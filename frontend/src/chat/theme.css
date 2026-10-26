@@ -1,0 +1,96 @@
+/* 东审财税 AI 智能工作台 — 设计 Token */
+:root {
+  --ds-brand: #008ae7;
+  --ds-brand-hover: #0075c7;
+  --ds-brand-deep: #005fa3;
+  --ds-brand-soft: #eaf5ff;
+  --ds-brand-mist: rgba(0, 138, 231, 0.06);
+  --ds-page: #f5f8fc;
+  --ds-card: #ffffff;
+  --ds-title: #172b4d;
+  --ds-body: #526579;
+  --ds-muted: #8492a6;
+  --ds-line: #e6edf5;
+  --ds-line-strong: #d5e2ef;
+  --ds-success: #12b76a;
+  --ds-success-bg: #ecfdf3;
+  --ds-warning: #f79009;
+  --ds-warning-bg: #fffaeb;
+  --ds-danger: #f04438;
+  --ds-danger-bg: #fef3f2;
+  --ds-sidebar-w: 248px;
+  --ds-sidebar-collapsed: 72px;
+  --ds-inspector-w: 300px;
+  --ds-header-h: 48px;
+  --ds-chat-max: 680px;
+  --ds-radius: 10px;
+  --ds-radius-sm: 8px;
+  --ds-radius-lg: 12px;
+  --ds-shadow: 0 1px 2px rgba(23, 43, 77, 0.03);
+  --ds-shadow-lg: 0 2px 8px rgba(23, 43, 77, 0.05);
+  --ds-shadow-brand: 0 2px 8px rgba(0, 138, 231, 0.18);
+  --ds-font: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei',
+    'Helvetica Neue', sans-serif;
+  --ds-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ds-text: 15px;
+  --ds-text-sm: 13px;
+  --ds-text-xs: 12px;
+
+  --el-color-primary: #008ae7;
+  --el-color-primary-light-3: #4aaef0;
+  --el-color-primary-light-5: #80c7f5;
+  --el-color-primary-light-7: #b3dff9;
+  --el-color-primary-light-8: #cceafb;
+  --el-color-primary-light-9: #eaf5ff;
+  --el-color-primary-dark-2: #0075c7;
+  --el-border-radius-base: 8px;
+  --el-font-size-base: 14px;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  font-family: var(--ds-font);
+  font-size: 14px;
+  color: var(--ds-body);
+  background: var(--ds-page);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input,
+textarea {
+  font-family: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(132, 146, 166, 0.32);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 138, 231, 0.4);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

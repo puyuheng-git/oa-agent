@@ -1,0 +1,13 @@
+---
+description: Alembic 迁移约定（agent_ops 库）
+globs: backend/migrations/**
+alwaysApply: false
+---
+
+# 迁移约定
+
+- 每个阶段的表改动新建迁移文件，已发布的迁移不得修改；命名 `NNNN_<阶段>_<说明>.py`（如 `0002_p1_run_event.py`）。
+- 迁移需同时兼容 MySQL 8（生产）与 SQLite（测试）；MySQL 专属类型用 `with_variant`。
+- 字符集 `utf8mb4`；时间列 `DATETIME(3)` UTC；唯一键/索引显式命名（`uk_`、`ix_` 前缀）。
+- `agent_audit_log` 只追加：迁移中不得为其加 UPDATE/DELETE 相关触发或级联；应用账号仅授予 INSERT/SELECT（DDL 由迁移账号执行）。
+- 种子数据（内置角色、权限点）写在迁移里，保证幂等。

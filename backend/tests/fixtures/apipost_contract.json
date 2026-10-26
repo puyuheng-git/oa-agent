@@ -1,0 +1,71 @@
+{
+  "code": 0,
+  "msg": "成功",
+  "data": {
+    "list": [
+      {
+        "target_id": "4f335407bc00a",
+        "target_type": "api",
+        "name": "查询未接收合同列表",
+        "method": "GET",
+        "url": "workbench/contract/fetchunreceivedcontractlist?user_id=44115&ht_bh=&run_id=900578",
+        "description": "",
+        "request": {
+          "body": {"mode": "none", "parameter": []},
+          "header": {"parameter": []},
+          "query": {
+            "parameter": [
+              {"description": "oa号", "field_type": "string", "is_checked": 1, "key": "user_id", "not_null": 1, "value": "44115"},
+              {"description": "合同编号", "field_type": "string", "is_checked": 1, "key": "ht_bh", "not_null": 1, "value": ""},
+              {"description": "流水号", "field_type": "string", "is_checked": 1, "key": "run_id", "not_null": 1, "value": "900578"}
+            ]
+          },
+          "cookie": {"parameter": []},
+          "restful": {"parameter": []}
+        },
+        "response": {
+          "example": [
+            {
+              "example_id": "1",
+              "raw": "{\"code\":0,\"message\":\"\",\"data\":{\"list\":[{\"id\":1,\"ht_bh\":\"示例【2022】第1号\",\"run_id\":2,\"kh_name\":\"示例客户\",\"ht_je\":\"500\",\"sq_user\":\"示例人\",\"gzgs\":\"示例公司\",\"sq_dept\":\"示例区\",\"tj_type\":0,\"auth_key\":\"x\"}]}}",
+              "expect": {
+                "code": "200", "is_default": 1, "name": "成功",
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {"type": "integer"},
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "list": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "id": {"type": "integer", "description": "合同标识，接收合同接口需要"},
+                              "gzgs": {"type": "string", "description": "盖章公司"},
+                              "ht_bh": {"type": "string", "description": "合同编号"},
+                              "ht_je": {"type": "string", "description": "合同金额"},
+                              "run_id": {"type": "integer", "description": "合同流水号"},
+                              "kh_name": {"type": "string", "description": "客户名称"},
+                              "sq_dept": {"type": "string", "description": "合同申请人区域"},
+                              "sq_user": {"type": "string", "description": "合同申请人"},
+                              "auth_key": {"type": "string", "description": "key，接收合同接口需要"}
+                            },
+                            "x-schema-orders": ["id", "ht_bh", "run_id", "kh_name", "ht_je", "sq_user", "gzgs", "sq_dept", "auth_key"]
+                          }
+                        }
+                      }
+                    },
+                    "message": {"type": "string"}
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "folders": []
+  }
+}

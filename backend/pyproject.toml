@@ -1,0 +1,44 @@
+[project]
+name = "oa-agent"
+version = "0.1.0"
+description = "OA LangGraph Agent + 运营管理后台"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0.30",
+    "pymysql>=1.1",
+    "alembic>=1.13",
+    "redis>=5.0",
+    "httpx>=0.27",
+    "cryptography>=42",
+    "argon2-cffi>=23.1",
+    "python-ulid>=2.7",
+    "pyyaml>=6.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "langgraph>=0.2.60",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "langchain-openai>=0.2",
+    "websockets>=13",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "fakeredis>=2.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["oa_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --basetemp=.pytest_tmp"
+markers = ["perf: 性能基线（记录实测值，阈值只防数量级退化）"]

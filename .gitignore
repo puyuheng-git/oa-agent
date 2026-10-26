@@ -1,0 +1,26 @@
+# runtime data (master.key / bootstrap.json / setup.token / checkpoints)
+/data/
+backend/data/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.pytest_tmp/
+*.egg-info/
+.coverage
+htmlcov/
+
+# frontend
+node_modules/
+frontend/dist/
+
+# misc
+.env
+*.log
+.playwright-mcp/
+.DS_Store
+.idea/
+.superpowers/
+.ui-shots/

@@ -1,0 +1,82 @@
+# OA Agent MVP-1 OpenAPI - travel expense read-only
+openapi: 3.0.3
+info:
+  title: OA Agent Travel Expense API
+  version: 1.0.0
+  description: Phase-1 read-only tools for travel expense via office-api
+servers:
+  - url: "{OFFICE_API_BASE}"
+    variables:
+      OFFICE_API_BASE:
+        default: http://127.0.0.1
+paths:
+  /out_attendance/go_out_travel_expense/index:
+    get:
+      operationId: query_my_travel_expense_list
+      summary: List my travel expense sheets (paged)
+      description: oa is injected by MCP/gateway; model must not pass oa
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+            maximum: 20
+        - name: queryParams
+          in: query
+          description: JSON string filters; oa injected
+          schema:
+            type: string
+      security:
+        - OfficeBearer: []
+      x-agent:
+        enabled: true
+        domain: travel_reimbursement
+        capability: query_my_travel_expense_list
+        risk_level: low
+        requires_confirmation: false
+        audit_required: true
+        idempotent: true
+        visibility: user
+        timeout_seconds: 10
+        inject_identity_fields: [oa]
+      responses:
+        "200":
+          description: success
+  /out_attendance/go_out_travel_expense/detail:
+    get:
+      operationId: query_my_travel_expense_detail
+      summary: Get one travel expense detail
+      parameters:
+        - name: queryParams
+          in: query
+          required: true
+          description: JSON with id; oa injected
+          schema:
+            type: string
+      security:
+        - OfficeBearer: []
+      x-agent:
+        enabled: true
+        domain: travel_reimbursement
+        capability: query_my_travel_expense_detail
+        risk_level: low
+        requires_confirmation: false
+        audit_required: true
+        idempotent: true
+        visibility: user
+        timeout_seconds: 10
+        inject_identity_fields: [oa]
+      responses:
+        "200":
+          description: success
+components:
+  securitySchemes:
+    OfficeBearer:
+      type: http
+      scheme: bearer

@@ -1,0 +1,91 @@
+Agent 运行时装配：EventSink、RunService、Checkpointer、Graph、巡检线程。
+---
+LiveRegistry
+---
+每次查找都读引擎当前注册表：停用立即对后续调用生效。
+---
+LiveRegistry
+---
+AgentEngine
+---
+event_spool
+---
+checkpoints.sqlite
+---
+启动恢复失败（监控库不可用？）
+---
+Tool/Skill 首次同步失败
+---
+初始化 Workflow 发布失败
+---
+run-watchdog
+---
+runtime
+---
+watchdog_interval_seconds
+---
+巡检：%d 个运行超时，标记为 timed_out
+---
+巡检失败
+---
+巡检：%d 个介入任务过期
+---
+介入任务过期巡检失败
+---
+purge_interval_minutes
+---
+巡检：清理过期事件 %d 条
+---
+清理过期事件失败
+---
+巡检附加任务失败
+---
+从库重建运行时注册表与 Skill 状态。失败时保留上一份（启动即失败则为空：宁可拒绝也不放开已停用的 Tool）。
+---
+加载 Tool/Skill 注册表失败，沿用上一份
+---
+；
+---
+：
+---
+已停用
+---
+；
+---
+校验未通过
+---
+未配置任何 Skill
+---
+SKILL_DISABLED
+---
+没有可用的 Skill（
+---
+）
+---
+configurable
+---
+configurable
+---
+thread_id
+---
+checkpoint_restored
+---
+checkpoint_restored
+---
+Checkpoint 中属于该运行的未决中断；不存在返回 None（不可恢复）。
+---
+configurable
+---
+thread_id
+---
+读取 Checkpoint 失败：thread=%s
+---
+interrupts
+---
+value
+---
+run_id
+---
+给库内已有运行续写事件：执行中的用其记录器；否则先刷出队列，seq 接在库内最大值之后。
+---
+AgentEngine

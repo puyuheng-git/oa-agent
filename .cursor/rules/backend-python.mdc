@@ -1,0 +1,27 @@
+---
+description: 后端 Python（FastAPI / SQLAlchemy / 安全）约定
+globs: backend/**/*.py
+alwaysApply: false
+---
+
+# 后端约定
+
+- Python ≥ 3.11，依赖与命令用 `uv`（在 `backend/` 下：`uv sync`、`uv run pytest`）。包名 `oa_agent`，模块分布遵循设计 §4。
+- SQLAlchemy 2 声明式（`Mapped[...]`）；表名 `agent_` 前缀单数 snake_case；时间统一 UTC，列类型用 `db.types.UtcDateTime`（MySQL 落 `DATETIME(3)`）。
+- 标识：`run_` / `thr_` / `evt_` + ULID，由 `oa_agent.ids` 生成，不要手拼。
+- 每张业务表预留 `tenant_id`（一期固定 `dscpa`），查询层统一注入过滤。
+- 管理写接口依赖链：`require_perm(...)` → `require_csrf` → `idempotency_guard`，并在**同一事务**内调用 `AuditService.record(...)`：
+
+```python
+@router.put("/settings/{group}")
+def update(group: str, body: SettingsIn, ctx: AdminCtx = Depends(admin_write("sys.setting.edit"))):
+    with ctx.db.begin():
+        before = svc.summary(group)
+        svc.update(group, body.values, actor=ctx.user)
+        ctx.audit("setting.update", "setting", group, before=before, after=svc.summary(group))
+```
+
+- 密钥只经 `SecretVault` 存取（AES-GCM，master key 加密）；对外只暴露 `vault.describe()` 掩码；审计只记「已变更」。
+- 异常响应用统一错误体 `{"error": {"code", "message"}}`；不要把底层异常文本（可能含连接串/密钥）原样返回，先 `redact()`。
+- 外部依赖（MySQL/Redis/LLM/office-api）的“测试连接”必须真实连接，失败如实返回原因。
+- 测试：pytest；数据库用 SQLite 内存库跑 Alembic 迁移，Redis 用内存替身；外部 HTTP 用 `respx`。新功能先写测试。

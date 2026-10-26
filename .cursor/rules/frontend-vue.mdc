@@ -1,0 +1,15 @@
+---
+description: 前端 Vue 3 + Vite + Element Plus 多入口约定
+globs: frontend/**
+alwaysApply: false
+---
+
+# 前端约定
+
+- Vue 3 `<script setup lang="ts">` + Element Plus；多入口 `setup` / `admin` / `chat`，共享代码放 `src/shared/`。构建产物 `frontend/dist/` 由 FastAPI 静态托管（`/setup/`、`/admin/`、`/chat/`）。
+- 路由用 hash 模式，避免后端 SPA 回退配置。
+- 所有请求经 `src/shared/http.ts`：管理端带 Cookie + `X-CSRF-Token`，写请求自动生成 `Idempotency-Key`；对话端 ticket **只存内存**，用 `Authorization: Bearer`。
+- 统一错误体 `{"error": {"code","message"}}` 由 http 层转为 `ElMessage`；403 显示「无权限」，不要隐藏按钮了事。
+- 密钥输入框只写：展示后端返回的掩码（`已设置 · ****abcd`），留空表示不修改；绝不在前端缓存或回显明文。
+- 没有真实数据时显示「暂无数据 / 未检测」，禁止占位假数据或演示数字。
+- 命令：`npm run dev`（代理 `/v1` 到 `http://127.0.0.1:8000`）、`npm run build`、`npm run test`（Vitest）。

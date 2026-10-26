@@ -1,0 +1,18 @@
+# 行程报销查询 Skill。仅在首次启动（Skill 表为空）时导入；之后以管理后台「Skill 管理」为准，
+# 改本文件需在后台点「从文件导入」。依赖 Tool 停用或无有效版本时 Skill 校验失败，对话不会使用它。
+name: travel_expense_query
+display_name: 行程报销查询
+version: 1.1.0
+description: 查询员工本人的行程报销单列表与详情（只读）
+instructions: |
+  「上周/上月/最近N天」等换算为具体的开始、结束日期；只说「本月」时从本月 1 日到今天。
+  员工提到具体单号并要看详情时用详情工具，否则用列表工具。
+examples:
+  - 查上周的行程报销
+  - 本月未报销的行程
+  - 查看报销单 12345 的详情
+workflow: travel_query
+enabled: true
+tools:
+  - query_my_travel_expense_list
+  - query_my_travel_expense_detail

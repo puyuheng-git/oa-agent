@@ -1,0 +1,80 @@
+1|"""OA 助手图：understand �?(call_tool �?human_handoff，可多步) �?respond �?remember�?
+2|
+3|可用 Tool 来自后台配置：已启用且校验通过�?Skill 声明的、已注册�?Tool。understand 由模型结合最近几轮对话与更早对话�?
+4|记忆理解员工意图：需要查 OA 数据时按 Skill 说明�?Tool 并填参，否则直接回答（日常聊天、通用问答；chat_mode=help �?
+5|改为回复帮助）。模型不可用时回退到行程报销的内置规则；参数�?Tool �?model_params 校验，身份字段一律丢弃，由服务端注入�?
+6|
+7|多步查询（引用式串联）：模型一次给出多个步骤，后面步骤的参数写�?{"$ref": "step1.list[0].id"}。模型看不到任何步骤�?
+8|返回值；call_tool 逐步执行，引用由服务端从前面步骤的返回字段白名单中取值，再按�?Tool 的参数规则校验�?
+9|
+10|模型看到的历史只含员工原话、聊天回复与查询摘要（工具、条件、记�?ID），不含业务明细，聊天回复不得编造业务数据�?
+11|超出历史轮数的旧对话�?remember 按发布配置压缩为记忆（截�?/ 滚动摘要 / 要点提取，见 runtime.memory）�?
+12|LangGraph 只做编排：身份来�?RunContext（服务端会话），业务数据只来�?office-api 返回�?
+13|回复�?respond 节点�?Tool 配置的字段与名称确定性生成，模型不参与拼写业务数据�?
+14|上游暂时故障且发布配�?on_upstream_error=handoff 时，human_handoff �?interrupt() 挂起等待管理员决定；
+15|恢复后回�?call_tool 重新以员工身份调用当前步骤（身份在恢复时由服务端重新校验，不来自 Checkpoint）�?
+16|"""
+17|
+18|from __future__ import annotations
+19|
+20|import json
+21|import re
+22|import time
+23|from dataclasses import dataclass, field
+24|from datetime import date
+25|from contextlib import AbstractContextManager
+26|from typing import Callable, TypedDict
+27|
+28|from sqlalchemy.exc import SQLAlchemyError
+29|from sqlalchemy.orm import Session
+30|
+31|from langgraph.errors import GraphInterrupt
+32|from langgraph.graph import END, START, StateGraph
+33|from langgraph.types import interrupt
+34|
+35|from oa_agent.executor.catalog import SkillState
+36|from oa_agent.executor.executor import Identity, ToolError, ToolExecutor, validate_args
+37|from oa_agent.executor.registry import ToolSpec
+38|from oa_agent.runtime import intent_rules, memory as memory_mod
+39|from oa_agent.runtime.intent_rules import DETAIL, LIST
+40|from oa_agent.runtime.llm import ModelCallError, ModelConfig, invoke_json
+41|from oa_agent.observability.events import RunRecorder
+42|
+43|WORKFLOW_ID = "travel_query"
+44|WORKFLOW_VERSION = "4"
+45|AGENT_ID = "oa_assistant"
+46|BUSINESS_TYPE = "oa_query"
+47|
+48|TOOL = "tool"
+49|HELP = "help"
+50|ASK = "ask"     # 问题对应某个 Tool，但缺少必填参数：请员工补充，不调用
+51|CHAT = "chat"   # 与工具无关：模型直接回答
+52|MEMORY_WRITE = "memory_write"
+53|MEMORY_FORGET = "memory_forget"
+54|
+55|# 模型不可用时的内置规则只覆盖行程报销两个 Tool；其�?Tool 需要配置模�?
+56|RULE_TOOLS = {LIST: "query_my_travel_expense_list", DETAIL: "query_my_travel_expense_detail"}
+57|
+58|REPLY_SUMMARY_CHARS = 12000   # 时间线事件摘要上限（事件�?TEXT 列），完整回复在对话记录�?
+59|DEFAULT_PERSONA = "你是公司的「OA 助手」，员工的智能助理�?
+60|
+61|# 发布配置（P5 agent_workflow_version.content_json）的默认值；运行绑定发布快照，执行中不变
+62|DEFAULT_CONFIG: dict = {
+63|    "intent_mode": "auto",          # auto：有可用模型时用模型�?Tool，失败回退规则；rules：只用规�?
+64|    "llm_model_id": None,           # 指定模型；None 用默认模�?
+65|    "list_default_limit": 10,
+66|    "on_upstream_error": "fail",    # fail：直接失败；handoff：转人工介入
+67|    "help_text": "",                # 为空时按可用 Skill 的名称与示例问题自动生成
+68|    "chat_mode": "llm",             # llm：与工具无关的问题由模型直接回答；help：回复帮�?
+69|    "chat_instructions": "",        # 追加给模型的回答要求（语气、范围等�?
+70|    "assistant_persona": DEFAULT_PERSONA,
+71|    "history_turns": 6,             # 带给模型的最近对话轮数（1 �?= 员工一�?+ 助手一句）
+72|    "history_message_chars": 600,   # 每条历史消息带给模型的最大字�?
+73|    "history_ref_ids": 20,          # 查询摘要里最多列出的记录 ID 数（供「第一条的详情」这类追问）
+74|    "history_compress": True,       # 超出轮数的旧对话：True 压缩为记忆；False 直接丢弃
+75|    "history_compress_mode": memory_mod.TRUNCATE,
+76|    "compress_memory_chars": 800,   # 记忆总字数上�?
+77|    "compress_truncate_chars": 80,  # 截断压缩时每条旧消息保留的字�?
+78|    "chat_reply_max_chars": 4000,
+79|    "max_table_rows": 50,
+80|    "max_tool_steps": 3,            # 一次提问最多串联的工具步数�? = 不串�?

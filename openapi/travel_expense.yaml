@@ -1,0 +1,88 @@
+# 行程报销只读 Tool（设计：history/2026-09-21 §5，权威 design §3）
+# 仅在首次启动（Tool 表为空）时导入；之后以管理后台「Tool 管理」为准，改本文件需在后台点「从文件导入」。
+# x-agent.model_params 是模型可见入参；身份字段（oa）只由服务端注入，模型/客户端传入一律丢弃。
+# result.labels：字段显示名称；详情只显示设置了名称的字段。result.list_columns：列表表格的列。
+openapi: 3.0.3
+info:
+  title: OA Agent Travel Expense API
+  version: 1.0.0
+servers:
+  - url: "{OFFICE_API_BASE}"
+    variables:
+      OFFICE_API_BASE:
+        default: http://127.0.0.1
+paths:
+  /out_attendance/go_out_travel_expense/index:
+    get:
+      operationId: query_my_travel_expense_list
+      summary: 查询本人行程报销单（分页）
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 10, maximum: 20 } }
+        - { name: queryParams, in: query, description: "JSON 字符串；oa 由网关注入", schema: { type: string } }
+      security:
+        - OfficeBearer: []
+      x-agent:
+        enabled: true
+        description: 按日期区间、报销状态、来源筛选员工本人的行程报销单列表
+        domain: travel_reimbursement
+        capability: query_my_travel_expense_list
+        risk_level: low
+        requires_confirmation: false
+        audit_required: true
+        idempotent: true
+        visibility: user
+        timeout_seconds: 10
+        inject_identity_fields: [oa]
+        top_level_fields: [page, limit]
+        query_params_field: queryParams
+        result:
+          kind: list
+          fields: [id, date, client_name, total_amount, status, status_text, source, source_text, transport_types_desc, remark]
+          list_columns: [id, date, client_name, total_amount, status_text]
+          labels: { id: 单号, date: 日期, client_name: 客户, total_amount: 金额, status_text: 状态, source_text: 来源, transport_types_desc: 交通方式, remark: 备注 }
+        model_params:
+          date_gte: { type: string, format: date, label: 开始日期, description: "YYYY-MM-DD" }
+          date_lte: { type: string, format: date, label: 结束日期, description: "YYYY-MM-DD" }
+          status: { type: integer, enum: [0, 1], label: 状态, enum_labels: { "0": 未报销, "1": 已报销 } }
+          fiscal_year: { type: integer, minimum: 2000, maximum: 2100, label: 财年 }
+          source: { type: integer, enum: [1, 2], label: 来源, enum_labels: { "1": 外出, "2": 191 请款 } }
+          page: { type: integer, minimum: 1, default: 1, label: 页码 }
+          limit: { type: integer, minimum: 1, maximum: 20, default: 10, label: 每页条数 }
+      responses:
+        "200": { description: success }
+  /out_attendance/go_out_travel_expense/detail:
+    get:
+      operationId: query_my_travel_expense_detail
+      summary: 查询本人一张行程报销单详情
+      parameters:
+        - { name: queryParams, in: query, required: true, description: "JSON，含 id；oa 由网关注入", schema: { type: string } }
+      security:
+        - OfficeBearer: []
+      x-agent:
+        enabled: true
+        description: 按单号查看员工本人一张行程报销单的详情
+        domain: travel_reimbursement
+        capability: query_my_travel_expense_detail
+        risk_level: low
+        requires_confirmation: false
+        audit_required: true
+        idempotent: true
+        visibility: user
+        timeout_seconds: 10
+        inject_identity_fields: [oa]
+        top_level_fields: []
+        query_params_field: queryParams
+        result:
+          kind: object
+          fields: [id, date, client_name, total_amount, status, status_text, source, source_text, transport_types_desc, remark, travel_route, is_meal_allowance, run_id, out_attendance_application_id, fiscal_year]
+          labels: { id: 单号, date: 日期, client_name: 客户, total_amount: 金额, status_text: 状态, source_text: 来源, transport_types_desc: 交通方式, travel_route: 行程路线, fiscal_year: 财年, remark: 备注 }
+        model_params:
+          id: { type: integer, minimum: 1, required: true, label: 单号, description: "报销单 ID" }
+      responses:
+        "200": { description: success }
+components:
+  securitySchemes:
+    OfficeBearer:
+      type: http
+      scheme: bearer

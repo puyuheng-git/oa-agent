@@ -1,0 +1,25 @@
+---
+description: oa-langGraph 项目总则：权威设计、硬约束、阶段纪律
+alwaysApply: true
+---
+
+# oa-langGraph 项目总则
+
+- 回复与文档使用中文；代码标识符用英文。
+- 权威设计：`docs/design/2026-10-09-oa-langgraph-design.md`（OA 侧配套见同目录 `oa-service-side-design.md`）。`docs/history/`、`docs/reference/` 仅供追溯，冲突时以 `design/` 为准；旧网关代码不迁移。
+- 按 §13 分阶段实施（P0 骨架 → P1 对话与可观测 → P2 监控 → P3 介入 → P4 Tool/Skill → P5 配置版本 → P6 加固），不提前实现后续阶段功能；需要的扩展点只留接口。
+
+## 硬约束（不可违反）
+
+1. 与 OA 只走 HTTP 契约；对 OA 业务库 `td_oa` 零访问。业务数据只来自 office-api 以该员工 token 返回的结果，模型/客户端自报的 `oa` 一律丢弃。office-api 可配多个地址，但只限认同同一员工 token 的同一信任域；Tool 只存相对路径 + 地址标识，不得写完整 URL。
+2. LangGraph 只做编排；业务授权、校验、幂等在 office-api / Service。模型输出不参与权限判定。
+3. 管理员与员工是两套主体，互不代替；后台不能直改 Checkpoint/图状态。
+4. 不伪造指标、Token、成本、健康状态；无数据显示「暂无数据 / 未检测」。不展示模型隐藏推理链。
+5. 密钥只写不读：API/页面只返回 `已设置 · ****abcd`；日志、审计、异常信息中不得出现明文密钥。
+6. 管理写操作 = 权限点 + CSRF + `Idempotency-Key` + 审计；审计写失败则操作失败。
+
+## 交付纪律
+
+- 每阶段输出：功能、文件清单、迁移说明、API 说明、权限与安全、测试结果、未完成项、下一阶段计划。
+- 测试结果区分「自动化通过 / 手工 / 未执行 / 外部依赖未验证」，不得把未执行说成通过。
+- `data/`（master.key、bootstrap.json、setup.token、checkpoints.sqlite）不入库。
