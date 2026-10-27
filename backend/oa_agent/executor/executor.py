@@ -143,7 +143,7 @@ class ToolExecutor:
                          node_name: str) -> dict:
         """kind=builtin：由 BuiltinRuntime 执行；结果一律作为不可信数据围栏后回图（结构化结果不直接进模型）。"""
         from oa_agent.executor.builtin_runtime import BuiltinRuntime
-        from oa_agent.security.prompt_guard import wrap_untrusted
+        from oa_agent.security.prompt_guard import scan_flags, wrap_untrusted
 
         name = spec.name
         clean = {k: v for k, v in (args or {}).items() if k not in MCP_DROPPED_ARGS}
@@ -161,16 +161,21 @@ class ToolExecutor:
                       error_code=exc.code, error_summary=exc.message,
                       metadata={"kind": "builtin", "builtin_id": spec.builtin_id})
             raise
-        text = wrap_untrusted(json.dumps(raw, ensure_ascii=False, default=str), source="builtin", name=name)
+        raw = dict(raw)
+        flags = {str(f) for f in (raw.pop("guard_flags", None) or [])}  # 运行时清洗阶段的标志；不回给模型
+        body = json.dumps(raw, ensure_ascii=False, default=str)
+        flags |= scan_flags(body)
+        text = wrap_untrusted(body, source="builtin", name=name)
         rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
                   duration_ms=int((time.perf_counter() - started) * 1000), output_summary={"result_count": 1},
-                  metadata={"kind": "builtin", "builtin_id": spec.builtin_id})
+                  metadata={"kind": "builtin", "builtin_id": spec.builtin_id,
+                            **({"guard_flags": sorted(flags)} if flags else {})})
         return {"ok": True, "capability": name, "data": {"text": text}, "message": ""}
 
     def _execute_mcp(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
         """kind=mcp：默认由 MCP 服务端校验参数，这里丢弃身份字段；spec.model_params 非空时先本地校验；结果一律作为不可信数据围栏后回图。"""
         from oa_agent.executor.outbound import MAX_RESULT_BYTES, NoopOutboundMcpClient
-        from oa_agent.security.prompt_guard import wrap_untrusted
+        from oa_agent.security.prompt_guard import scan_flags, wrap_untrusted
 
         name = spec.name
         clean = {k: v for k, v in (args or {}).items() if k not in MCP_DROPPED_ARGS}
@@ -190,11 +195,13 @@ class ToolExecutor:
                       status="error", duration_ms=int((time.perf_counter() - started) * 1000),
                       error_code=exc.code, error_summary=exc.message, metadata={"kind": "mcp"})
             raise
-        text = wrap_untrusted(str(raw.get("text") or ""), source="mcp", name=name, max_chars=MAX_RESULT_BYTES)
+        raw_text = str(raw.get("text") or "")
+        flags = scan_flags(raw_text)
+        text = wrap_untrusted(raw_text, source="mcp", name=name, max_chars=MAX_RESULT_BYTES)
         rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
                   duration_ms=int((time.perf_counter() - started) * 1000),
                   output_summary={"result_count": 1, "truncated": bool(raw.get("truncated"))},
-                  metadata={"kind": "mcp"})
+                  metadata={"kind": "mcp", **({"guard_flags": sorted(flags)} if flags else {})})
         # structured 不回图：它不经围栏，直接进模型会绕过不可信数据边界
         return {"ok": True, "capability": name, "data": {"text": text, "truncated": bool(raw.get("truncated"))},
                 "message": ""}

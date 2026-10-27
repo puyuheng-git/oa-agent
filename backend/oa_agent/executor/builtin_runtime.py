@@ -25,7 +25,7 @@ import sqlalchemy as sa
 from oa_agent.errors import AppError
 from oa_agent.executor.executor import MSG_NOT_AVAILABLE, Identity, ToolError
 from oa_agent.executor.registry import ToolSpec
-from oa_agent.security.prompt_guard import normalize_text, scrub_html
+from oa_agent.security.prompt_guard import normalize_text, scan_flags, scrub_html_with_flags
 
 CHINA_TZ = timezone(timedelta(hours=8))
 DEFAULT_TIMEZONE = "Asia/Shanghai"
@@ -268,8 +268,9 @@ class BuiltinRuntime:
             kwargs["json"] = body
         # 不带员工 Authorization / oa；不跟随重定向（避免经 302 越过白名单）
         status, raw, truncated, ctype = _fetch(method, url, timeout=spec.timeout_seconds, limit=limit, **kwargs)
-        return {"status": status, "content_type": ctype, "body": _clean_body(raw, ctype), "truncated": truncated,
-                "size_bytes": len(raw)}
+        body, flags = _clean_body(raw, ctype)
+        return {"status": status, "content_type": ctype, "body": body, "truncated": truncated,
+                "size_bytes": len(raw), "guard_flags": sorted(flags)}
 
     # ---- sys.web_search
     def _web_search(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
@@ -301,13 +302,18 @@ class BuiltinRuntime:
         if items is None and isinstance(data, dict) and isinstance(data.get("web"), dict):
             items = data["web"].get("results")
         results = []
+        flags: set[str] = set()
         for it in (items or [])[:count]:
             if not isinstance(it, dict):
                 continue
-            results.append({"title": scrub_html(str(it.get("title") or ""))[:200],
-                            "url": scrub_html(str(it.get("url") or ""))[:500],
-                            "snippet": scrub_html(str(it.get("snippet") or it.get("description") or ""))[:500]})
-        return {"query": query, "results": results}
+            row = {}
+            for field, val, cap in (("title", it.get("title"), 200), ("url", it.get("url"), 500),
+                                    ("snippet", it.get("snippet") or it.get("description"), 500)):
+                clean, f = scrub_html_with_flags(str(val or ""))
+                row[field] = clean[:cap]
+                flags |= f
+            results.append(row)
+        return {"query": query, "results": results, "guard_flags": sorted(flags)}
 
     def _search_key(self) -> str | None:
         if self.vault is None or self.session_factory is None:
@@ -347,8 +353,8 @@ class BuiltinRuntime:
         with target.open("rb") as fh:
             data = fh.read(limit + 1)
         truncated = len(data) > limit
-        text = data[:limit].decode("utf-8", errors="ignore")
-        return {"path": norm, "content": text, "truncated": truncated}
+        text, flags = _clean_body(data[:limit], "text/html" if norm.lower().endswith((".html", ".htm")) else "")
+        return {"path": norm, "content": text, "truncated": truncated, "guard_flags": sorted(flags)}
 
     def _fs_write(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
         target, norm = self._resolve_in_sandbox(args.get("path"))
@@ -488,11 +494,13 @@ def _fetch(method: str, url: str, *, timeout: float, limit: int, params: dict | 
                         user_message="请求失败") from None
 
 
-def _clean_body(raw: bytes, content_type: str) -> str:
+def _clean_body(raw: bytes, content_type: str) -> tuple[str, set[str]]:
+    """出站/沙箱文件正文清洗：HTML → scrub_html；其它 → NFKC；一并返回防注入标志（不含原文）。"""
     text = raw.decode("utf-8", errors="replace")
     if "html" in (content_type or "").lower() or text.lstrip().startswith("<"):
-        return scrub_html(text)
-    return normalize_text(text)
+        return scrub_html_with_flags(text)
+    clean = normalize_text(text)
+    return clean, scan_flags(clean)
 
 
 def _validate_cron(value: object) -> str:
