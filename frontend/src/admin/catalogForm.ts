@@ -26,7 +26,7 @@ export interface ToolForm {
   name: string
   summary: string
   description: string
-  /** office-api 地址标识，`office` 为主地址 */
+  /** 业务上游标识（「OA 对接」目录中的 key；默认常为 office） */
   upstream: string
   path: string
   timeout_seconds: number
@@ -55,9 +55,10 @@ export function emptyParam(): ParamRow {
   }
 }
 
-export function emptyToolForm(): ToolForm {
+export function emptyToolForm(defaultUpstream = 'office'): ToolForm {
   return {
-    name: '', summary: '', description: '', upstream: 'office', path: '/', timeout_seconds: 10, injectOa: true,
+    name: '', summary: '', description: '', upstream: defaultUpstream || 'office', path: '/',
+    timeout_seconds: 10, injectOa: true,
     query_params_field: 'queryParams', identityParams: '', result_kind: 'list', params: [], fields: [],
   }
 }

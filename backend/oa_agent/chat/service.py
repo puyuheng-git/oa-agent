@@ -3,6 +3,8 @@
 身份只来自服务端会话：运行上下文（KV）只存会话引用，恢复/重试时重新加载并校验会话仍有效且属于同一员工"
 """
 
+# O5: domain routing hook（L1 骨架在 runtime.multi_agent，O2+O4 门禁后再挂接）
+
 from __future__ import annotations
 
 import json
@@ -21,7 +23,7 @@ from oa_agent.db.models import Run
 from oa_agent.db.types import utcnow
 from oa_agent.errors import AppError
 from oa_agent.ids import new_run_id
-from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError, upstream_clients
+from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError, mint_base_url, upstream_clients
 from oa_agent.db.models import Skill
 from oa_agent.executor.catalog import SkillState
 from oa_agent.executor.executor import Identity, ToolError, ToolExecutor
@@ -31,9 +33,13 @@ from oa_agent.executor.tags import EmptyTagProvider
 from oa_agent.executor.visibility import PrincipalContext, VisibilityService
 from oa_agent.observability import conversation
 from oa_agent.observability.events import RunRecorder
-from oa_agent.runtime.graphs import travel_query
+from oa_agent.runtime import confirmation
+from oa_agent.runtime.confirmation import ConfirmationError
+from oa_agent.runtime.graphs import travel_query, travel_reimburse_submit
 from oa_agent.runtime.graphs.travel_query import RunCancelled, chat_enabled
-from oa_agent.runtime.intervention import DEFAULT_EXPIRE_MINUTES, InterventionService
+from oa_agent.runtime.intervention import DEFAULT_EXPIRE_MINUTES, USER_CONFIRM, InterventionService
+from oa_agent.executor.write_tools import WriteToolExecutor
+from oa_agent.db.models import InterventionTask
 from oa_agent.runtime.llm import build_chat_model, resolve_model
 from oa_agent.runtime.releases import Release, ReleaseError
 from oa_agent.runtime.run_service import (
@@ -91,7 +97,7 @@ def launch_policy(rt: AppRuntime) -> chat_launch.LaunchPolicy:
 def office_client(rt: AppRuntime) -> OfficeApiClient:
     oa = load_settings(rt, "oa")
     try:
-        return OfficeApiClient(oa.get("office_api_base_url"), oa.get("success_codes"))
+        return OfficeApiClient(mint_base_url(oa), oa.get("success_codes"))
     except OfficeApiError as exc:
         raise AppError(503, exc.code, exc.message) from exc
 
@@ -101,6 +107,10 @@ def tool_clients(rt: AppRuntime) -> dict[str, OfficeApiClient]:
         return upstream_clients(load_settings(rt, "oa"))
     except OfficeApiError as exc:
         raise AppError(503, exc.code, exc.message) from exc
+
+
+def write_workflows_enabled(rt: AppRuntime) -> bool:
+    return bool(setting(rt, "runtime", "write_workflows_enabled"))
 
 
 def _model(rt: AppRuntime, config: dict):
@@ -251,8 +261,10 @@ def employee_session(rt: AppRuntime, run: Run) -> tuple[ChatSession | None, dict
     ctx = run_context(rt, run.run_id)
     if ctx is None:
         return None, None, (
-            f"运行上下文已过期（超过 {setting(rt, 'chat', 'run_context_ttl_hours')} 小时）"
-            "或缓存已清空），无法恢复")
+            f"运行上下文已过期（超过 {setting(rt, 'chat', 'run_context_ttl_hours')} 小时"
+            "或缓存已清空），无法恢复"
+        )
+    session = chat_launch.load_session_by_key(rt.kv.current, ctx.get("session_key"))
     if session is None:
         return None, ctx, "员工会话已过期，无法以员工身份继续执行"
     if session.oa != run.oa or ctx.get("oa") != run.oa:
@@ -361,6 +373,21 @@ def _load_long_term_memory(rt: AppRuntime, oa: str) -> str:
         return ""
 
 
+def _build_write_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession) -> travel_reimburse_submit.WriteRunContext:
+    return travel_reimburse_submit.WriteRunContext(
+        recorder=rec,
+        identity=Identity(oa=session.oa, authorization=session.office_token),
+        read_executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
+                                   int(setting(rt, "oa", "tool_remark_max_chars")),
+                                   mcp_client=get_mcp_client(rt),
+                                   builtin_runtime=build_builtin_runtime(rt)),
+        write_executor=WriteToolExecutor(tool_clients(rt)),
+        runs=rt.engine.runs,
+        tenant_id=rt.tenant_id,
+        session_factory=rt.session,
+    )
+
+
 def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
                    on_delta: Callable[[str], None] | None = None) -> travel_query.RunContext:
     return travel_query.RunContext(
@@ -408,7 +435,10 @@ def _drive(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
 
     interrupts = state.get("__interrupt__")
     if interrupts:
-        return _handoff(rt, rec, interrupts[0].value or {}, tracked)
+        value = interrupts[0].value or {}
+        if value.get("kind") == "user_confirm":
+            return _await_confirmation(rt, rec, value, tracked)
+        return _handoff(rt, rec, value, tracked)
 
     reply = state.get("reply") or {"type": "text", "content": "", "data": None}
     spec = engine.registry.get(state.get("tool") or "")
@@ -419,6 +449,124 @@ def _drive(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
                  else text(rt, "upstream_unavailable"), "data": None, "error_code": final.upper()}
     store_reply(rt, rec.run_id, reply)
     return _result(rec, final, reply, tracked)
+
+
+def start_travel_reimburse_submit(rt: AppRuntime, session: ChatSession, expense_id: int, correlation_id: str,
+                                  *, session_key: str = "") -> dict:
+    """固定写 Workflow 入口（O2）；write_workflows_enabled 关时拒绝。"""
+    if not write_workflows_enabled(rt):
+        raise AppError(503, "WRITE_WORKFLOWS_DISABLED", "写操作 Workflow 未启用，请联系管理员。")
+    if not isinstance(expense_id, int) or expense_id < 1:
+        raise AppError(422, "VALIDATION_ERROR", "请提供有效的行程报销单号")
+    engine = rt.engine
+    release = current_release(rt)
+    rec = RunRecorder(run_id=new_run_id(), thread_id=session.thread_id, oa=session.oa,
+                      correlation_id=correlation_id, sink=engine.sink)
+    tracked = engine.runs.start(
+        rec, channel=session.channel, agent_id=travel_query.AGENT_ID,
+        workflow_id=travel_reimburse_submit.WORKFLOW_ID,
+        workflow_version=travel_reimburse_submit.WORKFLOW_VERSION,
+        business_type=travel_reimburse_submit.BUSINESS_TYPE, config_release_id=release.release_id,
+        message=f"submit_travel_expense:{expense_id}",
+    )
+    if session_key:
+        try:
+            remember_run(rt, rec.run_id, session_key=session_key, oa=session.oa, thread_id=session.thread_id,
+                         channel=session.channel, message=f"submit:{expense_id}")
+        except Exception:  # noqa: BLE001
+            log.exception("保存运行上下文失败：%s", rec.run_id)
+    return _drive_write(rt, rec, session, expense_id, tracked)
+
+
+def _drive_write(rt: AppRuntime, rec: RunRecorder, session: ChatSession, expense_id: int, tracked: bool) -> dict:
+    engine = rt.engine
+    try:
+        ctx = _build_write_context(rt, rec, session)
+        state = engine.invoke_write(ctx, expense_id, session.thread_id)
+    except (ToolError, AppError) as exc:
+        code = getattr(exc, "code", "RUN_FAILED")
+        final = engine.runs.finish(rec, FAILED, error_code=code, error_summary=exc.message)
+        return _error_reply(rt, rec, code, exc.message, tracked, final, getattr(exc, "user_message", ""))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("写 Workflow 运行 %s 失败", rec.run_id)
+        final = engine.runs.finish(rec, FAILED, error_code="RUN_FAILED", error_summary=f"{type(exc).__name__}: {exc}")
+        return _error_reply(rt, rec, "RUN_FAILED", "", tracked, final)
+
+    interrupts = state.get("__interrupt__")
+    if interrupts:
+        value = interrupts[0].value or {}
+        if value.get("kind") == "user_confirm":
+            return _await_confirmation(rt, rec, value, tracked)
+    reply = state.get("reply") or {"type": "text", "content": "", "data": None}
+    final = engine.runs.finish(rec, SUCCEEDED)
+    store_reply(rt, rec.run_id, reply)
+    return _result(rec, final, reply, tracked)
+
+
+def confirm_write(rt: AppRuntime, session: ChatSession, task_id: str, token: str, correlation_id: str) -> dict:
+    """员工凭令牌确认写操作；verify_and_consume 后恢复固定 Workflow 图。"""
+    engine = rt.engine
+    with rt.session() as db:
+        task = db.scalar(sa.select(InterventionTask).where(
+            InterventionTask.tenant_id == rt.tenant_id, InterventionTask.task_id == task_id))
+        if task is None or task.kind != USER_CONFIRM:
+            raise AppError(404, "CONFIRMATION_NOT_FOUND", "确认请求不存在")
+        run = db.scalar(sa.select(Run).where(Run.run_id == task.run_id))
+    if run is None or run.oa != session.oa:
+        raise AppError(404, "NOT_FOUND", "记录不存在")
+    if run.run_status != WAITING_CONFIRMATION:
+        raise AppError(409, "CONFIRMATION_NOT_PENDING", "该确认已处理或运行状态不可确认")
+    interrupt_value = engine.pending_interrupt(run.thread_id, run.run_id)
+    if interrupt_value is None or interrupt_value.get("task_id") != task_id:
+        raise AppError(409, "CONFIRMATION_NOT_RESUMABLE", "无法恢复确认流程，请重新发起")
+    payload = interrupt_value.get("payload") or {}
+    try:
+        with rt.session() as db, db.begin():
+            confirmation.verify_and_consume(db, task_id=task_id, token=token, oa=session.oa, payload=payload)
+            engine.runs.transition(run.run_id, WAITING_CONFIRMATION, RUNNING, db=db)
+    except ConfirmationError as exc:
+        raise AppError(400, exc.code, exc.message) from exc
+    rec = engine.recorder_for_run(run, correlation_id)
+    rec.event("employee_confirm", status=RUNNING, operator_id=f"employee:{session.oa}",
+              metadata={"task_id": task_id})
+    try:
+        ctx = _build_write_context(rt, rec, session)
+        state = engine.resume_write(ctx, run.thread_id, {"confirmed": True})
+    except (ToolError, AppError) as exc:
+        code = getattr(exc, "code", "RUN_FAILED")
+        final = engine.runs.finish(rec, FAILED, error_code=code, error_summary=exc.message)
+        return _error_reply(rt, rec, code, exc.message, True, final, getattr(exc, "user_message", ""))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("写 Workflow 恢复 %s 失败", run.run_id)
+        final = engine.runs.finish(rec, FAILED, error_code="RUN_FAILED", error_summary=f"{type(exc).__name__}: {exc}")
+        return _error_reply(rt, rec, "RUN_FAILED", "", True, final)
+    reply = state.get("reply") or {"type": "text", "content": "", "data": None}
+    final = engine.runs.finish(rec, SUCCEEDED)
+    store_reply(rt, rec.run_id, reply)
+    return _result(rec, final, reply, True)
+
+
+def _await_confirmation(rt: AppRuntime, rec: RunRecorder, value: dict, tracked: bool) -> dict:
+    preview = value.get("payload") or {}
+    lines = ["请确认是否提交以下行程报销："]
+    if preview.get("expense_id") is not None:
+        lines.append(f"原单号：{preview['expense_id']}")
+    if preview.get("draft_id") is not None:
+        lines.append(f"草稿号：{preview['draft_id']}")
+    if preview.get("total_amount") is not None:
+        lines.append(f"金额：{preview['total_amount']}")
+    reply = {
+        "type": "confirmation_pending",
+        "content": "\n".join(lines),
+        "data": {
+            "task_id": value.get("task_id"),
+            "token": value.get("token"),
+            "expire_at": value.get("expire_at"),
+            "preview": preview,
+        },
+    }
+    conversation.record_reply(rt.session, rec.run_id, reply)
+    return _result(rec, WAITING_CONFIRMATION, reply, tracked)
 
 
 def _handoff(rt: AppRuntime, rec: RunRecorder, value: dict, tracked: bool) -> dict:

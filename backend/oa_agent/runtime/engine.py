@@ -18,7 +18,7 @@ from oa_agent.executor.catalog import Catalog, SkillState
 from oa_agent.executor.registry import ToolRegistry
 from oa_agent.observability.events import RUN_COLUMNS, EventSink, RunRecorder
 from oa_agent.runtime.checkpointer import open_checkpointer
-from oa_agent.runtime.graphs import travel_query
+from oa_agent.runtime.graphs import travel_query, travel_reimburse_submit
 from oa_agent.runtime.intervention import InterventionService
 from oa_agent.runtime.releases import ReleaseService
 from oa_agent.runtime.run_service import RunService
@@ -60,9 +60,12 @@ class AgentEngine:
         self.skill_checker = self.check_skills
         self.release_provider = ReleaseService(session_factory, tenant_id)
         self._contexts: dict[str, travel_query.RunContext] = {}
+        self._write_contexts: dict[str, travel_reimburse_submit.WriteRunContext] = {}
         self._cancel_requested: set[str] = set()
         self.checkpointer = open_checkpointer(settings.data_dir / "checkpoints.sqlite", self._recorder_for)
+        # 主对话图为 oa_assistant（graphs.travel_query 仅为兼容 import shim）
         self.graph = travel_query.build_graph(self.checkpointer, self._context)
+        self.write_graph = travel_reimburse_submit.build_graph(self.checkpointer, self._write_context)
         self._timeout_seconds = timeout_seconds
         self._retention_days = retention_days
         self._last_purge = 0.0
@@ -73,8 +76,13 @@ class AgentEngine:
     def _context(self, run_id: str) -> travel_query.RunContext:
         return self._contexts[run_id]
 
+    def _write_context(self, run_id: str) -> travel_reimburse_submit.WriteRunContext:
+        return self._write_contexts[run_id]
+
     def _recorder_for(self, run_id: str | None) -> RunRecorder | None:
-        ctx = self._contexts.get(run_id) if run_id else None
+        if not run_id:
+            return None
+        ctx = self._contexts.get(run_id) or self._write_contexts.get(run_id)
         return ctx.recorder if ctx else None
 
     def start(self) -> None:
@@ -189,6 +197,16 @@ class AgentEngine:
             self._contexts.pop(run_id, None)
             self._cancel_requested.discard(run_id)
 
+    def _run_write_graph(self, ctx: travel_reimburse_submit.WriteRunContext, graph_input, thread_id: str) -> dict:
+        run_id = ctx.recorder.run_id
+        self._write_contexts[run_id] = ctx
+        config = {"configurable": {"thread_id": thread_id, "run_id": run_id}}
+        try:
+            return self.write_graph.invoke(graph_input, config)
+        finally:
+            self._write_contexts.pop(run_id, None)
+            self._cancel_requested.discard(run_id)
+
     def invoke(self, ctx: travel_query.RunContext, message: str, thread_id: str) -> dict:
         if self.checkpointer.get_tuple({"configurable": {"thread_id": thread_id}}) is not None:
             ctx.recorder.event("checkpoint_restored", metadata={"thread_id": thread_id})
@@ -198,17 +216,27 @@ class AgentEngine:
         ctx.recorder.event("checkpoint_restored", metadata={"thread_id": thread_id, "resume": True})
         return self._run_graph(ctx, Command(resume=decision), thread_id)
 
+    def invoke_write(self, ctx: travel_reimburse_submit.WriteRunContext, expense_id: int, thread_id: str) -> dict:
+        return self._run_write_graph(
+            ctx, {"run_id": ctx.recorder.run_id, "expense_id": expense_id}, thread_id,
+        )
+
+    def resume_write(self, ctx: travel_reimburse_submit.WriteRunContext, thread_id: str, decision: dict) -> dict:
+        ctx.recorder.event("checkpoint_restored", metadata={"thread_id": thread_id, "resume": True, "write": True})
+        return self._run_write_graph(ctx, Command(resume=decision), thread_id)
+
     def pending_interrupt(self, thread_id: str, run_id: str) -> dict | None:
         """Checkpoint 中属于该运行的未决中断；不存在返"None（不可恢复）"""
-        try:
-            snapshot = self.graph.get_state({"configurable": {"thread_id": thread_id}})
-        except Exception:  # noqa: BLE001 —"Checkpoint 损坏/缺失一律视为不可恢"
-            log.exception("读取 Checkpoint 失败：thread=%s", thread_id)
-            return None
-        for item in getattr(snapshot, "interrupts", ()) or ():
-            value = getattr(item, "value", None)
-            if isinstance(value, dict) and value.get("run_id") == run_id:
-                return value
+        for graph in (self.graph, self.write_graph):
+            try:
+                snapshot = graph.get_state({"configurable": {"thread_id": thread_id}})
+            except Exception:  # noqa: BLE001 —"Checkpoint 损坏/缺失一律视为不可恢"
+                log.exception("读取 Checkpoint 失败：thread=%s", thread_id)
+                continue
+            for item in getattr(snapshot, "interrupts", ()) or ():
+                value = getattr(item, "value", None)
+                if isinstance(value, dict) and value.get("run_id") == run_id:
+                    return value
         return None
 
     def recorder_for_run(self, run: Run, correlation_id: str = "") -> RunRecorder:

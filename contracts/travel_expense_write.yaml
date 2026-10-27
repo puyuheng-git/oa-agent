@@ -1,0 +1,124 @@
+# 行程报销写操作契约草图（O2：不进入自由 Tool 注册表，仅供固定 Workflow 白名单调用）
+# office-api 未上线前以 respx 契约测试为准；生产需 write_workflows_enabled 显式开启。
+# POST 请求体只含业务字段；员工身份仅 Authorization Bearer，不在 query/body 注入 oa。
+openapi: 3.0.3
+info:
+  title: OA Agent Travel Expense Write API
+  version: 1.0.0
+servers:
+  - url: "{OFFICE_API_BASE}"
+    variables:
+      OFFICE_API_BASE:
+        default: http://127.0.0.1
+paths:
+  /out_attendance/go_out_travel_expense/submit/draft:
+    post:
+      operationId: create_travel_expense_submit_draft
+      summary: 创建行程报销提交草稿
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: 可选；office-api 侧幂等（Agent 固定 Workflow 可不传）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_expense_id]
+              properties:
+                source_expense_id:
+                  type: integer
+                  minimum: 1
+                  description: 待提交的行程报销单 ID（来自只读查询）
+      security:
+        - OfficeBearer: []
+      x-agent:
+        enabled: true
+        description: 根据已存在的行程报销单生成可提交的草稿（不产生最终提交）
+        domain: travel_reimbursement
+        capability: create_travel_expense_submit_draft
+        risk_level: high
+        requires_confirmation: true
+        audit_required: true
+        idempotent: false
+        visibility: workflow
+        timeout_seconds: 15
+        inject_identity_fields: []
+        result:
+          kind: object
+          fields: [draft_id, source_expense_id, total_amount, status, status_text]
+          labels:
+            draft_id: 草稿号
+            source_expense_id: 原单号
+            total_amount: 金额
+            status_text: 状态
+        model_params:
+          source_expense_id:
+            type: integer
+            minimum: 1
+            required: true
+            label: 行程报销单号
+      responses:
+        "200":
+          description: success
+  /out_attendance/go_out_travel_expense/submit:
+    post:
+      operationId: submit_travel_expense_reimbursement
+      summary: 确认后提交行程报销
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+          description: 提交幂等键；office-api 须保证同一键不重复入账
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [draft_id]
+              properties:
+                draft_id:
+                  type: integer
+                  minimum: 1
+      security:
+        - OfficeBearer: []
+      x-agent:
+        enabled: true
+        description: 员工确认后提交草稿；须携带 Idempotency-Key
+        domain: travel_reimbursement
+        capability: submit_travel_expense_reimbursement
+        risk_level: high
+        requires_confirmation: true
+        audit_required: true
+        idempotent: true
+        visibility: workflow
+        timeout_seconds: 20
+        inject_identity_fields: []
+        result:
+          kind: object
+          fields: [submit_id, draft_id, status, status_text]
+          labels:
+            submit_id: 提交单号
+            draft_id: 草稿号
+            status_text: 状态
+        model_params:
+          draft_id:
+            type: integer
+            minimum: 1
+            required: true
+            label: 草稿号
+      responses:
+        "200":
+          description: success
+components:
+  securitySchemes:
+    OfficeBearer:
+      type: http
+      scheme: bearer

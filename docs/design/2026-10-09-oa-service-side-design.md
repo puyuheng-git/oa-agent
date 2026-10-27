@@ -30,15 +30,20 @@ Agent 已定为**独立系统**（Python + LangGraph，独立仓库、独立部�
 
 ## 3. OA / Service 侧职责
 
-### 3.1 Service（PHP 7.2）— 重做计划 Task 1
+### 3.1 Service（PHP 7.2）— 身份签发与校验（公用，重做计划 Task 1）
 
-- `LoginConst`：`TOKEN_BIZ_CODE_OFFICE = 'office'`、`LOGIN_EXPIRE_OFFICE = 1800`，加入 `TOKEN_EXPIRE`。
+Authorization **签发与 checkLogin 的真相源在 Service**，不在某一个业务域名：
+
+- `LoginConst`：`TOKEN_BIZ_CODE_OFFICE = 'office'`、`LOGIN_EXPIRE_OFFICE = 1800`，加入 `TOKEN_EXPIRE`（biz code 名可保留历史值，语义是「员工助手用 Passport」，不绑定 office-api 域名）。
 - `oa/user Export::checkLogin`：按 UID 取 DB 用户行并返回该行。
 - `oa/user Export::agentMintOfficeToken($oa, $gatewaySecret, $operateUser)` + `logic/AgentTokenImpl` + `Error`：`hash_equals` 校验 `AGENT_GATEWAY_SECRET`、`DuplicateSubmit::assert`、用户存在且可登录、Passport 签发、审计日志。
+- 各业务 HTTP 面（office-api、service-api、open-oa 等，**名称不写死**）中间件统一：有 `Authorization` → 调 Service 校验身份 → **再**做该接口的业务授权与数据范围。入口（OA 宿主 / 企微 mint）只证明「是谁」，不一次放开全部业务接口。
 
-### 3.2 office-api
+### 3.2 业务上游 HTTP 面（含 office-api）与 mint 入口
 
-核对现有 `AuthUser`、`Token`、`detail` 改动与 Task 1 契约一致；`AGENT_MINT_ALLOW_IPS` 配置为 Agent 服务器 IP。
+- 核对各域 `AuthUser`（或等价中间件）与 Task 1 契约一致：认同同一 Passport；按 token 解析员工后再做业务校验。
+- **mint HTTP**：现挂在 office-api `/agent/token/mint`；宜迁到更中性的公用入口（如 service-api 或独立鉴权路径），避免「只有 office 能签发」的错觉。`AGENT_MINT_ALLOW_IPS`、审计随入口迁移。Agent 配置上签发地址与业务上游目录已拆分，物理迁移可后置。
+- office-api 业务接口（如行程 detail）继续按员工 token 强制身份，不信任客户端/模型自报 `oa`。
 
 ### 3.3 OA（PHP 5.2, GBK）— iframe 宿主页
 
@@ -106,10 +111,21 @@ Agent 通过企业微信智能机器人长连接收到员工消息，只拿到�
 
 - MVP-3：报销草稿 / 提交业务 API（含幂等键、草稿版本、服务端重校验）。
 
+**写 API 契约（Agent O2 / MVP-3，2026-10-26 增）：**
+
+| 项 | 约定 |
+|----|------|
+| 草稿 | `POST .../go_out_travel_expense/submit/draft`（路径以 office-api 为准）；Body 仅含业务字段，**禁止**信任客户端/模型自报 `oa`、员工身份或权限结论 |
+| 提交 | `POST .../go_out_travel_expense/submit`；须带 **`Idempotency-Key`**（Agent 管理写与员工确认提交均服务端生成/校验） |
+| 身份 | 仅使用 office-api 以**该员工** token 解析出的身份；自报 `oa` 一律丢弃 |
+| 幂等 | 重复 `Idempotency-Key` 返回同一业务结果，不重复落单 |
+| 校验 | 草稿版本、字段、状态由 Service 重校验；Agent/LangGraph 不参与权限判定 |
+
+
 ---
 
 ## 4. 约束
 
-- Agent 不访问 `td_oa`；所有业务数据经 office-api 以员工 token 获取。
+- Agent 不访问 `td_oa`；所有业务数据经已配置的业务上游以员工 Authorization 获取；仅调用 Agent 侧已声明的 Tool/写契约。
 - OA 侧代码遵守 PHP 5.2 / GBK / 文件头；Service 侧遵守 service-php73-architect，写路径 `DuplicateSubmit`。
 - 改动后执行 stack-code-review。

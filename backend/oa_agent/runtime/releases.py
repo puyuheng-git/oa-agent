@@ -26,13 +26,13 @@ log = logging.getLogger(__name__)
 DRAFT, VALIDATED, PUBLISHED = "draft", "validated", "published"
 PUBLISH, ROLLBACK = "publish", "rollback"
 
-BASIC, DIALOG, MEMORY, OUTPUT = "基础", "对话与角", "多轮对话与会话压", "工具串联与输"
+BASIC, DIALOG, MEMORY, OUTPUT = "基础", "对话与角色", "多轮对话与会话压缩", "工具串联与输出"
 GROUPS = (BASIC, DIALOG, MEMORY, OUTPUT)
 
 FIELDS = (
     {"key": "intent_mode", "group": BASIC, "label": "意图解析方式", "kind": "enum",
-     "options": [{"value": "auto", "label": "自动（有可用模型时用模型，失败回退规则"},
-                 {"value": "rules", "label": "仅规"}],
+     "options": [{"value": "auto", "label": "自动（有可用模型时用模型，失败回退规则）"},
+                 {"value": "rules", "label": "仅规则"}],
      "help": "自动：由模型理解员工的话、选择工具或直接回答；模型不可用或调用失败时退回内置规则（只认识行程报销的固定说法）"
              "仅规则：不调用模型，只能回答行程报销查询，其他问题回复帮助"},
     {"key": "llm_model_id", "group": BASIC, "label": "指定模型", "kind": "model",
@@ -48,9 +48,9 @@ FIELDS = (
     {"key": "help_text", "group": BASIC, "label": "帮助回复", "kind": "text", "max": 2000,
      "help": "员工问「你能做什么」或问题无法处理时的回复。留空则按可用 Skill 的名称、说明和示例问题自动生成（推荐）；"
              "Skill 变化时自动更新）"},
-    {"key": "chat_mode", "group": DIALOG, "label": "非查询问", "kind": "enum",
-     "options": [{"value": "llm", "label": "由模型直接回答（日常聊天、通用问答"},
-                 {"value": "help", "label": "回复帮助"}],
+    {"key": "chat_mode", "group": DIALOG, "label": "非查询问题（聊天模式）", "kind": "enum",
+     "options": [{"value": "llm", "label": "由模型直接回答（日常聊天、通用问答）"},
+                 {"value": "help", "label": "回复帮助文案"}],
      "help": "与查询无关的问题（打招呼、闲聊、常识、写作润色等）怎么处理。仅「自动」意图解析且有可用模型时生效；否则回复帮助"},
     {"key": "assistant_persona", "group": DIALOG, "label": "角色设定", "kind": "text", "max": 500,
      "default": travel_query.DEFAULT_PERSONA,
@@ -64,18 +64,18 @@ FIELDS = (
      "help": "模型能看到本会话最近几轮对话（1 轮 = 员工一句 + 助手一句），用来理解「那上个月的呢」「第一条的详情」这类追问。"
              "轮数越多理解越连贯，但每次调用的 Token 越多、越慢。0 = 每句话独立理解。"
              "查询结果在历史里只保留工具、条件和记录 ID，不含业务明细"},
-    {"key": "history_message_chars", "group": MEMORY, "label": "每条历史消息的最大字", "kind": "int",
+    {"key": "history_message_chars", "group": MEMORY, "label": "每条历史消息的最大字数", "kind": "int",
      "min": 100, "max": 4000, "unit": "",
      "help": "带给模型的每条历史消息超过该字数时截断，防止一条长回复占满上下文"},
     {"key": "history_ref_ids", "group": MEMORY, "label": "查询摘要中保留的记录 ID ", "kind": "int",
      "min": 0, "max": 100, "unit": "",
      "help": "列表查询后，历史里按显示顺序记下前 N 条记录的 ID，员工说「第 3 条的详情」时模型据此选 ID。"
              "0 = 不记 ID（这类追问将无法理解）"},
-    {"key": "history_compress", "group": MEMORY, "label": "超出轮数时压缩会", "kind": "bool",
+    {"key": "history_compress", "group": MEMORY, "label": "超出轮数时压缩会话", "kind": "bool",
      "help": "对话超过上面的轮数后，更早的对话怎么处理。开启：按下面的方式压缩成「记忆」带给模型，"
              "员工很久之前提过的偏好、条件仍能被理解；关闭：直接丢弃，模型只看到最近几轮"},
     {"key": "history_compress_mode", "group": MEMORY, "label": "压缩方式", "kind": "enum",
-     "options": [{"value": "truncate", "label": "截断压缩（不调用模型，零成本"},
+     "options": [{"value": "truncate", "label": "截断压缩（不调用模型，零成本）"},
                  {"value": "summary", "label": "滚动摘要（模型改写摘要）"},
                  {"value": "facts", "label": "要点提取（模型提取关键事实）"}],
      "help": "截断压缩：每条旧消息只保留开头若干字，按时间顺序排列，超出记忆上限丢最早的；简单可靠、不额外花钱"
@@ -85,20 +85,20 @@ FIELDS = (
              "要点提取：模型从移出的对话中提取偏好、查询条件、记录 ID、未完成的请求等要点并去重合并；"
              "最适合查询类助手，成本与滚动摘要相当。\n"
              "模型方式失败（未配置模型、调用失败、输出无效）时自动改用截断压缩，不影响回复"},
-    {"key": "compress_memory_chars", "group": MEMORY, "label": "记忆最大字", "kind": "int",
+    {"key": "compress_memory_chars", "group": MEMORY, "label": "记忆最大字数", "kind": "int",
      "min": 200, "max": 4000, "unit": "",
      "help": "压缩后的记忆总长度上限，超出时丢弃最早的内容。记忆随每次模型调用一起发送，越长 Token 越多"},
-    {"key": "compress_truncate_chars", "group": MEMORY, "label": "截断压缩：每条保留字", "kind": "int",
+    {"key": "compress_truncate_chars", "group": MEMORY, "label": "截断压缩：每条保留字数", "kind": "int",
      "min": 20, "max": 500, "unit": "", "help": "仅「截断压缩」使用：每条旧消息保留开头的字数"},
-    {"key": "max_tool_steps", "group": OUTPUT, "label": "工具串联最大步", "kind": "int",
+    {"key": "max_tool_steps", "group": OUTPUT, "label": "工具串联最大步数", "kind": "int",
      "min": 1, "max": 5, "unit": "",
      "help": "一个问题需要先用 A 再用 A 的结果查 B 时（如「我最近一笔报销的详情」），模型一次规划多个步骤，"
              "后面步骤的参数引用前面步骤的返回字段，由服务端取值（模型看不到任何返回数据）"
              "1 = 不串联，每次只调一个工具。步数越多越容易出现中途无数据而停止"},
-    {"key": "max_table_rows", "group": OUTPUT, "label": "表格最多显示行", "kind": "int",
+    {"key": "max_table_rows", "group": OUTPUT, "label": "表格最多显示行数", "kind": "int",
      "min": 1, "max": 200, "unit": "",
      "help": "列表结果在回复里最多显示的行数；超出时提示「显示前 N 条」。企业微信单条消息有 20KB 上限，过多的行会被截断"},
-    {"key": "chat_reply_max_chars", "group": OUTPUT, "label": "聊天回复最大字", "kind": "int",
+    {"key": "chat_reply_max_chars", "group": OUTPUT, "label": "聊天回复最大字数", "kind": "int",
      "min": 200, "max": 20000, "unit": "",
      "help": "模型直接回答（非查询）时回复的最大字数，超出部分截掉。需要更长回答时同时调大模型的 max_tokens"},
     {"key": "stream_output", "group": OUTPUT, "label": "流式输出", "kind": "bool",
@@ -147,7 +147,7 @@ def validate_content(db: Session, tenant_id: str, content: dict) -> list[str]:
             errors.append("指定模型必须是模型 ID 或留空")
         elif db.scalar(sa.select(LlmModel.id).where(LlmModel.tenant_id == tenant_id, LlmModel.id == model_id,
                                                     LlmModel.enabled.is_(True))) is None:
-            errors.append(f"指定模型 {model_id} 不存在或未启")
+            errors.append(f"指定模型 {model_id} 不存在或未启用")
     return errors
 
 

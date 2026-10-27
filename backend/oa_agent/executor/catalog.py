@@ -640,7 +640,7 @@ class Catalog:
         for tool in db.scalars(sa.select(Tool).where(Tool.tenant_id == self.tenant).order_by(Tool.name)):
             for vid in {tool.current_version_id, tool.pending_version_id} - {None}:
                 upstream = (db.get(ToolVersion, vid).schema_json or {}).get("upstream", DEFAULT_UPSTREAM)
-                if upstream not in keep | {DEFAULT_UPSTREAM}:
+                if upstream not in keep:
                     used.append(f"{tool.name}（{upstream}）")
         return list(dict.fromkeys(used))
 

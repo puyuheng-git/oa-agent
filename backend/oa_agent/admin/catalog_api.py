@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
 import sqlalchemy as sa
@@ -20,6 +21,7 @@ from oa_agent.errors import AppError
 from oa_agent.integrations.office_api import DEFAULT_UPSTREAM
 from oa_agent.executor import apipost
 from oa_agent.executor.catalog import compare, normalize_skill, normalize_tool_form, registration_blockers
+from oa_agent.executor.contract_test import contract_check, is_activatable
 from oa_agent.executor.visibility import VisibilityService
 from oa_agent.runtime.llm import ModelCallError, build_chat_model, resolve_model
 
@@ -29,6 +31,8 @@ visibility_router = APIRouter(prefix="/v1/admin/visibility", tags=["admin-skills
 
 TOOL = "ops.tool.manage"
 SKILL = "ops.skill.manage"
+
+log = logging.getLogger(__name__)
 
 
 class ReasonIn(BaseModel):
@@ -133,10 +137,17 @@ def _tool_view(ctx: AdminCtx, tool: Tool) -> dict:
 
 
 def _upstreams(ctx: AdminCtx) -> list[dict]:
-    """Tool 可选的 office-api 地址（只读视图，供表单下拉；配置在「OA 对接」）"""
+    """Tool 可选的业务上游（只读视图，供表单下拉；配置在「OA 对接」）"""
     values = ctx.runtime.settings_svc.view(ctx.db, "oa")["values"]
-    return [{"key": DEFAULT_UPSTREAM, "label": "office-api（主", "base_url": values.get("office_api_base_url")},
-            *(values.get("extra_upstreams") or [])]
+    items = list(values.get("upstreams") or [])
+    if items:
+        return [{"key": u["key"], "label": u.get("label") or u["key"], "base_url": u.get("base_url")} for u in items]
+    base = values.get("office_api_base_url") or values.get("mint_base_url")
+    out = []
+    if base:
+        out.append({"key": DEFAULT_UPSTREAM, "label": "office-api", "base_url": base})
+    out.extend(values.get("extra_upstreams") or [])
+    return out
 
 
 @tools_router.get("")
@@ -145,7 +156,12 @@ def list_tools(kind: Literal["office", "builtin", "mcp"] | None = None, ctx: Adm
     if kind:
         stmt = stmt.where(Tool.kind == kind)
     tools = ctx.db.scalars(stmt.order_by(Tool.name)).all()
-    return {"items": [_tool_view(ctx, t) for t in tools], "upstreams": _upstreams(ctx)}
+    oa = ctx.runtime.settings_svc.view(ctx.db, "oa")["values"]
+    default_key = (oa.get("default_upstream_key") or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+    ups = _upstreams(ctx)
+    if ups and default_key not in {u["key"] for u in ups}:
+        default_key = ups[0]["key"]
+    return {"items": [_tool_view(ctx, t) for t in tools], "upstreams": ups, "default_upstream_key": default_key}
 
 
 @tools_router.get("/{name}")
@@ -216,7 +232,7 @@ def _save_tool(ctx: AdminCtx, body: ToolIn, create: bool) -> dict:
                            "内置 / MCP 工具不可改 method、path、builtin_id 等核心字段；请用启停开关或「MCP 连接」页同步")
         upstream = spec.get("upstream", DEFAULT_UPSTREAM)
         if upstream not in {u["key"] for u in _upstreams(ctx)}:
-            raise AppError(422, "VALIDATION_ERROR", f"office-api 地址 {upstream} 未在「OA 对接」中配置")
+            raise AppError(422, "VALIDATION_ERROR", f"业务上游 {upstream} 未在「OA 对接」中配置")
         result = engine.catalog.save_tool(ctx.db, spec, ctx.user.username)
         ctx.db.flush()
         engine.catalog.revalidate_skills(ctx.db)
@@ -314,11 +330,18 @@ def activate_tool_version(name: str, body: ActivateIn, ctx: AdminCtx = Depends(a
     engine = ctx.runtime.engine
     with ctx.db.begin():
         tool = _get_tool(ctx, name)
+        version = _tool_version(ctx, tool, body.version_no)
+        schema = version.schema_json or {}
+        check = contract_check(schema)
+        for warning in check.warnings:
+            log.warning("Tool %s v%s 契约检查：%s", name, body.version_no, warning)
+        if not is_activatable(schema):
+            raise AppError(400, "CONTRACT_NOT_ACTIVATABLE", "契约检查未通过，不可激活该 Tool 版本")
         before = _version_no(ctx, tool.current_version_id)
         try:
             engine.catalog.activate_version(ctx.db, tool, body.version_no, ctx.user.username)
         except LookupError:
-            raise AppError(404, "NOT_FOUND", f"版本 v{body.version_no} 不存") from None
+            raise AppError(404, "NOT_FOUND", f"版本 v{body.version_no} 不存在") from None
         ctx.audit("tool.activate", "tool", name, before={"version_no": before},
                   after={"version_no": body.version_no}, reason=body.reason)
     _reload(ctx)
@@ -384,7 +407,7 @@ def sync_skills(ctx: AdminCtx = Depends(admin_write(SKILL))):
 
 
 def _save_skill(ctx: AdminCtx, body: SkillIn, create: bool) -> dict:
-    content, errors = normalize_skill({**body.model_dump(exclude={"reason"}), "workflow": "travel_query"})
+    content, errors = normalize_skill({**body.model_dump(exclude={"reason"}), "workflow": "oa_assistant"})
     if errors:
         raise AppError(422, "VALIDATION_ERROR", "".join(errors))
     engine = ctx.runtime.engine

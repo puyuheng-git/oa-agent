@@ -11,7 +11,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from oa_agent.executor.catalog import BREAKING, COMPATIBLE, SpecError, compare, parse_openapi
-from oa_agent.runtime.graphs import travel_query
+from oa_agent.runtime.graphs import travel_query, oa_assistant
 from oa_agent.settings import REPO_ROOT
 from tests.conftest import audit_rows, login
 from tests.test_accounts_rbac import VIEWER_PASS, _role, _user
@@ -182,14 +182,14 @@ def test_tool_disabled_mid_run_is_refused(chat, office, admin, monkeypatch):
     """运行已开始（已选定 Tool）后 Tool 被停用：执行器按最新注册表拒绝调用"""
     rt = runtime(chat)
     route = office.get(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": []}}))
-    original = travel_query._rules
+    original = oa_assistant._rules
 
     def rules_then_disable(*args):
         out = original(*args)
         rt.engine.registry = type(rt.engine.registry)({})
         return out
 
-    monkeypatch.setattr(travel_query, "_rules", rules_then_disable)
+    monkeypatch.setattr(oa_assistant, "_rules", rules_then_disable)
     body = send(chat, open_chat(chat), "查上周的行程报销").json()
     assert body["reply"]["error_code"] == "TOOL_NOT_AVAILABLE" and route.call_count == 0
 

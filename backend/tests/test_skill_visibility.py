@@ -272,7 +272,7 @@ def test_admin_put_visibility_and_preview(admin_client, rt):
 
 
 def test_execute_hidden_tool_returns_not_available_no_upstream(chat, office, rt, monkeypatch):
-    from oa_agent.runtime.graphs import travel_query as tq
+    from oa_agent.runtime.graphs import oa_assistant as tq
     from tests.test_chat import LIST_URL, open_chat, send
 
     _allow_oa_only(rt, "travel_expense_query", "alice")

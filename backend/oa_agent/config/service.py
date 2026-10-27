@@ -18,6 +18,9 @@ from oa_agent.observability.redact import redact
 
 ORIGIN_RE = re.compile(r"https?://[A-Za-z0-9.-]+(:\d{1,5})?")
 MAX_UPSTREAMS = 20
+# 旧配置键：读取时映射到 mint_base_url / upstreams，新保存不再写入
+LEGACY_OA_BASE = "office_api_base_url"
+LEGACY_OA_EXTRA = "extra_upstreams"
 
 
 def _group(name: str) -> GroupDef:
@@ -94,9 +97,9 @@ def _upstreams(f: FieldDef, value) -> list[dict]:
     out: list[dict] = []
     for item in value:
         key = str(item.get("key") or "").strip()
-        if not UPSTREAM_KEY_RE.fullmatch(key) or key == DEFAULT_UPSTREAM:
-            raise AppError(422, "VALIDATION_ERROR", f"{f.label}：标识 {key!r} 只能用小写字母、数字、下划线，"
-                                                    f"以字母开头，2～32 位，且不能是 {DEFAULT_UPSTREAM}")
+        if not UPSTREAM_KEY_RE.fullmatch(key):
+            raise AppError(422, "VALIDATION_ERROR",
+                           f"{f.label}：标识 {key!r} 只能用小写字母、数字、下划线，以字母开头，2～32 位")
         if any(o["key"] == key for o in out):
             raise AppError(422, "VALIDATION_ERROR", f"{f.label}：标识 {key} 重复")
         label = f"{f.label}「{key}」"
@@ -106,6 +109,57 @@ def _upstreams(f: FieldDef, value) -> list[dict]:
             raise AppError(422, "VALIDATION_ERROR", f"{label} 只能是 http(s) 地址，不能带用户名、查询串或 #")
         out.append({"key": key, "label": str(item.get("label") or "").strip()[:64] or key, "base_url": url})
     return out
+
+
+def apply_oa_compat(values: dict, rows: dict[str, Setting] | None = None) -> dict:
+    """把旧 office_api_base_url / extra_upstreams 映射到 mint_base_url + upstreams（不写库）。"""
+    out = dict(values)
+    legacy_base = out.get(LEGACY_OA_BASE)
+    legacy_extra = out.get(LEGACY_OA_EXTRA)
+    if rows is not None:
+        if legacy_base is None and LEGACY_OA_BASE in rows:
+            legacy_base = rows[LEGACY_OA_BASE].value_json
+        if legacy_extra is None and LEGACY_OA_EXTRA in rows:
+            legacy_extra = rows[LEGACY_OA_EXTRA].value_json
+    if isinstance(legacy_extra, str):
+        try:
+            legacy_extra = json.loads(legacy_extra)
+        except ValueError:
+            legacy_extra = []
+    upstreams = out.get("upstreams")
+    if not upstreams:
+        upstreams = []
+        if legacy_base:
+            url = str(legacy_base).rstrip("/")
+            upstreams.append({"key": DEFAULT_UPSTREAM, "label": "office-api", "base_url": url})
+        if isinstance(legacy_extra, list):
+            for item in legacy_extra:
+                if isinstance(item, dict) and item.get("key"):
+                    upstreams.append(item)
+        out["upstreams"] = upstreams
+    mint = out.get("mint_base_url")
+    if not mint:
+        mint = legacy_base
+        if not mint and upstreams:
+            default_key = (out.get("default_upstream_key") or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+            mint = next((u.get("base_url") for u in upstreams if u.get("key") == default_key), None)
+            if not mint:
+                mint = upstreams[0].get("base_url")
+        out["mint_base_url"] = str(mint).rstrip("/") if mint else mint
+    if not (out.get("default_upstream_key") or "").strip():
+        out["default_upstream_key"] = DEFAULT_UPSTREAM
+    return out
+
+
+def validate_oa_upstream_refs(values: dict) -> None:
+    """有上游列表时，默认上游标识必须在列表中。"""
+    upstreams = values.get("upstreams") or []
+    if not upstreams:
+        return
+    keys = {u["key"] for u in upstreams if isinstance(u, dict) and u.get("key")}
+    default = (values.get("default_upstream_key") or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+    if default not in keys:
+        raise AppError(422, "VALIDATION_ERROR", f"新建 Tool 默认上游「{default}」不在业务上游列表中")
 
 
 def normalize_origin(text: str) -> str | None:
@@ -146,6 +200,8 @@ class SettingsService:
                 values[f.key] = row.value_json if row else f.default
                 if row:
                     meta[f.key] = {"version": row.version, "updated_by": row.updated_by, "updated_at": row.updated_at}
+        if group == "oa":
+            values = apply_oa_compat(values, rows)
         return {
             "group": g.name,
             "label": g.label,
@@ -168,6 +224,8 @@ class SettingsService:
             else:
                 row = rows.get(f.key)
                 out[f.key] = row.value_json if row else f.default
+        if group == "oa":
+            out = apply_oa_compat(out, rows)
         return out
 
     def merged_candidate(self, db: Session, group: str, values: dict) -> dict:
@@ -182,6 +240,8 @@ class SettingsService:
                         current[f.key] = str(v)
                 else:
                     current[f.key] = _coerce(f, v)
+        if group == "oa":
+            validate_oa_upstream_refs(current)
         return current
 
     def summary(self, db: Session, group: str) -> str:
@@ -195,6 +255,8 @@ class SettingsService:
             else:
                 row = rows.get(f.key)
                 out[f.key] = row.value_json if row else f.default
+        if group == "oa":
+            out = apply_oa_compat(out, rows)
         return redact(json.dumps(out, ensure_ascii=False, default=str))
 
     def update(self, db: Session, group: str, values: dict, clear_secrets: list[str], actor: str) -> list[str]:
@@ -203,6 +265,8 @@ class SettingsService:
         unknown = set(values) - {f.key for f in g.fields}
         if unknown:
             raise AppError(422, "VALIDATION_ERROR", f"未知字段：{', '.join(sorted(unknown))}")
+        if group == "oa":
+            validate_oa_upstream_refs(self.merged_candidate(db, group, values))
         rows = self._rows(db, group)
         changed: list[str] = []
         for f in g.fields:

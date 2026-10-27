@@ -11,6 +11,7 @@ interface Upstream { key: string; label: string; base_url: string | null }
 
 const items = ref<ToolItem[]>([])
 const upstreams = ref<Upstream[]>([])
+const defaultUpstreamKey = ref('office')
 const kindFilter = ref<'' | ToolKind>('')
 const KIND_LABEL: Record<ToolKind, string> = { office: 'OA 接口', builtin: '内置', mcp: 'MCP' }
 const loading = ref(false)
@@ -27,9 +28,13 @@ async function load() {
   loading.value = true
   loadError.value = ''
   try {
-    const r = await http.get<{ items: ToolItem[]; upstreams: Upstream[] }>('/v1/admin/tools', { kind: kindFilter.value || undefined })
+    const r = await http.get<{ items: ToolItem[]; upstreams: Upstream[]; default_upstream_key?: string }>(
+      '/v1/admin/tools', { kind: kindFilter.value || undefined })
     items.value = r.items
     upstreams.value = r.upstreams
+    defaultUpstreamKey.value = r.default_upstream_key
+      || r.upstreams[0]?.key
+      || 'office'
   } catch (e) {
     loadError.value = errorMessage(e)
   } finally {
@@ -133,7 +138,7 @@ const reason = ref('')
 
 function create() {
   editing.value = false
-  form.value = emptyToolForm()
+  form.value = emptyToolForm(defaultUpstreamKey.value)
   reason.value = ''
   draftWarnings.value = []
   skillDraft.value = null
@@ -270,7 +275,7 @@ onMounted(load)
       type="info"
       :closable="false"
       show-icon
-      title="Tool 是对 office-api 只读接口的声明，在此新建、编辑后立即生效，无需改代码。保存时：兼容变更直接生效；不兼容变更（删参数、改路径等）存为待激活版本。员工身份由服务端注入，模型无法指定。停用后立即拒绝调用。"
+      title="Tool 是对业务上游只读接口的声明，在此新建、编辑后立即生效，无需改代码。保存时：兼容变更直接生效；不兼容变更（删参数、改路径等）存为待激活版本。员工身份由服务端注入，模型无法指定。停用后立即拒绝调用。"
       style="margin-bottom: 12px"
     />
     <div style="margin-bottom: 12px">
@@ -380,14 +385,14 @@ onMounted(load)
           <el-input v-model="form.description" type="textarea" :rows="2" maxlength="2000" show-word-limit
             placeholder="给模型看：什么问题该用这个 Tool、能查到什么" />
         </el-form-item>
-        <el-form-item label="office-api 地址" required>
+        <el-form-item label="业务上游" required>
           <el-select v-model="form.upstream" style="width: 420px">
             <el-option v-for="u in upstreams" :key="u.key" :value="u.key"
               :label="`${u.label}（${u.base_url || '未设置'}）`" />
             <el-option v-if="!upstreams.some((u) => u.key === form.upstream)" :value="form.upstream"
               :label="`${form.upstream}（未配置）`" />
           </el-select>
-          <span class="hint">地址在「系统设置 → OA 对接」中维护；改地址属于不兼容变更。</span>
+          <span class="hint">上游在「系统设置 → OA 对接 → 业务上游地址」中维护；改上游属于不兼容变更。</span>
         </el-form-item>
         <el-form-item label="接口路径" required>
           <el-input v-model="form.path" placeholder="所选地址下的相对路径，如 /hr/leave/index">
@@ -409,7 +414,7 @@ onMounted(load)
         </el-form-item>
         <el-form-item label="身份查询参数">
           <el-input v-model="form.identityParams" style="width: 240px" placeholder="如 user_id，多个用逗号分隔" />
-          <span class="hint">这些查询参数由服务端填入当前员工 oa，模型无法指定、也不能出现在参数表中。须由 office-api 按 token 校验该值，否则不安全。</span>
+          <span class="hint">这些查询参数由服务端填入当前员工 oa，模型无法指定、也不能出现在参数表中。须由业务上游按 token 校验该值，否则不安全。</span>
         </el-form-item>
 
         <h4 class="sec">模型可填的参数</h4>

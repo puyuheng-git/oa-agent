@@ -23,7 +23,7 @@ from oa_agent.config.service import SettingsService
 from oa_agent.config.vault import SecretVault
 from oa_agent.db.engine import make_engine, make_sessionmaker
 from oa_agent.db.migrate import revision_status, upgrade_head
-from oa_agent.kv import KVManager
+from oa_agent.kv import KVManager, assert_production_kv
 from oa_agent.observability.audit import AuditService
 from oa_agent.observability.redact import redact
 from oa_agent.runtime.engine import AgentEngine
@@ -71,6 +71,7 @@ class AppRuntime:
         self.mode = NORMAL
         self._ensure_migrated()
         self.reload_redis()
+        assert_production_kv(self.kv.current, self.settings)
         self.engine = AgentEngine(self.settings, self.session, self.tenant_id, self._run_timeout,
                                   self._retention_days, self.setting)
         self.engine.start()

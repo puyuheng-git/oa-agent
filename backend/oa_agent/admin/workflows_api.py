@@ -15,6 +15,7 @@ from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
 from oa_agent.db.models import AgentDefinition, ConfigRelease, LlmModel, Skill, WorkflowVersion
 from oa_agent.errors import AppError
 from oa_agent.runtime.graphs import travel_query
+from oa_agent.runtime.graphs.travel_query import resolve_workflow_id
 from oa_agent.runtime.releases import FIELDS, GROUPS, PUBLISHED, ReleaseError, ReleaseService, diff_content
 
 router = APIRouter(prefix="/v1/admin/workflows", tags=["admin-workflows"])
@@ -39,7 +40,7 @@ class RollbackIn(BaseModel):
 
 def _svc(ctx: AdminCtx, workflow_id: str) -> ReleaseService:
     svc: ReleaseService = ctx.runtime.engine.release_provider
-    if workflow_id != svc.workflow_id:
+    if resolve_workflow_id(workflow_id) != svc.workflow_id:
         raise AppError(404, "NOT_FOUND", "Workflow 不存在")
     return svc
 

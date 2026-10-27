@@ -154,14 +154,44 @@ class OfficeApiClient:
         data, hint = self._unwrap(resp)
         return OfficeResponse(data, resp.status_code, ms, hint)
 
+    def post(self, path: str, body: dict, authorization: str, *, timeout: float | None = None,
+             idempotency_key: str | None = None) -> OfficeResponse:
+        headers = {"Authorization": authorization}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        resp, ms = self._send("POST", path, json=body, headers=headers, timeout=timeout)
+        data, hint = self._unwrap(resp)
+        return OfficeResponse(data, resp.status_code, ms, hint)
+
+
+def mint_base_url(oa_settings: dict) -> str | None:
+    """签发入口基址；已由 SettingsService.apply_oa_compat 做过旧字段映射。"""
+    url = oa_settings.get("mint_base_url") or oa_settings.get("office_api_base_url")
+    return str(url).rstrip("/") if url else None
+
 
 def upstream_clients(oa_settings: dict) -> dict[str, OfficeApiClient]:
-    """Tool 可用的 office-api 地址：主地址（`office`）+ 其他地址；都以员工 token 调用。主地址未配置时抛错。"""
+    """业务上游客户端：来自 upstreams 目录（peer）；都以员工 Authorization 调用。
+
+    兼容旧配置：无 upstreams 时用 office_api_base_url 作为 office + extra_upstreams。
+    目录为空时仍尝试构建默认 office 客户端，未配置则抛 OFFICE_API_NOT_CONFIGURED。
+    """
     codes = oa_settings.get("success_codes")
     hint_max = int(oa_settings.get("business_hint_max_chars") or MAX_HINT)
-    clients = {DEFAULT_UPSTREAM: OfficeApiClient(oa_settings.get("office_api_base_url"), codes, hint_max=hint_max)}
-    for item in oa_settings.get("extra_upstreams") or []:
-        clients[item["key"]] = OfficeApiClient(item["base_url"], codes, hint_max=hint_max)
+    items = list(oa_settings.get("upstreams") or [])
+    if not items:
+        base = oa_settings.get("office_api_base_url") or oa_settings.get("mint_base_url")
+        if base:
+            items = [{"key": DEFAULT_UPSTREAM, "label": "office-api", "base_url": base}]
+        for extra in oa_settings.get("extra_upstreams") or []:
+            items.append(extra)
+    if not items:
+        # 保持与旧行为一致：访问默认上游时给出未配置错误
+        return {DEFAULT_UPSTREAM: OfficeApiClient(None, codes, hint_max=hint_max)}
+    clients: dict[str, OfficeApiClient] = {}
+    for item in items:
+        key = item["key"]
+        clients[key] = OfficeApiClient(item.get("base_url"), codes, hint_max=hint_max)
     return clients
 
 

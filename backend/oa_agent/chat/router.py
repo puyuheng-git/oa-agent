@@ -20,8 +20,8 @@ from oa_agent.auth import chat_launch
 from oa_agent.auth.chat_launch import ChatSession
 from oa_agent.auth.rbac import request_meta
 from oa_agent.chat.service import (
-    chat_available, guard_message, handle_message, launch_policy, load_reply, load_settings, office_client,
-    setting, skill_menu, user_reply_for,
+    chat_available, confirm_write, guard_message, handle_message, launch_policy, load_reply, load_settings,
+    office_client, setting, skill_menu, user_reply_for,
 )
 from oa_agent.chat import memory_store
 from oa_agent.chat.threads import (
@@ -67,6 +67,10 @@ class SwitchIn(BaseModel):
 
 class MemoryClearIn(BaseModel):
     confirm: Literal[True]
+
+
+class ConfirmationIn(BaseModel):
+    token: str = Field(min_length=10, max_length=128)
 
 
 class ChatAuth:
@@ -406,6 +410,13 @@ def delete_memory(
     if not ok:
         raise AppError(404, "MEMORY_NOT_FOUND", "记忆不存在")
     return {"ok": True}
+
+
+@router.post("/confirmations/{task_id}")
+def confirm_workflow(task_id: str, body: ConfirmationIn, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    """员工确认写操作：校验令牌后恢复固定 Workflow（管理员不能代确认）。"""
+    rt = get_runtime(request)
+    return confirm_write(rt, auth.session, task_id, body.token.strip(), request.state.request_id)
 
 
 @router.get("/runs/{run_id}")

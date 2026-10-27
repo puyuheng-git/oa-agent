@@ -14,7 +14,7 @@ import {
   type WorkflowSchema,
 } from '../ops'
 
-const WF = '/v1/admin/workflows/travel_query'
+const WF = '/v1/admin/workflows/oa_assistant'
 
 const detail = ref<WorkflowDetail | null>(null)
 const schema = ref<WorkflowSchema | null>(null)

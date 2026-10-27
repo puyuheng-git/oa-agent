@@ -78,25 +78,31 @@ GROUPS: dict[str, GroupDef] = {
             "OA 对接",
             "热生效",
             (
-                FieldDef("office_api_base_url", "office-api 地址（主）", "url",
-                         help="签发员工 token（mint）与默认 Tool 调用都走这里"),
-                FieldDef("extra_upstreams", "其他 office-api 地址", "upstreams", [],
-                         "必须认同主地址签发的员工 token（同一信任域）；Tool 可选择走这些地址"),
+                FieldDef("mint_base_url", "员工 token 签发地址", "url",
+                         help="OA 宿主页 / 企微入口换员工 Authorization 的 HTTP 基址（调用 /agent/token/mint）。"
+                              "与业务上游分离；未配置时兼容读取旧「office-api 主地址」。"),
+                FieldDef("upstreams", "业务上游地址", "upstreams", [],
+                         "认同同一员工 Authorization 的业务 HTTP 面（名称自定，勿写死域名）。"
+                         "每项标识 + 名称 + 基址；Tool 只引用标识与相对路径。"
+                         "入口建权后可带 token 调用目录内上游上已声明的接口；各接口仍须 OA 侧业务授权。"),
+                FieldDef("default_upstream_key", "新建 Tool 默认上游", "str", "office",
+                         help="仅影响新建 Tool 的默认上游标识，无协议特权；须存在于上方列表中（有列表时）。"),
                 FieldDef("gateway_secret", "AGENT_GATEWAY_SECRET（mint 用）", "secret",
-                         help="向 office-api 签发员工 token 时使用的网关密钥，须与 OA 侧配置一致。只写不读。"),
+                         help="向签发入口换员工 token 时使用的网关密钥，须与 OA 侧配置一致。只写不读。"),
                 FieldDef("assertion_hmac_secret", "OA assertion HMAC 密钥", "secret",
                          help="校验 OA 宿主页签发的员工身份断言（assertion）的密钥，须与 OA 侧配置一致。只写不读。"),
                 FieldDef("allowed_frame_origins", "允许嵌入的 OA 域名", "list", [], "如 https://oa.example.com"),
-                FieldDef("success_codes", "office-api 成功码", "list", ["0", "200"], "响应 code 字段视为成功的取值"),
+                FieldDef("success_codes", "业务上游成功码", "list", ["0", "200"], "响应 code 字段视为成功的取值"),
                 FieldDef("business_hint_max_chars", "业务提示语最大长度", "int", 200,
-                         "office-api 返回的 msg/message 提示语（如「该单据不存在」）展示给员工前的截断长度。"
+                         "业务上游返回的 msg/message 提示语（如「该单据不存在」）展示给员工前的截断长度。"
                          "过长的提示语多为接口异常堆栈，截断可避免泄露内部信息。", min=50, max=1000, unit="字"),
                 FieldDef("tool_remark_max_chars", "备注字段最大长度", "int", 100,
                          "Tool 返回结果中 remark（备注）字段的截断长度，超出部分以「…」结尾。"
                          "备注通常是员工自由填写的长文本，截断可以让表格保持可读。", min=20, max=2000, unit="字"),
             ),
-            description="助手与 OA 之间只走 HTTP：员工身份由 OA 宿主页签发的 assertion 证明，"
-                        "业务数据只来自 office-api 以该员工 token 返回的结果。",
+            description="助手与 OA 只走 HTTP：入口（宿主页 assertion / 企微）完成身份与 token 签发；"
+                        "业务数据只来自已配置上游以该员工 Authorization 返回的结果，且仅限已声明的 Tool/写契约。"
+                        "旧字段 office_api_base_url / extra_upstreams 读取时自动映射，保存请用新字段。",
         ),
         GroupDef(
             "chat",
@@ -273,6 +279,9 @@ GROUPS: dict[str, GroupDef] = {
                 FieldDef("export_max_days", "对话导出最大时间跨度", "int", 92,
                          "导出对话记录时开始与结束时间的最大间隔，防止一次导出过多数据拖慢数据库。",
                          min=1, max=366, unit="天"),
+                FieldDef("write_workflows_enabled", "启用固定写 Workflow", "bool", False,
+                         "开启后允许运行行程报销等固定写闭环（查→草稿→员工确认→提交）。"
+                         "office-api 写接口未就绪或探针失败时应保持关闭；默认关闭。"),
                 FieldDef("http_allow_hosts", "内置 HTTP 全局白名单", "list", [],
                          "内置工具 sys.http 的默认允许主机（如 api.example.com 或 *.example.com）；"
                          "单个 Tool 的沙箱策略里配置了 http_allow_hosts 时以 Tool 为准。"

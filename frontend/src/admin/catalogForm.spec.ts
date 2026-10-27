@@ -40,6 +40,7 @@ describe('catalogForm', () => {
 
   it('defaults upstream to office and keeps a chosen one', () => {
     expect(toolFormFromSchema({ name: 'x', result: {} }).upstream).toBe('office')
+    expect(emptyToolForm('hr').upstream).toBe('hr')
     const form = { ...emptyToolForm(), upstream: 'hr' }
     expect(toolPayload(form).upstream).toBe('hr')
     expect(toolFormFromSchema(toolPayload(form)).upstream).toBe('hr')

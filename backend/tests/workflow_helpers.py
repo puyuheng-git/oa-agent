@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-WF = "/v1/admin/workflows/travel_query"
+WF = "/v1/admin/workflows/oa_assistant"
 
 
 def publish_config(admin, overrides: dict, reason: str = "测试发布") -> dict:
