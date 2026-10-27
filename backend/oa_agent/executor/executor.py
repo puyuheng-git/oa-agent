@@ -138,7 +138,7 @@ class ToolExecutor:
         self.mcp_client = mcp_client  # None → 未配置出站连接器（调用即「未对你开放」）
 
     def _execute_mcp(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
-        """kind=mcp：参数由 MCP 服务端自行校验，这里只丢弃身份字段；结果一律作为不可信数据围栏后回图。"""
+        """kind=mcp：默认由 MCP 服务端校验参数，这里丢弃身份字段；spec.model_params 非空时先本地校验；结果一律作为不可信数据围栏后回图。"""
         from oa_agent.executor.outbound import MAX_RESULT_BYTES, NoopOutboundMcpClient
         from oa_agent.security.prompt_guard import wrap_untrusted
 
@@ -151,6 +151,8 @@ class ToolExecutor:
         try:
             if not spec.mcp_server_id or not spec.mcp_tool_name:
                 raise ToolError("TOOL_NOT_AVAILABLE", f"MCP 工具未绑定连接：{name}", user_message=MSG_NOT_AVAILABLE)
+            if spec.model_params:  # 仅声明了 model_params 才本地校验；同步来的 MCP Tool 为空（远端 input_schema 未映射）
+                clean, _ = validate_args(spec, clean)
             client = self.mcp_client or NoopOutboundMcpClient()
             raw = client.call_tool(spec.mcp_tool_name, clean, identity=identity, server_id=spec.mcp_server_id)
         except ToolError as exc:

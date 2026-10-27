@@ -509,3 +509,35 @@ def test_resolver_rechecks_remote_allowlist_at_call_time(installed, admin):
     r = admin.put("/v1/admin/settings/mcp", json={"values": {"allowed_origins": ["https://mcp.example.internal"]}})
     assert r.status_code == 200, r.text
     assert resolver(sid).url == "https://mcp.example.internal/mcp"
+
+
+# ---------------------------------------------------------------- Review fix：model_params 校验 / 写上下文注入
+
+
+def test_executor_mcp_validates_declared_model_params_before_call():
+    out = _FakeOutbound({"text": "x", "truncated": False})
+    spec = _mcp_spec(model_params={"q": {"type": "string", "required": True},
+                                   "n": {"type": "integer", "maximum": 5}})
+    rec = _Rec()
+    with pytest.raises(ToolError) as e:
+        _executor(spec, out).execute("demo_echo", {"n": 1}, IDENTITY, rec, "n")
+    assert e.value.code == "INVALID_ARGUMENT" and out.calls == []
+    assert rec.events[-1]["status"] == "error" and rec.events[-1]["error_code"] == "INVALID_ARGUMENT"
+    _executor(spec, out).execute("demo_echo", {"q": "a", "n": "9", "extra": 1}, IDENTITY, _Rec(), "n")
+    assert out.calls[0][1] == {"q": "a", "n": 5}  # 未声明字段丢弃、上限截断
+
+
+def test_write_context_injects_mcp_client(installed, monkeypatch):
+    svc = pytest.importorskip("oa_agent.chat.service")
+    if not hasattr(svc, "_build_write_context"):
+        pytest.skip("write context 尚未提交")
+    from oa_agent.executor.mcp_runtime import get_mcp_client
+
+    monkeypatch.setattr(svc, "tool_clients", lambda rt: {})
+    rt = installed.app.state.runtime
+    sentinel = object()
+    rt.mcp_client = sentinel
+    assert get_mcp_client(rt) is sentinel
+    session = SimpleNamespace(oa="u1", office_token="t", thread_id="thr_x")
+    ctx = svc._build_write_context(rt, _Rec(), session)
+    assert ctx.read_executor.mcp_client is sentinel
