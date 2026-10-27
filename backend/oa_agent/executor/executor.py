@@ -130,12 +130,42 @@ def _extract_list(data: object) -> tuple[list, int]:
 
 class ToolExecutor:
     def __init__(self, registry: ToolRegistry, clients: dict[str, OfficeApiClient], remark_limit: int = REMARK_LIMIT,
-                 *, mcp_client: object | None = None):
-        """clients：地址标识 → office-api 客户端（见 office_api.upstream_clients）；mcp_client：出站 MCP 客户端。"""
+                 *, mcp_client: object | None = None, builtin_runtime: object | None = None):
+        """clients：地址标识 → office-api 客户端（见 office_api.upstream_clients）；mcp_client：出站 MCP 客户端；
+        builtin_runtime：内置 Tool 运行时（None → 仅 time/calc 可用，export/memory 需注入带存储的运行时）。"""
         self.registry = registry
         self.clients = clients
         self.remark_limit = remark_limit
         self.mcp_client = mcp_client  # None → 未配置出站连接器（调用即「未对你开放」）
+        self.builtin_runtime = builtin_runtime
+
+    def _execute_builtin(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder,
+                         node_name: str) -> dict:
+        """kind=builtin：由 BuiltinRuntime 执行；结果一律作为不可信数据围栏后回图（结构化结果不直接进模型）。"""
+        from oa_agent.executor.builtin_runtime import BuiltinRuntime
+        from oa_agent.security.prompt_guard import wrap_untrusted
+
+        name = spec.name
+        clean = {k: v for k, v in (args or {}).items() if k not in MCP_DROPPED_ARGS}
+        rec.tool_call_count += 1
+        rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,
+                  input_summary={"arg_names": sorted(clean)},
+                  metadata={"kind": "builtin", "builtin_id": spec.builtin_id})
+        started = time.perf_counter()
+        try:
+            runtime = self.builtin_runtime or BuiltinRuntime()
+            raw = runtime.call(spec, clean, identity=identity)
+        except ToolError as exc:
+            rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version,
+                      status="error", duration_ms=int((time.perf_counter() - started) * 1000),
+                      error_code=exc.code, error_summary=exc.message,
+                      metadata={"kind": "builtin", "builtin_id": spec.builtin_id})
+            raise
+        text = wrap_untrusted(json.dumps(raw, ensure_ascii=False, default=str), source="builtin", name=name)
+        rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
+                  duration_ms=int((time.perf_counter() - started) * 1000), output_summary={"result_count": 1},
+                  metadata={"kind": "builtin", "builtin_id": spec.builtin_id})
+        return {"ok": True, "capability": name, "data": {"text": text}, "message": ""}
 
     def _execute_mcp(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
         """kind=mcp：默认由 MCP 服务端校验参数，这里丢弃身份字段；spec.model_params 非空时先本地校验；结果一律作为不可信数据围栏后回图。"""
@@ -175,6 +205,8 @@ class ToolExecutor:
             raise ToolError("TOOL_NOT_AVAILABLE", f"Tool 未注册或未启用：{name}")
         if spec.kind == "mcp":
             return self._execute_mcp(spec, args, identity, rec, node_name)
+        if spec.kind == "builtin":
+            return self._execute_builtin(spec, args, identity, rec, node_name)
         clean, dropped = validate_args(spec, args)
         rec.tool_call_count += 1
         rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,
