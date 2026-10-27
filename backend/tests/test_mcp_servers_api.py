@@ -297,6 +297,33 @@ def test_sync_creates_disabled_prefixed_mcp_tools(admin, installed):
     assert "mcp_server.sync" in {a["action"] for a in audit_rows(admin)}
 
 
+def test_sync_maps_input_schema_properties_to_model_params(admin, installed):
+    from oa_agent.db.models import Tool, ToolVersion
+
+    _fake(installed, tools=[{
+        "name": "search", "description": "搜索",
+        "input_schema": {
+            "type": "object", "required": ["q"],
+            "properties": {
+                "q": {"type": "string", "description": "关键词"},
+                "limit": {"type": "integer", "description": "条数"},
+                "active": {"type": "boolean", "description": "仅有效"},
+            },
+        },
+    }])
+    assert admin.post(URL, json=stdio_body(tool_prefix="demo_")).status_code == 200
+    assert admin.post(f"{URL}/demo_stdio/sync").status_code == 200
+    rt = installed.app.state.runtime
+    with rt.session() as db:
+        tool = db.scalar(sa.select(Tool).where(Tool.name == "demo_search"))
+        assert tool is not None and tool.enabled is False
+        ver = db.get(ToolVersion, tool.current_version_id)
+        mp = (ver.schema_json or {}).get("model_params") or {}
+    assert set(mp) == {"q", "limit", "active"}
+    assert mp["q"]["type"] == "string" and mp["q"]["required"] is True and mp["q"]["description"] == "关键词"
+    assert mp["limit"]["type"] == "integer" and mp["active"]["type"] == "boolean"
+
+
 def test_sync_is_idempotent_and_keeps_admin_enabled_flag(admin, installed):
     from oa_agent.db.models import Tool
 

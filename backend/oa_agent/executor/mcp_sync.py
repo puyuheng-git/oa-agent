@@ -31,15 +31,44 @@ def _summary(remote: dict) -> str:
     return (text or str(remote.get("name") or ""))[:255]
 
 
+_PARAM_TYPES = frozenset({"string", "integer", "number", "boolean"})
+
+
+def _input_schema(remote: dict) -> dict:
+    raw = remote.get("input_schema") or remote.get("inputSchema") or {"type": "object"}
+    return raw if isinstance(raw, dict) else {"type": "object"}
+
+
+def _model_params_from_input_schema(schema: dict) -> dict[str, dict[str, Any]]:
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return {}
+    required = {x for x in (schema.get("required") or []) if isinstance(x, str)}
+    out: dict[str, dict[str, Any]] = {}
+    for name, prop in props.items():
+        if not isinstance(name, str) or not isinstance(prop, dict):
+            continue
+        typ = str(prop.get("type") or "string").lower()
+        if typ not in _PARAM_TYPES:
+            continue
+        rule: dict[str, Any] = {"type": typ, "required": name in required}
+        desc = prop.get("description")
+        if isinstance(desc, str) and desc.strip():
+            rule["description"] = desc.strip()[:200]
+        out[name] = rule
+    return out
+
+
 def _schema(local: str, remote: dict, server: McpServer) -> dict:
+    inp = _input_schema(remote)
     return {
         "name": local, "method": "", "path": "", "summary": _summary(remote),
         "description": str(remote.get("description") or "")[:2000],
         "risk_level": "low", "requires_confirmation": False, "timeout_seconds": float(server.timeout_seconds or 30),
         "inject_identity_fields": [], "top_level_fields": [], "query_params_field": None, "identity_params": {},
-        "model_params": {}, "result": {"kind": "object", "fields": [], "labels": {}, "list_columns": []},
-        "mcp": {"server": server.name, "tool": remote.get("name"),
-                "input_schema": remote.get("input_schema") or {"type": "object"}},
+        "model_params": _model_params_from_input_schema(inp),
+        "result": {"kind": "object", "fields": [], "labels": {}, "list_columns": []},
+        "mcp": {"server": server.name, "tool": remote.get("name"), "input_schema": inp},
     }
 
 
