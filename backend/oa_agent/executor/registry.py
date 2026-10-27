@@ -32,6 +32,11 @@ class ToolSpec:
     list_columns: tuple[str, ...] = ()
     identity_params: dict = field(default_factory=dict)  # 普通查询参数名 → 身份字段，由服务端注入
     upstream: str = "office"  # office-api 地址标识（「OA 对接」中配置）
+    kind: str = "office"  # office | builtin | mcp：Executor 据此分派
+    builtin_id: str | None = None
+    mcp_server_id: int | None = None
+    mcp_tool_name: str | None = None
+    sandbox_policy: dict = field(default_factory=dict)
 
     def label(self, key: str) -> str:
         return self.result_labels.get(key) or key

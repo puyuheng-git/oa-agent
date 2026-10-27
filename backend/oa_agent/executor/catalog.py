@@ -360,9 +360,16 @@ def parse_skill(path: Path) -> tuple[str, dict]:
 
 # ---------------- 运行时视图 ----------------
 
-def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: str) -> ToolSpec:
+def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: str, *, kind: str = "office",
+                 builtin_id: str | None = None, mcp_server_id: int | None = None,
+                 mcp_tool_name: str | None = None, sandbox_policy: dict | None = None) -> ToolSpec:
     result = schema["result"]
     return ToolSpec(
+        kind=kind or "office",
+        builtin_id=builtin_id,
+        mcp_server_id=mcp_server_id,
+        mcp_tool_name=mcp_tool_name,
+        sandbox_policy=dict(sandbox_policy or {}),
         summary=schema.get("summary") or "",
         description=schema.get("description") or "",
         result_labels=dict(result.get("labels") or {}),
@@ -386,7 +393,36 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
     )
 
 
+TOOL_KINDS = ("office", "builtin", "mcp")
+
+
+def _extension_tool_spec(tool: Tool) -> ToolSpec:
+    """builtin / mcp Tool 没有 OpenAPI 版本：由 Tool 行直接生成运行时视图（调用面由 Executor 按 kind 分派）。"""
+    return ToolSpec(
+        name=tool.name, method="", path="", version=tool.kind, schema_hash="",
+        risk_level=tool.risk_level or "low", requires_confirmation=bool(tool.requires_confirmation),
+        timeout_seconds=10.0, inject_identity_fields=(), top_level_fields=(), query_params_field=None,
+        model_params={}, result_kind="object", result_fields=(), summary=tool.summary or "",
+        kind=tool.kind, builtin_id=tool.builtin_id, mcp_server_id=tool.mcp_server_id,
+        mcp_tool_name=tool.mcp_tool_name, sandbox_policy=dict(tool.sandbox_policy_json or {}))
+
+
 def registration_blockers(tool: Tool, has_version: bool, method: str | None = None) -> list[str]:
+    kind = getattr(tool, "kind", None) or "office"
+    if kind not in TOOL_KINDS:
+        return [f"未知 Tool 类型：{kind}"]
+    if kind != "office":
+        reasons = []
+        if not tool.enabled:
+            reasons.append("管理员已停用")
+        if kind == "builtin" and not tool.builtin_id:
+            reasons.append("内置工具缺少 builtin_id")
+        if kind == "mcp":
+            if not tool.mcp_server_id:
+                reasons.append("MCP 工具未绑定 MCP Server")
+            if not tool.mcp_tool_name:
+                reasons.append("MCP 工具缺少远端工具名")
+        return reasons
     reasons = []
     if not tool.enabled:
         reasons.append("管理员已停用")
@@ -606,13 +642,22 @@ class Catalog:
     def load_registry(self, db: Session) -> ToolRegistry:
         tools: dict[str, ToolSpec] = {}
         rows = db.execute(
-            sa.select(Tool, ToolVersion).join(ToolVersion, ToolVersion.id == Tool.current_version_id)
+            sa.select(Tool, ToolVersion).outerjoin(ToolVersion, ToolVersion.id == Tool.current_version_id)
             .where(Tool.tenant_id == self.tenant)).all()
         for tool, version in rows:
-            if registration_blockers(tool, True, version.schema_json.get("method")):
+            kind = tool.kind or "office"
+            if kind == "office":
+                if version is None or registration_blockers(tool, True, version.schema_json.get("method")):
+                    continue
+            elif registration_blockers(tool, version is not None):
                 continue
-            tools[tool.name] = to_tool_spec(version.schema_json, version.spec_version, version.version_no,
-                                            version.schema_hash)
+            if version is None:  # builtin / mcp 无 OpenAPI 版本
+                tools[tool.name] = _extension_tool_spec(tool)
+                continue
+            tools[tool.name] = to_tool_spec(
+                version.schema_json, version.spec_version, version.version_no, version.schema_hash,
+                kind=kind, builtin_id=tool.builtin_id, mcp_server_id=tool.mcp_server_id,
+                mcp_tool_name=tool.mcp_tool_name, sandbox_policy=tool.sandbox_policy_json)
         return ToolRegistry(tools)
 
     def skill_states(self, db: Session) -> dict[str, SkillState]:
