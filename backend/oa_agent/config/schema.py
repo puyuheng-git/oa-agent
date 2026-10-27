@@ -303,5 +303,16 @@ def secret_name(group: str, key: str) -> str:
 
 
 def default(group: str, key: str):
+        GroupDef(
+            "mcp",
+            "MCP 连接",
+            "热生效（只影响之后新建/修改的 MCP 连接）",
+            (
+                FieldDef("allowed_origins", "远程 MCP 地址白名单", "list", [],
+                         "sse / http 类型的 MCP 连接地址必须命中此名单（协议+域名，可带端口，"
+                         "如 https://mcp.example.com）。未配置时拒绝所有远程地址，请先在这里配置。"),
+            ),
+            description="出站 MCP 连接的全局安全边界。MCP 连接本身在「MCP 连接」页配置，密钥只写不读。",
+        ),
     f = GROUPS[group].field(key)
     return f.default if f else None

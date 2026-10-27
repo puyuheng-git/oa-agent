@@ -65,7 +65,7 @@ def _coerce(f: FieldDef, value):
     if f.kind == "list":
         items = value if isinstance(value, list) else str(value).split(",")
         items = [str(i).strip() for i in items if str(i).strip()]
-        if f.key == "allowed_frame_origins":
+        if f.key in ("allowed_frame_origins", "allowed_origins"):
             items = [_origin(f, i) for i in items]
         return items
     return str(value).strip()
