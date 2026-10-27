@@ -11,6 +11,7 @@ PERMISSIONS: dict[str, str] = {
     "ops.intervention.handle": "人工介入处理",
     "ops.tool.manage": "Tool 同步/启停",
     "ops.skill.manage": "Skill 同步/启停",
+    "ops.mcp.manage": "MCP 出站连接配置/同步",
     "ops.config.edit": "Workflow 配置编辑",
     "ops.config.publish": "Workflow 配置发布",
     "ops.config.rollback": "Workflow 配置回滚",
