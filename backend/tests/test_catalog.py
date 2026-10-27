@@ -45,7 +45,8 @@ def list_op(doc: dict) -> dict:
 
 
 def tools_by_name(admin) -> dict:
-    r = admin.get("/v1/admin/tools")
+    """OpenAPI（office）Tool；启动时 upsert 的 builtin.* 内置工具不在此列。"""
+    r = admin.get("/v1/admin/tools?kind=office")
     assert r.status_code == 200, r.text
     return {t["name"]: t for t in r.json()["items"]}
 
@@ -75,7 +76,8 @@ def test_list_tools_serializes_kind_and_filters(admin):
     assert {t["name"] for t in office_items} == {LIST_TOOL, DETAIL_TOOL}
 
     builtin_items = admin.get("/v1/admin/tools?kind=builtin").json()["items"]
-    assert [t["name"] for t in builtin_items] == ["_kind_builtin"]
+    names = {t["name"] for t in builtin_items}
+    assert "_kind_builtin" in names and "builtin.time" in names  # 启动 upsert 的内置工具也在列
     assert admin.get("/v1/admin/tools?kind=mcp").json()["items"] == []
     assert admin.get("/v1/admin/tools?kind=bogus").status_code == 422
 

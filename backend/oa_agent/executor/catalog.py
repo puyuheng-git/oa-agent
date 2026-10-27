@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from oa_agent.db.models import Skill, SkillVersion, Tool, ToolVersion
 from oa_agent.db.types import utcnow
 from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, UPSTREAM_KEY_RE
+from oa_agent.executor.builtin_catalog import ensure_builtin_tools
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.redact import redact
 from oa_agent.settings import REPO_ROOT
@@ -490,6 +491,7 @@ class Catalog:
                     tool.spec_enabled = False
                     tool.last_sync_at, tool.last_sync_result, tool.last_sync_error = now, "removed", None
                     report["tools"].append({"name": name, "result": "removed"})
+        ensure_builtin_tools(db, self.tenant)  # 刷新时补齐缺失的内置工具（不覆盖管理员改动）
         return report
 
     def _sync_tool(self, db: Session, source: str, spec_version: str, spec: dict, operator: str, now) -> dict:
@@ -690,3 +692,4 @@ class Catalog:
                 log.info("首次同步 Tool：%s", [t["name"] for t in report["tools"]])
             if db.scalar(sa.select(sa.func.count()).select_from(Skill).where(Skill.tenant_id == self.tenant)) == 0:
                 self.sync_skills(db, "system")
+            ensure_builtin_tools(db, self.tenant)
