@@ -47,7 +47,7 @@ BUILTIN_CATALOG: list[BuiltinDef] = [
     BuiltinDef("sys.export", "导出文件并返回下载票据", "medium", True, True,
                {"export_ttl_seconds": 3600}),
     BuiltinDef("sys.memory", "员工长期记忆", "medium", True),
-    BuiltinDef("sys.cron", "定时触发已发布的流程或任务模板", "high", False),
+    BuiltinDef("sys.cron", "定时触发已发布的流程或任务模板", "high", False, True, {"cron_max_jobs": 20}),
     BuiltinDef("sys.http", "受控 HTTP 请求", "high", False, True,
                {"http_allow_hosts": [], "http_methods": ["GET"], "http_max_response_bytes": 65536}),
     BuiltinDef("sys.web_search", "网络搜索", "high", False, True, {"search_max_results": 5}),

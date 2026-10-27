@@ -127,3 +127,20 @@ def prepare_memory_text(text: str) -> str | None:
     if not clean or FLAG_INJECTION in scan_flags(text):
         return None
     return clean
+
+
+_HTML_DROP_BLOCK = re.compile(r"<(script|style|noscript|template|iframe|object|embed)\b[^>]*>.*?</\1\s*>",
+                              re.IGNORECASE | re.DOTALL)
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_TAG = re.compile(r"</?[A-Za-z!][^>]*>")
+
+
+def scrub_html(text: str) -> str:
+    """网页正文清洗（最小版，Task 12 会加深）：去 script/style 等块、注释、全部标签，再规范化。"""
+    if not text:
+        return ""
+    out = _HTML_COMMENT.sub("", text)
+    out = _HTML_DROP_BLOCK.sub("", out)
+    out = re.sub(r"</?(script|style|noscript|template|iframe|object|embed)\b[^>]*>", "", out, flags=re.IGNORECASE)
+    out = _HTML_TAG.sub("", out)
+    return normalize_text(out).strip()

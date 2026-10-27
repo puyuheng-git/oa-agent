@@ -226,11 +226,10 @@ def test_memory_without_session_factory_not_available():
     assert e.value.code == "TOOL_NOT_AVAILABLE"
 
 
-def test_unknown_or_high_risk_builtin_not_available():
-    for bid in ("sys.http", "sys.cron", "sys.nope"):
-        with pytest.raises(ToolError) as e:
-            _runtime().call(_spec(bid), {}, identity=ID_ALICE)
-        assert e.value.code == "TOOL_NOT_AVAILABLE"
+def test_unknown_builtin_not_available():
+    with pytest.raises(ToolError) as e:
+        _runtime().call(_spec("sys.nope"), {}, identity=ID_ALICE)
+    assert e.value.code == "TOOL_NOT_AVAILABLE"
 
 
 def _executor(spec, builtin_runtime=None):
@@ -291,3 +290,201 @@ def test_chat_service_executors_get_builtin_runtime():
 
     src = inspect.getsource(service)
     assert src.count("builtin_runtime=build_builtin_runtime(rt)") >= 1
+
+# ---------------------------------------------------------------- Task 11：高风险沙箱 builtin
+import httpx  # noqa: E402
+import respx  # noqa: E402
+
+HIGH_RISK = ("sys.http", "sys.web_search", "sys.fs_read", "sys.fs_write", "sys.cron")
+
+
+@pytest.mark.parametrize("bid", HIGH_RISK)
+def test_high_risk_without_sandbox_policy_is_sandbox_required(bid, tmp_path):
+    from oa_agent.kv import MemoryKV
+
+    rtm = _runtime(tmp_path=tmp_path)
+    rtm.kv = MemoryKV()
+    with pytest.raises(ToolError) as e:
+        rtm.call(_spec(bid, risk_level="high"), {"url": "https://a.test/", "path": "a.txt", "content": "x",
+                                                 "query": "q", "action": "list"}, identity=ID_ALICE)
+    assert e.value.code == "SANDBOX_REQUIRED"
+
+
+HTTP_POLICY = {"http_allow_hosts": ["api.allowed.test", "*.corp.test"], "http_methods": ["GET"],
+               "http_max_response_bytes": 64}
+
+
+def test_http_rejects_non_allowlisted_host_and_method_and_scheme():
+    rtm = _runtime()
+    spec = _spec("sys.http", sandbox_policy=HTTP_POLICY)
+    for args in ({"url": "https://evil.test/x"}, {"url": "https://corp.test.evil.test/"},
+                 {"url": "https://api.allowed.test/x", "method": "POST"},
+                 {"url": "file:///etc/passwd"}, {"url": "https://user@evil.test@api.allowed.test/"}):
+        with pytest.raises(ToolError) as e:
+            rtm.call(spec, args, identity=ID_ALICE)
+        assert e.value.code in ("HOST_NOT_ALLOWED", "METHOD_NOT_ALLOWED", "INVALID_ARGUMENT"), args
+
+
+@respx.mock
+def test_http_get_allowlisted_scrubs_html_and_limits_bytes():
+    html = "<html><script>alert(1)</script><p>你好</p>" + "x" * 500 + "</html>"
+    route = respx.get("https://api.allowed.test/page").mock(return_value=httpx.Response(200, text=html))
+    out = _runtime().call(_spec("sys.http", sandbox_policy=HTTP_POLICY), {"url": "https://api.allowed.test/page"},
+                          identity=ID_ALICE)
+    assert route.called and out["status"] == 200 and out["truncated"] is True
+    assert "alert(1)" not in out["body"] and "<script" not in out["body"]
+    assert "authorization" not in {k.lower() for k in route.calls[0].request.headers}  # 不带员工 token
+
+
+@respx.mock
+def test_http_does_not_follow_redirect_to_other_host():
+    respx.get("https://api.allowed.test/r").mock(
+        return_value=httpx.Response(302, headers={"location": "https://evil.test/x"}))
+    out = _runtime().call(_spec("sys.http", sandbox_policy=HTTP_POLICY), {"url": "https://api.allowed.test/r"},
+                          identity=ID_ALICE)
+    assert out["status"] == 302 and "evil" not in out["body"]
+
+
+def test_http_global_allow_hosts_fallback_and_empty_is_sandbox_required():
+    from oa_agent.executor.builtin_runtime import BuiltinRuntime
+
+    rtm = BuiltinRuntime(global_setting=lambda g, k: ["g.test"] if k == "http_allow_hosts" else None)
+    spec = _spec("sys.http", sandbox_policy={"http_methods": ["GET"]})
+    with pytest.raises(ToolError) as e:
+        rtm.call(spec, {"url": "https://other.test/"}, identity=ID_ALICE)
+    assert e.value.code == "HOST_NOT_ALLOWED"
+    with pytest.raises(ToolError) as e:
+        _runtime().call(spec, {"url": "https://g.test/"}, identity=ID_ALICE)
+    assert e.value.code == "SANDBOX_REQUIRED"
+
+
+FS_POLICY = {"fs_root": "sandbox", "fs_max_read_bytes": 16}
+
+
+@pytest.mark.parametrize("bad", ["../etc/passwd", "a/../../x", "/etc/passwd", "C:\\Windows\\win.ini", "..\\x", "",
+                                 "a\x00b"])
+def test_fs_rejects_path_escape(tmp_path, bad):
+    rtm = _runtime(tmp_path=tmp_path)
+    for bid, args in (("sys.fs_read", {"path": bad}), ("sys.fs_write", {"path": bad, "content": "x"})):
+        with pytest.raises(ToolError) as e:
+            rtm.call(_spec(bid, sandbox_policy=FS_POLICY), args, identity=ID_ALICE)
+        assert e.value.code in ("PATH_NOT_ALLOWED", "INVALID_ARGUMENT")
+    assert not (tmp_path.parent / "etc").exists()
+
+
+def test_fs_write_read_roundtrip_under_tenant_sandbox(tmp_path):
+    rtm = _runtime(tmp_path=tmp_path)
+    w = rtm.call(_spec("sys.fs_write", sandbox_policy=FS_POLICY), {"path": "d/a.txt", "content": "你好"},
+                 identity=ID_ALICE)
+    assert w["written"] is True and "path" not in w or str(tmp_path) not in str(w)
+    assert (tmp_path / "sandbox" / "dscpa" / "d" / "a.txt").read_text(encoding="utf-8") == "你好"
+    r = rtm.call(_spec("sys.fs_read", sandbox_policy=FS_POLICY), {"path": "d/a.txt"}, identity=ID_ALICE)
+    assert r["content"] == "你好" and r["truncated"] is False
+    rtm.call(_spec("sys.fs_write", sandbox_policy=FS_POLICY), {"path": "big.txt", "content": "y" * 100},
+             identity=ID_ALICE)
+    big = rtm.call(_spec("sys.fs_read", sandbox_policy=FS_POLICY), {"path": "big.txt"}, identity=ID_ALICE)
+    assert big["truncated"] is True and len(big["content"].encode()) <= 16
+
+
+def test_fs_rejects_symlink_escape(tmp_path):
+    root = tmp_path / "sandbox" / "dscpa"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "s.txt").write_text("secret")
+    try:
+        (root / "link").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("无法创建符号链接")
+    with pytest.raises(ToolError) as e:
+        _runtime(tmp_path=tmp_path).call(_spec("sys.fs_read", sandbox_policy=FS_POLICY), {"path": "link/s.txt"},
+                                         identity=ID_ALICE)
+    assert e.value.code == "PATH_NOT_ALLOWED"
+
+
+def test_fs_requires_data_dir():
+    with pytest.raises(ToolError) as e:
+        _runtime().call(_spec("sys.fs_read", sandbox_policy=FS_POLICY), {"path": "a"}, identity=ID_ALICE)
+    assert e.value.code == "TOOL_NOT_AVAILABLE"
+
+
+SEARCH_POLICY = {"search_max_results": 2, "search_endpoint": "https://search.supplier.test/v1"}
+
+
+def test_web_search_without_vault_key_is_unavailable(rt):
+    from oa_agent.executor.builtin_runtime import BuiltinRuntime
+
+    rtm = BuiltinRuntime(tenant_id=rt.tenant_id, session_factory=rt.session, vault=rt.vault)
+    with pytest.raises(ToolError) as e:
+        rtm.call(_spec("sys.web_search", sandbox_policy=SEARCH_POLICY), {"query": "hi"}, identity=ID_ALICE)
+    assert e.value.code == "TOOL_NOT_AVAILABLE"
+
+
+@respx.mock
+def test_web_search_uses_vault_key_and_scrubs(rt):
+    from oa_agent.executor.builtin_runtime import BuiltinRuntime, SEARCH_SECRET_NAME
+
+    with rt.session() as db, db.begin():
+        rt.vault.set(db, SEARCH_SECRET_NAME, "sk-search-secret-1234", "tester")
+    route = respx.get("https://search.supplier.test/v1").mock(return_value=httpx.Response(200, json={"results": [
+        {"title": "<b>T1</b>", "url": "https://x.test/1", "snippet": "a<script>bad()</script>b"},
+        {"title": "T2", "url": "https://x.test/2", "snippet": "s2"},
+        {"title": "T3", "url": "https://x.test/3", "snippet": "s3"}]}))
+    rtm = BuiltinRuntime(tenant_id=rt.tenant_id, session_factory=rt.session, vault=rt.vault)
+    out = rtm.call(_spec("sys.web_search", sandbox_policy=SEARCH_POLICY), {"query": "hello"}, identity=ID_ALICE)
+    assert route.called and route.calls[0].request.url.params["q"] == "hello"
+    assert "sk-search-secret-1234" in route.calls[0].request.headers["authorization"]
+    assert len(out["results"]) == 2 and "bad()" not in repr(out) and "sk-search-secret" not in repr(out)
+
+
+def _cron_runtime(rt):
+    from oa_agent.executor.builtin_runtime import BuiltinRuntime
+    from oa_agent.kv import MemoryKV
+
+    return BuiltinRuntime(tenant_id=rt.tenant_id, session_factory=rt.session, kv=MemoryKV())
+
+
+def _publish(rt, workflow_id):
+    import json
+
+    from oa_agent.db.models import WorkflowVersion
+
+    with rt.session() as db, db.begin():
+        db.add(WorkflowVersion(version_id=f"v_{workflow_id}", tenant_id=rt.tenant_id, workflow_id=workflow_id,
+                               version_no=1, content_json={}, content_hash="h", status="published"))
+
+
+def test_cron_only_published_workflow_and_valid_expression(rt):
+    rtm = _cron_runtime(rt)
+    spec = _spec("sys.cron", sandbox_policy={"cron_max_jobs": 2})
+    _publish(rt, "travel_query")
+    out = rtm.call(spec, {"action": "add", "workflow": "travel_query", "cron": "0 9 * * 1-5"}, identity=ID_ALICE)
+    assert out["added"] is True and out["executes"] is False
+    for args in ({"action": "add", "workflow": "not_published", "cron": "0 9 * * *"},
+                 {"action": "add", "workflow": "travel_query", "cron": "rm -rf /"},
+                 {"action": "add", "workflow": "travel_query", "cron": "* * * *"},
+                 {"action": "add", "workflow": "travel_query", "cron": "0 9 * * *", "command": "ls"}):
+        with pytest.raises(ToolError) as e:
+            rtm.call(spec, args, identity=ID_ALICE)
+        assert e.value.code == "INVALID_ARGUMENT", args
+    listed = rtm.call(spec, {"action": "list"}, identity=ID_ALICE)["items"]
+    assert [(j["workflow"], j["cron"]) for j in listed] == [("travel_query", "0 9 * * 1-5")]
+    assert rtm.call(spec, {"action": "list"}, identity=Identity(oa="bob", authorization="x"))["items"] == []
+
+
+def test_cron_limit_and_remove(rt):
+    rtm = _cron_runtime(rt)
+    spec = _spec("sys.cron", sandbox_policy={"cron_max_jobs": 1})
+    _publish(rt, "travel_query")
+    first = rtm.call(spec, {"action": "add", "workflow": "travel_query", "cron": "0 9 * * *"}, identity=ID_ALICE)
+    with pytest.raises(ToolError):
+        rtm.call(spec, {"action": "add", "workflow": "travel_query", "cron": "0 10 * * *"}, identity=ID_ALICE)
+    assert rtm.call(spec, {"action": "remove", "job_id": first["job_id"]}, identity=ID_ALICE)["removed"] is True
+    assert rtm.call(spec, {"action": "list"}, identity=ID_ALICE)["items"] == []
+
+
+def test_scrub_html_strips_scripts_and_tags():
+    from oa_agent.security.prompt_guard import scrub_html
+
+    out = scrub_html("<div onclick='x()'>a<script>evil()</script><style>p{}</style><!-- c --><b>B</b></div>")
+    assert out == "aB" and scrub_html("") == ""

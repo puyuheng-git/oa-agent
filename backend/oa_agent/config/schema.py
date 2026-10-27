@@ -273,6 +273,10 @@ GROUPS: dict[str, GroupDef] = {
                 FieldDef("export_max_days", "对话导出最大时间跨度", "int", 92,
                          "导出对话记录时开始与结束时间的最大间隔，防止一次导出过多数据拖慢数据库。",
                          min=1, max=366, unit="天"),
+                FieldDef("http_allow_hosts", "内置 HTTP 全局白名单", "list", [],
+                         "内置工具 sys.http 的默认允许主机（如 api.example.com 或 *.example.com）；"
+                         "单个 Tool 的沙箱策略里配置了 http_allow_hosts 时以 Tool 为准。"
+                         "留空且 Tool 也未配置时，sys.http 一律拒绝（SANDBOX_REQUIRED）。高风险工具默认关闭。"),
             ),
             description="运行监控、超时判定、人工介入、数据保留与导出相关的参数。",
         ),
