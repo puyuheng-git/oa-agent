@@ -1,5 +1,5 @@
 <script setup lang="ts">
-withDefaults(defineProps<{ focus?: 'skill' | 'tool' }>(), { focus: 'skill' })
+withDefaults(defineProps<{ focus?: 'skill' | 'tool' | 'mcp' }>(), { focus: 'skill' })
 </script>
 
 <template>
@@ -18,8 +18,9 @@ withDefaults(defineProps<{ focus?: 'skill' | 'tool' }>(), { focus: 'skill' })
       <li :class="{ active: focus === 'tool' }">
         <b>Tool</b>：原子能力，有三种来源——OA 接口（office）、平台内置（builtin）、外部 MCP（mcp）。
       </li>
-      <li>
+      <li :class="{ active: focus === 'mcp' }">
         <b>MCP</b>：外部连接，只负责接入；谁能用、能用哪些，授权在 Skill，而不在 MCP 连接上。
+        <template v-if="focus === 'mcp'">用法：新建连接 → 测试连接 → 同步 Tools → 到 Tool 管理启用 → 在 Skill 中绑定。</template>
       </li>
     </ul>
   </el-alert>
