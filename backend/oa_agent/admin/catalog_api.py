@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends
@@ -116,7 +116,8 @@ def _tool_view(ctx: AdminCtx, tool: Tool) -> dict:
     blockers = registration_blockers(tool, current is not None, schema.get("method"))
     pending = ctx.db.get(ToolVersion, tool.pending_version_id) if tool.pending_version_id else None
     return {
-        "name": tool.name, "summary": tool.summary, "method": schema.get("method"), "path": schema.get("path"),
+        "name": tool.name, "kind": tool.kind or "office",
+        "summary": tool.summary, "method": schema.get("method"), "path": schema.get("path"),
         "upstream": schema.get("upstream", DEFAULT_UPSTREAM) if current else None,
         "source_file": tool.source_file, "enabled": tool.enabled,
         "spec_enabled": tool.spec_enabled, "risk_level": tool.risk_level,
@@ -139,8 +140,11 @@ def _upstreams(ctx: AdminCtx) -> list[dict]:
 
 
 @tools_router.get("")
-def list_tools(ctx: AdminCtx = Depends(admin_read(TOOL))):
-    tools = ctx.db.scalars(sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id).order_by(Tool.name)).all()
+def list_tools(kind: Literal["office", "builtin", "mcp"] | None = None, ctx: AdminCtx = Depends(admin_read(TOOL))):
+    stmt = sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id)
+    if kind:
+        stmt = stmt.where(Tool.kind == kind)
+    tools = ctx.db.scalars(stmt.order_by(Tool.name)).all()
     return {"items": [_tool_view(ctx, t) for t in tools], "upstreams": _upstreams(ctx)}
 
 

@@ -3,13 +3,16 @@ import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { errorMessage, http } from '@/shared/http'
 import { formatTime } from '@/shared/format'
-import { COMPAT_LEVEL, syncTag, type DiffChange, type ToolDetail, type ToolItem } from '../ops'
+import { COMPAT_LEVEL, syncTag, type DiffChange, type ToolDetail, type ToolItem, type ToolKind } from '../ops'
+import AbilityHelpBanner from '../components/AbilityHelpBanner.vue'
 import { emptyParam, emptyToolForm, toolFormFromSchema, toolPayload, type ToolForm } from '../catalogForm'
 
 interface Upstream { key: string; label: string; base_url: string | null }
 
 const items = ref<ToolItem[]>([])
 const upstreams = ref<Upstream[]>([])
+const kindFilter = ref<'' | ToolKind>('')
+const KIND_LABEL: Record<ToolKind, string> = { office: 'OA 接口', builtin: '内置', mcp: 'MCP' }
 const loading = ref(false)
 const loadError = ref('')
 const syncing = ref(false)
@@ -24,7 +27,7 @@ async function load() {
   loading.value = true
   loadError.value = ''
   try {
-    const r = await http.get<{ items: ToolItem[]; upstreams: Upstream[] }>('/v1/admin/tools')
+    const r = await http.get<{ items: ToolItem[]; upstreams: Upstream[] }>('/v1/admin/tools', { kind: kindFilter.value || undefined })
     items.value = r.items
     upstreams.value = r.upstreams
   } catch (e) {
@@ -262,6 +265,7 @@ onMounted(load)
 
 <template>
   <div>
+    <AbilityHelpBanner focus="tool" />
     <el-alert
       type="info"
       :closable="false"
@@ -278,6 +282,12 @@ onMounted(load)
         <el-button :loading="syncing" @click="sync">从文件导入</el-button>
       </el-tooltip>
       <el-button @click="load">刷新</el-button>
+      <el-radio-group v-model="kindFilter" style="margin-left: 12px" @change="load">
+        <el-radio-button value="">全部</el-radio-button>
+        <el-radio-button value="office">OA 接口</el-radio-button>
+        <el-radio-button value="builtin">内置</el-radio-button>
+        <el-radio-button value="mcp">MCP</el-radio-button>
+      </el-radio-group>
     </div>
 
     <el-alert v-if="report" type="success" :closable="true" style="margin-bottom: 12px" @close="report = null">
@@ -294,6 +304,7 @@ onMounted(load)
       <el-table-column label="Tool" min-width="260">
         <template #default="{ row }">
           <el-link type="primary" @click="open(row.name)">{{ row.name }}</el-link>
+          <el-tag v-if="row.kind" size="small" effect="plain" style="margin-left: 6px">{{ KIND_LABEL[row.kind as ToolKind] || row.kind }}</el-tag>
           <div class="muted">{{ row.summary }}</div>
           <div v-if="row.path" class="muted">
             <el-tag v-if="upstreamLabel(row.upstream)" size="small" type="info">{{ upstreamLabel(row.upstream) }}</el-tag>

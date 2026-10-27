@@ -59,6 +59,27 @@ def test_boot_sync_registers_tools_and_skill(admin):
     assert runtime(admin.client).engine.registry.get(LIST_TOOL).version == "1.0.0#v1"
 
 
+def test_list_tools_serializes_kind_and_filters(admin):
+    from oa_agent.db.models import Tool
+
+    rt = runtime(admin.client)
+    with rt.session() as db, db.begin():
+        db.add(Tool(tenant_id=rt.tenant_id, name="_kind_builtin", kind="builtin", builtin_id="calc",
+                    summary="内置", enabled=True))
+    all_items = admin.get("/v1/admin/tools").json()["items"]
+    assert all("kind" in t for t in all_items)
+    assert {t["kind"] for t in all_items} >= {"office", "builtin"}
+
+    office_items = admin.get("/v1/admin/tools?kind=office").json()["items"]
+    assert office_items and {t["kind"] for t in office_items} == {"office"}
+    assert {t["name"] for t in office_items} == {LIST_TOOL, DETAIL_TOOL}
+
+    builtin_items = admin.get("/v1/admin/tools?kind=builtin").json()["items"]
+    assert [t["name"] for t in builtin_items] == ["_kind_builtin"]
+    assert admin.get("/v1/admin/tools?kind=mcp").json()["items"] == []
+    assert admin.get("/v1/admin/tools?kind=bogus").status_code == 422
+
+
 def test_spec_validation_rejects_identity_params(tmp_path):
     doc = yaml.safe_load(SPEC.read_text(encoding="utf-8"))
     list_op(doc)["x-agent"]["model_params"]["oa"] = {"type": "string"}

@@ -48,8 +48,11 @@ export const TASK_KIND: Record<string, string> = {
 
 // ---------------- Tool / Skill ----------------
 
+export type ToolKind = 'office' | 'builtin' | 'mcp'
+
 export interface ToolItem {
   name: string
+  kind?: ToolKind
   summary: string
   method: string | null
   path: string | null
