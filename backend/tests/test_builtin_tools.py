@@ -272,3 +272,22 @@ def test_executor_builtin_memory_text_cannot_close_fence(rt):
     res = _executor(_spec("sys.memory"), _runtime(rt)).execute("builtin.memory", {"action": "list"}, ID_ALICE,
                                                                 _Rec(), "n")
     assert res["data"]["text"].count(FENCE_CLOSE) == 1
+
+def test_build_builtin_runtime_from_app_runtime_wires_tenant_session_data_dir(rt):
+    from oa_agent.executor.builtin_runtime import build_builtin_runtime
+
+    rtm = build_builtin_runtime(rt)
+    assert rtm.tenant_id == rt.tenant_id and rtm.data_dir == rt.settings.data_dir and rtm.session_factory is not None
+    out = rtm.call(_spec("sys.export"), {"filename": "a.txt", "content": "x"}, identity=ID_ALICE)
+    assert (rt.settings.data_dir / "exports" / rt.tenant_id / f"{out['ticket']}.bin").is_file()
+    rtm.call(_spec("sys.memory"), {"action": "add", "text": "喜欢靠窗座位"}, identity=ID_ALICE)
+    assert [m["text"] for m in rtm.call(_spec("sys.memory"), {"action": "list"}, identity=ID_ALICE)["items"]] == ["喜欢靠窗座位"]
+
+
+def test_chat_service_executors_get_builtin_runtime():
+    import inspect
+
+    from oa_agent.chat import service
+
+    src = inspect.getsource(service)
+    assert src.count("builtin_runtime=build_builtin_runtime(rt)") >= 1

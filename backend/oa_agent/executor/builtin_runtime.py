@@ -232,3 +232,9 @@ def _safe_filename(raw: object) -> str:
         name = (stem[:EXPORT_FILENAME_MAX - len(ext) - 1] + "." + ext) if dot and len(ext) < 10 \
             else name[:EXPORT_FILENAME_MAX]
     return name
+
+
+def build_builtin_runtime(rt: Any) -> BuiltinRuntime:
+    """从 AppRuntime 构造生产用 BuiltinRuntime：tenant / session（memory）/ data_dir（export 写 data/exports/{tenant}/）。"""
+    return BuiltinRuntime(tenant_id=rt.tenant_id, session_factory=rt.session, data_dir=rt.settings.data_dir)
+
