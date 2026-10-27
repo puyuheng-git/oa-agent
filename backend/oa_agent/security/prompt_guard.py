@@ -158,6 +158,19 @@ def wrap_untrusted(text: str, *, source: str, name: str = "", max_chars: int = 8
     return f"{head}\n{body}\n{FENCE_CLOSE}\n{FENCE_NOTE}"
 
 
+def unwrap_untrusted(text: str) -> str:
+    """仅用于「展示给员工」：去掉围栏头尾与提示句，返回正文。围栏文本不得以此形式回灌模型。"""
+    body = text or ""
+    if body.startswith(FENCE_OPEN):
+        nl = body.find("\n")
+        body = body[nl + 1:] if nl >= 0 else ""
+    if body.endswith(FENCE_NOTE):
+        body = body[:-len(FENCE_NOTE)].rstrip("\n")
+    if body.endswith(FENCE_CLOSE):
+        body = body[:-len(FENCE_CLOSE)].rstrip("\n")
+    return body
+
+
 def prepare_user_text(text: str) -> str:
     """用户消息：规范化后围栏（不静默删除命中短语，避免误伤）。"""
     return wrap_untrusted(normalize_text(text), source="user")

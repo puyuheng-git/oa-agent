@@ -211,6 +211,9 @@ def _save_tool(ctx: AdminCtx, body: ToolIn, create: bool) -> dict:
             raise AppError(409, "ALREADY_EXISTS", f"Tool {spec['name']} 已存在，请改为编")
         if not create and not exists:
             raise AppError(404, "NOT_FOUND", "Tool 不存")
+        if exists and (_get_tool(ctx, spec["name"]).kind or "office") != "office":
+            raise AppError(422, "VALIDATION_ERROR",
+                           "内置 / MCP 工具不可改 method、path、builtin_id 等核心字段；请用启停开关或「MCP 连接」页同步")
         upstream = spec.get("upstream", DEFAULT_UPSTREAM)
         if upstream not in {u["key"] for u in _upstreams(ctx)}:
             raise AppError(422, "VALIDATION_ERROR", f"office-api 地址 {upstream} 未在「OA 对接」中配置")

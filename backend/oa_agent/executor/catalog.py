@@ -26,7 +26,9 @@ from sqlalchemy.orm import Session
 from oa_agent.db.models import Skill, SkillVersion, Tool, ToolVersion
 from oa_agent.db.types import utcnow
 from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, UPSTREAM_KEY_RE
-from oa_agent.executor.builtin_catalog import ensure_builtin_tools
+from oa_agent.executor.builtin_catalog import (
+    TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_model_params, ensure_builtin_tools,
+)
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.redact import redact
 from oa_agent.settings import REPO_ROOT
@@ -365,6 +367,7 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
                  builtin_id: str | None = None, mcp_server_id: int | None = None,
                  mcp_tool_name: str | None = None, sandbox_policy: dict | None = None) -> ToolSpec:
     result = schema["result"]
+    text_result = (kind or "office") != "office"  # mcp / builtin：结果统一为围栏文本 {"text": ...}
     return ToolSpec(
         kind=kind or "office",
         builtin_id=builtin_id,
@@ -389,8 +392,8 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
         identity_params=dict(schema.get("identity_params") or {}),
         upstream=schema.get("upstream") or DEFAULT_UPSTREAM,
         model_params=dict(schema["model_params"]),
-        result_kind=schema["result"]["kind"],
-        result_fields=tuple(schema["result"]["fields"]),
+        result_kind=TEXT_RESULT_KIND if text_result else schema["result"]["kind"],
+        result_fields=TEXT_RESULT_FIELDS if text_result else tuple(schema["result"]["fields"]),
     )
 
 
@@ -403,7 +406,8 @@ def _extension_tool_spec(tool: Tool) -> ToolSpec:
         name=tool.name, method="", path="", version=tool.kind, schema_hash="",
         risk_level=tool.risk_level or "low", requires_confirmation=bool(tool.requires_confirmation),
         timeout_seconds=10.0, inject_identity_fields=(), top_level_fields=(), query_params_field=None,
-        model_params={}, result_kind="object", result_fields=(), summary=tool.summary or "",
+        model_params=builtin_model_params(tool.builtin_id) if tool.kind == "builtin" else {},
+        result_kind=TEXT_RESULT_KIND, result_fields=TEXT_RESULT_FIELDS, summary=tool.summary or "",
         kind=tool.kind, builtin_id=tool.builtin_id, mcp_server_id=tool.mcp_server_id,
         mcp_tool_name=tool.mcp_tool_name, sandbox_policy=dict(tool.sandbox_policy_json or {}))
 

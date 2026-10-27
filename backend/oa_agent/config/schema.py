@@ -298,15 +298,6 @@ GROUPS: dict[str, GroupDef] = {
             description="在「Tool 管理」中从 Apipost 分享链接生成 Tool 草稿时的限制。"
                         "出于安全考虑只允许访问 docs.apipost.net，地址不可配置。",
         ),
-    )
-}
-
-
-def secret_name(group: str, key: str) -> str:
-    return f"setting.{group}.{key}"
-
-
-def default(group: str, key: str):
         GroupDef(
             "mcp",
             "MCP 连接",
@@ -318,5 +309,14 @@ def default(group: str, key: str):
             ),
             description="出站 MCP 连接的全局安全边界。MCP 连接本身在「MCP 连接」页配置，密钥只写不读。",
         ),
+    )
+}
+
+
+def secret_name(group: str, key: str) -> str:
+    return f"setting.{group}.{key}"
+
+
+def default(group: str, key: str):
     f = GROUPS[group].field(key)
     return f.default if f else None

@@ -56,6 +56,40 @@ BUILTIN_CATALOG: list[BuiltinDef] = [
 ]
 
 
+def _p(label: str, description: str = "", *, required: bool = False, enum: tuple[str, ...] = ()) -> dict[str, Any]:
+    rule: dict[str, Any] = {"type": "string", "label": label, "required": required}
+    if description:
+        rule["description"] = description
+    if enum:
+        rule["enum"] = list(enum)
+    return rule
+
+
+# 模型可填的参数（只放行这些键；身份字段永远由服务端注入）。结果统一为围栏文本，见 BUILTIN_RESULT_*。
+BUILTIN_MODEL_PARAMS: dict[str, dict[str, dict[str, Any]]] = {
+    "sys.time": {"timezone": _p("时区", "IANA 时区名，如 Asia/Shanghai；缺省为平台默认时区")},
+    "sys.calc": {"expression": _p("表达式", "只支持数字与 + - * / // % ** 括号，如 (3+4)*2", required=True)},
+    "sys.export": {"content": _p("内容", "要导出的文本", required=True), "filename": _p("文件名")},
+    "sys.memory": {"action": _p("操作", "add 记住 / list 列出 / forget 忘记", enum=("add", "list", "forget")),
+                   "text": _p("内容", "add 时为要记住的内容；forget 时为要忘记的内容关键字"),
+                   "kind": _p("类别")},
+    "sys.cron": {"action": _p("操作", "list / add / remove"), "workflow": _p("流程"), "cron": _p("cron 表达式"),
+                 "job_id": _p("任务 ID")},
+    "sys.http": {"url": _p("URL", required=True), "method": _p("方法")},
+    "sys.web_search": {"query": _p("搜索词", required=True)},
+    "sys.fs_read": {"path": _p("沙箱内路径", required=True)},
+    "sys.fs_write": {"path": _p("沙箱内路径", required=True), "content": _p("内容", required=True)},
+}
+
+# builtin / mcp 的结果统一为 {"text": <围栏文本>}，回复层按 text 渲染，不走 office 的字段白名单
+TEXT_RESULT_KIND = "text"
+TEXT_RESULT_FIELDS = ("text",)
+
+
+def builtin_model_params(builtin_id: str | None) -> dict[str, dict[str, Any]]:
+    return {k: dict(v) for k, v in BUILTIN_MODEL_PARAMS.get(builtin_id or "", {}).items()}
+
+
 def ensure_builtin_tools(db: Session, tenant_id: str) -> int:
     """幂等 upsert：只补缺失行，返回新插入条数。调用方负责事务。"""
     existing = set(db.scalars(sa.select(Tool.name).where(Tool.tenant_id == tenant_id,
