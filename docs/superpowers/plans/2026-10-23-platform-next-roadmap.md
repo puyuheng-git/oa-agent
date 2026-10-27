@@ -22,7 +22,7 @@
 | **D7** | **B** | 模型选不可见 Tool → 明确告知未开放 |
 | **D16** | **B** | C 一期无 OA 标签联调：后台规则 + TagProvider 预留 |
 | **D17** | **A** | 可见性只挂 Skill |
-| **D18** | **A** | 出站 MCP 仅接口 + 安全边界 + Noop |
+| **D18** | **A** → **D18′（2026-10-27 修订）** | 出站 MCP 原为仅接口 + 安全边界 + Noop；现演进为可配置真实出站 Client（Noop 仅作未配置回退），见 [`specs/2026-10-27-mcp-builtin-tool-guard-design.md`](../specs/2026-10-27-mcp-builtin-tool-guard-design.md) |
 | **D19** | **C** | 无可见性规则 = 不启裁剪（同现网） |
 | **D8** | **C** | A 一期不做 Profile，只做长期记忆 |
 | **D9** | **A** | 长期记忆仅显式「请记住」写入 |
