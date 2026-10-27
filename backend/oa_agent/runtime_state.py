@@ -131,6 +131,12 @@ class AppRuntime:
         return self._sessionmaker()
 
     def shutdown(self) -> None:
+        mcp_client = getattr(self, "mcp_client", None)  # 出站 MCP 会话池（惰性创建，见 executor.mcp_runtime）
+        if mcp_client is not None and hasattr(mcp_client, "close"):
+            try:
+                mcp_client.close()
+            except Exception:  # noqa: BLE001 — 关闭尽力而为
+                log.warning("关闭出站 MCP 会话池失败", exc_info=True)
         if self.wecom is not None:
             self.wecom.stop()
         if self.engine is not None:

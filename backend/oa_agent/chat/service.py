@@ -25,6 +25,7 @@ from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError, up
 from oa_agent.db.models import Skill
 from oa_agent.executor.catalog import SkillState
 from oa_agent.executor.executor import Identity, ToolError, ToolExecutor
+from oa_agent.executor.mcp_runtime import get_mcp_client
 from oa_agent.executor.tags import EmptyTagProvider
 from oa_agent.executor.visibility import PrincipalContext, VisibilityService
 from oa_agent.observability import conversation
@@ -366,7 +367,8 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
         recorder=rec,
         identity=Identity(oa=session.oa, authorization=session.office_token),
         executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
-                              int(setting(rt, "oa", "tool_remark_max_chars"))),
+                              int(setting(rt, "oa", "tool_remark_max_chars")),
+                              mcp_client=get_mcp_client(rt)),
         today=datetime.now(CHINA_TZ).date(),
         model=_model(rt, config),
         config=config,

@@ -13,6 +13,8 @@ from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.events import RunRecorder
 
 REMARK_LIMIT = 100
+MCP_DROPPED_ARGS = frozenset({"oa", "authorization", "token", "office_token"})  # 身份只由服务端持有，不外传
+MSG_NOT_AVAILABLE = "该功能未对你开放。"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -127,16 +129,50 @@ def _extract_list(data: object) -> tuple[list, int]:
 
 
 class ToolExecutor:
-    def __init__(self, registry: ToolRegistry, clients: dict[str, OfficeApiClient], remark_limit: int = REMARK_LIMIT):
-        """clients：地址标识 → office-api 客户端（见 office_api.upstream_clients）。"""
+    def __init__(self, registry: ToolRegistry, clients: dict[str, OfficeApiClient], remark_limit: int = REMARK_LIMIT,
+                 *, mcp_client: object | None = None):
+        """clients：地址标识 → office-api 客户端（见 office_api.upstream_clients）；mcp_client：出站 MCP 客户端。"""
         self.registry = registry
         self.clients = clients
         self.remark_limit = remark_limit
+        self.mcp_client = mcp_client  # None → 未配置出站连接器（调用即「未对你开放」）
+
+    def _execute_mcp(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
+        """kind=mcp：参数由 MCP 服务端自行校验，这里只丢弃身份字段；结果一律作为不可信数据围栏后回图。"""
+        from oa_agent.executor.outbound import MAX_RESULT_BYTES, NoopOutboundMcpClient
+        from oa_agent.security.prompt_guard import wrap_untrusted
+
+        name = spec.name
+        clean = {k: v for k, v in (args or {}).items() if k not in MCP_DROPPED_ARGS}
+        rec.tool_call_count += 1
+        rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,
+                  input_summary={"arg_names": sorted(clean)}, metadata={"kind": "mcp"})
+        started = time.perf_counter()
+        try:
+            if not spec.mcp_server_id or not spec.mcp_tool_name:
+                raise ToolError("TOOL_NOT_AVAILABLE", f"MCP 工具未绑定连接：{name}", user_message=MSG_NOT_AVAILABLE)
+            client = self.mcp_client or NoopOutboundMcpClient()
+            raw = client.call_tool(spec.mcp_tool_name, clean, identity=identity, server_id=spec.mcp_server_id)
+        except ToolError as exc:
+            rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version,
+                      status="error", duration_ms=int((time.perf_counter() - started) * 1000),
+                      error_code=exc.code, error_summary=exc.message, metadata={"kind": "mcp"})
+            raise
+        text = wrap_untrusted(str(raw.get("text") or ""), source="mcp", name=name, max_chars=MAX_RESULT_BYTES)
+        rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
+                  duration_ms=int((time.perf_counter() - started) * 1000),
+                  output_summary={"result_count": 1, "truncated": bool(raw.get("truncated"))},
+                  metadata={"kind": "mcp"})
+        # structured 不回图：它不经围栏，直接进模型会绕过不可信数据边界
+        return {"ok": True, "capability": name, "data": {"text": text, "truncated": bool(raw.get("truncated"))},
+                "message": ""}
 
     def execute(self, name: str, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
         spec = self.registry.get(name)
         if spec is None:
             raise ToolError("TOOL_NOT_AVAILABLE", f"Tool 未注册或未启用：{name}")
+        if spec.kind == "mcp":
+            return self._execute_mcp(spec, args, identity, rec, node_name)
         clean, dropped = validate_args(spec, args)
         rec.tool_call_count += 1
         rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,

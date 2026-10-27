@@ -219,3 +219,164 @@ def test_write_requires_csrf_and_idempotency_key(admin, installed):
     h = {"X-CSRF-Token": admin.csrf, "Idempotency-Key": "same-key"}
     assert c.post(URL, json=stdio_body(), headers=h).status_code == 200
     assert c.post(URL, json=stdio_body(name="other_one"), headers=h).status_code == 409
+
+
+# ---------------- Task 7：test / sync ----------------
+
+class FakeMcp:
+    """替身出站客户端：list_tools / call_tool 都不触网。"""
+
+    def __init__(self, tools=None, fail=None):
+        self.tools = tools if tools is not None else [
+            {"name": "echo", "description": "回显", "input_schema": {"type": "object"}},
+            {"name": "add", "description": "加法", "input_schema": {"type": "object"}},
+        ]
+        self.fail = fail
+        self.listed: list = []
+
+    def list_tools(self, server):
+        self.listed.append(server)
+        if self.fail:
+            raise self.fail
+        return list(self.tools)
+
+    def call_tool(self, name, arguments, *, identity, server_id=None):
+        return {"text": "ok", "truncated": False}
+
+
+def _fake(installed, **kw) -> FakeMcp:
+    fake = FakeMcp(**kw)
+    installed.app.state.runtime.mcp_client = fake
+    return fake
+
+
+def _tools(installed, server_id=None):
+    from oa_agent.db.models import Tool
+
+    rt = installed.app.state.runtime
+    with rt.session() as db:
+        rows = db.scalars(sa.select(Tool).where(Tool.kind == "mcp").order_by(Tool.name)).all()
+        return [(t.name, t.mcp_tool_name, t.enabled, t.mcp_server_id) for t in rows]
+
+
+def test_test_endpoint_returns_ok_and_count_without_writing_tools(admin, installed):
+    fake = _fake(installed)
+    assert admin.post(URL, json=stdio_body(env={"API_KEY": "key-ENVSECRET-12345678"})).status_code == 200
+    r = admin.post(f"{URL}/demo_stdio/test")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True and r.json()["count"] == 2
+    assert _tools(installed) == []
+    # 探测配置带上了保险箱里的 env（仅服务端内部），响应/审计不含明文
+    assert fake.listed[0].env == {"API_KEY": "key-ENVSECRET-12345678"}
+    assert "ENVSECRET" not in r.text and "ENVSECRET" not in json.dumps(audit_rows(admin), ensure_ascii=False)
+    assert "mcp_server.test" in {a["action"] for a in audit_rows(admin)}
+
+
+def test_test_endpoint_reports_failure_honestly(admin, installed):
+    from oa_agent.executor.executor import ToolError
+
+    _fake(installed, fail=ToolError("UPSTREAM_UNAVAILABLE", "demo_stdio 连接失败：ConnectionError"))
+    assert admin.post(URL, json=stdio_body()).status_code == 200
+    r = admin.post(f"{URL}/demo_stdio/test")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is False and "连接失败" in r.json()["error"]
+
+
+def test_sync_creates_disabled_prefixed_mcp_tools(admin, installed):
+    _fake(installed)
+    assert admin.post(URL, json=stdio_body(tool_prefix="demo_")).status_code == 200
+    r = admin.post(f"{URL}/demo_stdio/sync")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True and r.json()["count"] == 2
+    assert sorted(r.json()["created"]) == ["demo_add", "demo_echo"]
+    rows = _tools(installed)
+    assert [(n, m, e) for n, m, e, _ in rows] == [("demo_add", "add", False), ("demo_echo", "echo", False)]
+    assert all(sid is not None for *_, sid in rows)
+    detail = admin.get(f"{URL}/demo_stdio").json()
+    assert detail["last_sync_result"] == "ok" and detail["last_sync_error"] is None and detail["last_sync_at"]
+    assert "mcp_server.sync" in {a["action"] for a in audit_rows(admin)}
+
+
+def test_sync_is_idempotent_and_keeps_admin_enabled_flag(admin, installed):
+    from oa_agent.db.models import Tool
+
+    _fake(installed)
+    assert admin.post(URL, json=stdio_body(tool_prefix="demo_")).status_code == 200
+    assert admin.post(f"{URL}/demo_stdio/sync").status_code == 200
+    rt = installed.app.state.runtime
+    with rt.session() as db, db.begin():
+        db.scalar(sa.select(Tool).where(Tool.name == "demo_echo")).enabled = True
+    r = admin.post(f"{URL}/demo_stdio/sync", headers={"Idempotency-Key": "again"})
+    assert r.status_code == 200 and r.json()["created"] == []
+    assert dict((n, e) for n, _, e, _ in _tools(installed)) == {"demo_add": False, "demo_echo": True}
+
+
+def test_sync_removed_tool_deleted_when_unreferenced_else_disabled(admin, installed):
+    from oa_agent.db.models import Skill, SkillVersion, Tool
+
+    fake = _fake(installed)
+    assert admin.post(URL, json=stdio_body(tool_prefix="demo_")).status_code == 200
+    assert admin.post(f"{URL}/demo_stdio/sync").status_code == 200
+    rt = installed.app.state.runtime
+    with rt.session() as db, db.begin():
+        db.scalar(sa.select(Tool).where(Tool.name == "demo_echo")).enabled = True
+        skill = Skill(tenant_id=rt.tenant_id, name="uses_echo", enabled=True)
+        db.add(skill)
+        db.flush()
+        ver = SkillVersion(skill_id=skill.id, version_no=1, content_json={"tools": ["demo_echo"]}, content_hash="h")
+        db.add(ver)
+        db.flush()
+        skill.current_version_id = ver.id
+    fake.tools = []  # 远端全部消失
+    r = admin.post(f"{URL}/demo_stdio/sync", headers={"Idempotency-Key": "gone"})
+    assert r.status_code == 200, r.text
+    assert r.json()["removed"] == ["demo_add"] and r.json()["disabled"] == ["demo_echo"]
+    assert [(n, e) for n, _, e, _ in _tools(installed)] == [("demo_echo", False)]
+    with rt.session() as db:
+        err = db.scalar(sa.select(Tool.last_sync_error).where(Tool.name == "demo_echo"))
+    assert err and "Skill" in err
+
+
+def test_sync_name_conflict_with_other_tool_is_skipped(admin, installed):
+    from oa_agent.db.models import Tool
+
+    _fake(installed)
+    assert admin.post(URL, json=stdio_body(tool_prefix="demo_")).status_code == 200
+    rt = installed.app.state.runtime
+    with rt.session() as db, db.begin():
+        db.add(Tool(tenant_id=rt.tenant_id, name="demo_echo", kind="office"))
+    r = admin.post(f"{URL}/demo_stdio/sync")
+    assert r.status_code == 200, r.text
+    assert r.json()["created"] == ["demo_add"] and r.json()["skipped"][0]["name"] == "demo_echo"
+    with rt.session() as db:
+        assert db.scalar(sa.select(Tool.kind).where(Tool.name == "demo_echo")) == "office"
+
+
+def test_sync_failure_records_error_and_keeps_tools(admin, installed):
+    from oa_agent.executor.executor import ToolError
+
+    fake = _fake(installed)
+    assert admin.post(URL, json=stdio_body(tool_prefix="demo_")).status_code == 200
+    assert admin.post(f"{URL}/demo_stdio/sync").status_code == 200
+    fake.fail = ToolError("UPSTREAM_TIMEOUT", "demo_stdio 连接超时")
+    r = admin.post(f"{URL}/demo_stdio/sync", headers={"Idempotency-Key": "boom"})
+    assert r.status_code == 200 and r.json()["ok"] is False
+    detail = admin.get(f"{URL}/demo_stdio").json()
+    assert detail["last_sync_result"] == "error" and "超时" in detail["last_sync_error"]
+    assert len(_tools(installed)) == 2
+
+
+def test_sync_and_test_404_permission_and_remote_allowlist(admin, installed):
+    _fake(installed)
+    assert admin.post(f"{URL}/ghost/sync").status_code == 404
+    assert admin.post(f"{URL}/ghost/test").status_code == 404
+    role = _role(admin, "tool_only2", ["ops.tool.manage"])
+    _user(admin, "toolonly2", [role["id"]])
+    other = login(TestClient(installed.app), "toolonly2", VIEWER_PASS)
+    assert other.post(f"{URL}/demo_stdio/sync").status_code == 403
+    assert other.post(f"{URL}/demo_stdio/test").status_code == 403
+    # 白名单后来被清空：远程连接不得再被探测
+    set_allowlist(admin, ["https://mcp.example.internal"])
+    assert admin.post(URL, json=http_body()).status_code == 200
+    set_allowlist(admin, ["https://other.example.internal"])
+    assert admin.post(f"{URL}/demo_http/test").status_code == 422

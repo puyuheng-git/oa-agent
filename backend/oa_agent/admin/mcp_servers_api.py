@@ -19,7 +19,12 @@ from sqlalchemy.exc import IntegrityError
 from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
 from oa_agent.config.crypto import mask_display
 from oa_agent.db.models import McpServer, Tool
+from oa_agent.db.types import utcnow
 from oa_agent.errors import AppError
+from oa_agent.executor.executor import ToolError
+from oa_agent.executor.mcp_runtime import SYNC_ERROR, SYNC_OK, build_config, get_mcp_client
+from oa_agent.executor.mcp_sync import sync_server_tools
+from oa_agent.observability.redact import redact
 
 router = APIRouter(prefix="/v1/admin/mcp-servers", tags=["admin-mcp-servers"])
 
@@ -250,6 +255,59 @@ def update_server(name: str, body: McpServerIn, ctx: AdminCtx = Depends(admin_wr
         row.headers_secret_ref = _secret_name(name, "headers") if has_headers else None
         ctx.audit("mcp_server.update", "mcp_server", name, before=before, after=_summary(row, changed))
     return _view(ctx, _get(ctx, name))
+
+
+def _probe(ctx: AdminCtx, name: str):
+    """读取连接与保险箱密钥并释放事务，返回 (server_id, 运行时配置)。管理员可探测未启用的连接。"""
+    row = _get(ctx, name)
+    if row.transport != "stdio":
+        _check_url(ctx, row.url or "")  # 白名单可能在创建后被收紧，探测前复核
+        row = _get(ctx, name)
+    cfg = build_config(ctx.runtime, ctx.db, row)
+    cfg.enabled = True
+    server_id = row.id
+    ctx.db.rollback()  # 外部调用期间不占用数据库事务
+    return server_id, cfg
+
+
+def _fetch_tools(ctx: AdminCtx, cfg) -> tuple[list[dict] | None, str | None]:
+    try:
+        return get_mcp_client(ctx.runtime).list_tools(cfg), None
+    except ToolError as exc:
+        return None, redact(exc.message, 300)
+    except Exception as exc:  # noqa: BLE001 — 外部依赖失败如实返回类型，不透传可能含地址/密钥的文本
+        return None, f"探测失败：{type(exc).__name__}"
+
+
+@router.post("/{name}/test")
+def test_server(name: str, ctx: AdminCtx = Depends(admin_write(PERM))):
+    """真实连接并 tools/list；只返回是否成功与工具数，不写 Tool。"""
+    _, cfg = _probe(ctx, name)
+    tools, error = _fetch_tools(ctx, cfg)
+    result = {"ok": tools is not None, "count": len(tools or []), "error": error}
+    with ctx.db.begin():
+        _get(ctx, name)
+        ctx.audit("mcp_server.test", "mcp_server", name, after={"ok": result["ok"], "count": result["count"]})
+    return result
+
+
+@router.post("/{name}/sync")
+def sync_server(name: str, ctx: AdminCtx = Depends(admin_write(PERM))):
+    """tools/list → upsert kind=mcp Tool（新增默认停用，须管理员启用并绑 Skill 后才对员工可用）。"""
+    server_id, cfg = _probe(ctx, name)
+    tools, error = _fetch_tools(ctx, cfg)
+    with ctx.db.begin():
+        row = _get(ctx, name)
+        row.last_sync_at = utcnow()
+        if tools is None:
+            row.last_sync_result, row.last_sync_error = SYNC_ERROR, error
+            ctx.audit("mcp_server.sync", "mcp_server", name, after={"ok": False})
+            return {"ok": False, "count": 0, "error": error}
+        report = sync_server_tools(ctx.db, ctx.runtime.tenant_id, row, tools, ctx.user.username)
+        row.last_sync_result, row.last_sync_error = SYNC_OK, None
+        ctx.audit("mcp_server.sync", "mcp_server", name,
+                  after={"ok": True, "count": len(tools), **{k: len(v) for k, v in report.items()}})
+    return {"ok": True, "count": len(tools), "error": None, **report}
 
 
 @router.delete("/{name}")
