@@ -93,7 +93,8 @@ def test_colloquial_question_calls_tool_and_followups_use_context(chat, office, 
     assert history[0][1] == "九月份跑客户花的钱都报了没"
     assert "query_my_travel_expense_list" in history[1][1] and "101，102" in history[1][1]
     assert "客户A" not in history[1][1], "历史里只有查询摘要，不含业务明细"
-    assert model.calls[1][-1] == ("human", "那八月呢")
+    assert model.calls[1][-1][0] == "human" and "那八月呢" in model.calls[1][-1][1]
+    assert model.calls[1][-1][1].startswith("<<<UNTRUSTED_DATA source=user")
 
     third = send(chat, h, "第二条详细看看").json()
     assert third["reply"]["data"]["kind"] == "record"

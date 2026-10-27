@@ -226,7 +226,8 @@ def test_forged_oa_from_model_is_dropped(chat, office, monkeypatch):
     assert "lisi" not in json.dumps(start.input_summary, ensure_ascii=False)
     model = next(e for e in events if e.event_type == "model_call")
     assert [m["role"] for m in json.loads(model.input_summary)["messages"]] == ["system", "human"]
-    assert json.loads(model.input_summary)["messages"][1]["content"] == "查九月的行程报销"
+    human = json.loads(model.input_summary)["messages"][1]["content"]
+    assert human.startswith("<<<UNTRUSTED_DATA source=user") and "查九月的行程报销" in human  # 用户原话经围栏
     assert "lisi" not in str(route.calls.last.request.url)
 
 
