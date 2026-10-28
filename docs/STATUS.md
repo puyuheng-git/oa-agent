@@ -16,7 +16,7 @@
 | 出站 MCP + Builtin | **已交付（一期）** | 真 Client + 沙箱高风险默认关；真实 MCP/搜索联调未执行 |
 | Tool 路由模式 + 调用过程 | **已交付** | 六模式可配置；管理端「调用过程」；embedding / 独立路由模型仍为扩展 |
 | LLM 远端模型列表 | **已交付** | 提供方 `/models` 拉取 + 可搜索下拉；见规格 |
-| 多系统可插拔平台 | **M1 已交付**（通向平台的部分能力） | 规格 [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md)；交付 [`multi-system-m1-delivery`](delivery/2026-10-28-multi-system-m1-delivery.md)；M2+ 未开 |
+| 多系统可插拔平台 | **M1 已交付；M2 计划已开** | 规格 [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md)；M1 交付 [`multi-system-m1-delivery`](delivery/2026-10-28-multi-system-m1-delivery.md)；M2 计划 [`multi-system-m2-envelope`](superpowers/plans/2026-10-28-multi-system-m2-envelope.md) |
 
 ---
 

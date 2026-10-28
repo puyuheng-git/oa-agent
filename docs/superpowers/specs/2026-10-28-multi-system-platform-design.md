@@ -296,4 +296,5 @@ integrations/office_api.py  → 迁入 connectors/http_profiles/oa_office.py（�
 - [x] M4 OIDC **仅骨架**  
 - [x] Pack：**本机目录 + 后台启用**（暂不上传 zip）
 
-下一步：[`docs/superpowers/plans/2026-10-28-multi-system-m1-connectors.md`](../plans/2026-10-28-multi-system-m1-connectors.md)（M1 实施计划）。
+- M1 计划 / 交付：[`multi-system-m1-connectors`](../plans/2026-10-28-multi-system-m1-connectors.md) · [`multi-system-m1-delivery`](../../delivery/2026-10-28-multi-system-m1-delivery.md)  
+- **下一步 M2：** [`multi-system-m2-envelope`](../plans/2026-10-28-multi-system-m2-envelope.md)
