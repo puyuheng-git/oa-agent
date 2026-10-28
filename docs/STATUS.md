@@ -35,7 +35,8 @@
 | Tool 路由六模式 | [`tool-routing-modes-design`](superpowers/specs/2026-10-28-tool-routing-modes-design.md) | [`tool-routing-modes-delivery`](delivery/2026-10-28-tool-routing-modes-delivery.md) | ✅ |
 | Auth 与上游解耦 | `.cursor/plans/auth与上游解耦_*.plan.md` | 设计 + schema/后台拆分 | ✅（OA 同 Passport 依赖现网） |
 | LLM 远端模型列表 | [`llm-remote-models-design`](superpowers/specs/2026-10-28-llm-remote-models-design.md) | [`llm-remote-models-delivery`](delivery/2026-10-28-llm-remote-models-delivery.md) | ✅ |
-| 多系统 M1 Principal/Connector | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M1；计划 [`multi-system-m1-connectors`](superpowers/plans/2026-10-28-multi-system-m1-connectors.md) | [`multi-system-m1-delivery`](delivery/2026-10-28-multi-system-m1-delivery.md) | ✅（行为兼容；M2+ 未做） |
+| 多系统 M1 Principal/Connector | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M1；计划 [`multi-system-m1-connectors`](superpowers/plans/2026-10-28-multi-system-m1-connectors.md) | [`multi-system-m1-delivery`](delivery/2026-10-28-multi-system-m1-delivery.md) | ✅（行为兼容） |
+| 多系统 M2 envelope/bindings | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M2；计划 [`multi-system-m2-envelope`](superpowers/plans/2026-10-28-multi-system-m2-envelope.md) | — | 📋 计划已开 |
 
 **清理（2026-10-28）：** 已删除 `scripts/` 下一批一次性修补/反编译临时脚本（`_*`），仅保留 `start.ps1` / `start.sh`。
 
@@ -85,7 +86,7 @@
 
 X1 / X4 / X5 / X6 与 **多系统 M1** 已完成（见 [`x4-x6-delivery`](delivery/2026-10-28-x4-x6-delivery.md)、[`multi-system-m1-delivery`](delivery/2026-10-28-multi-system-m1-delivery.md)）。建议继续：
 
-1. **多系统 M2**（envelope / identity_bindings 可配）— 待开计划  
+1. **多系统 M2**（envelope / identity_bindings / raw_json mock）— [`multi-system-m2-envelope`](superpowers/plans/2026-10-28-multi-system-m2-envelope.md)  
 2. **X2** embedding（需额外设计密钥与索引落点）  
 3. **X3** 管理端「调用过程」手工验收 + Chat 写 Workflow 快捷按钮  
 4. **X7–X9** TagProvider / Profile / Checkpointer 多实例；其后 M3–M5  
