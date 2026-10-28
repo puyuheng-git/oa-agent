@@ -195,6 +195,13 @@ def upstream_clients(oa_settings: dict) -> dict[str, OfficeApiClient]:
     return clients
 
 
+def upstream_connectors(oa_settings: dict):
+    """业务上游 Connector 目录；与 upstream_clients 同源，包装为 HttpJsonConnector。"""
+    from oa_agent.connectors.hub import ConnectorHub
+
+    return ConnectorHub.from_office_settings(oa_settings)
+
+
 def _json_or_none(resp: httpx.Response) -> object:
     try:
         return resp.json()

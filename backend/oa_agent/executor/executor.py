@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from datetime import date
 
+from oa_agent.connectors.base import ConnectorError
+from oa_agent.connectors.hub import ConnectorHub
 from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.events import RunRecorder
@@ -40,6 +42,11 @@ class Identity:
 
     oa: str
     authorization: str
+    principal_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.principal_id:
+            self.principal_id = self.oa
 
 
 def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
@@ -130,14 +137,17 @@ def _extract_list(data: object) -> tuple[list, int]:
 
 class ToolExecutor:
     def __init__(self, registry: ToolRegistry, clients: dict[str, OfficeApiClient], remark_limit: int = REMARK_LIMIT,
-                 *, mcp_client: object | None = None, builtin_runtime: object | None = None):
+                 *, mcp_client: object | None = None, builtin_runtime: object | None = None,
+                 hub: ConnectorHub | None = None):
         """clients：地址标识 → office-api 客户端（见 office_api.upstream_clients）；mcp_client：出站 MCP 客户端；
-        builtin_runtime：内置 Tool 运行时（None → 仅 time/calc 可用，export/memory 需注入带存储的运行时）。"""
+        builtin_runtime：内置 Tool 运行时（None → 仅 time/calc 可用，export/memory 需注入带存储的运行时）；
+        hub：可选 ConnectorHub；有对应 connector 时优先 invoke，否则回退 clients。"""
         self.registry = registry
         self.clients = clients
         self.remark_limit = remark_limit
         self.mcp_client = mcp_client  # None → 未配置出站连接器（调用即「未对你开放」）
         self.builtin_runtime = builtin_runtime
+        self.hub = hub
 
     def _execute_builtin(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder,
                          node_name: str) -> dict:
@@ -215,29 +225,40 @@ class ToolExecutor:
         if spec.kind == "builtin":
             return self._execute_builtin(spec, args, identity, rec, node_name)
         clean, dropped = validate_args(spec, args)
+        connector_id = spec.upstream or "office"
         rec.tool_call_count += 1
         rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,
                   input_summary=clean,
-                  metadata={"path": spec.path, "upstream": spec.upstream,
+                  metadata={"path": spec.path, "upstream": spec.upstream, "connector_id": connector_id,
                             **({"dropped_fields": dropped} if dropped else {})})
         started = time.perf_counter()
         try:
-            client = self.clients.get(spec.upstream)
-            if client is None:
-                raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 office-api 地址：{spec.upstream}")
-            resp = client.get(spec.path, build_request(spec, clean, identity), identity.authorization,
-                              timeout=spec.timeout_seconds)
+            params = build_request(spec, clean, identity)
+            connector = self.hub.get(spec.upstream) if self.hub is not None else None
+            if connector is not None:
+                resp = connector.invoke(
+                    (spec.method or "GET").upper(),
+                    spec.path,
+                    params=params,
+                    authorization=identity.authorization,
+                    timeout=spec.timeout_seconds,
+                )
+            else:
+                client = self.clients.get(spec.upstream)
+                if client is None:
+                    raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 office-api 地址：{spec.upstream}")
+                resp = client.get(spec.path, params, identity.authorization, timeout=spec.timeout_seconds)
             result = compact(spec, resp.data, clean, self.remark_limit)
-        except (OfficeApiError, ToolError) as exc:
+        except (OfficeApiError, ConnectorError, ToolError) as exc:
             rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version,
                       status="error", duration_ms=int((time.perf_counter() - started) * 1000),
                       error_code=exc.code, error_summary=exc.message,
-                      metadata={"http_status": getattr(exc, "http_status", None)})
+                      metadata={"http_status": getattr(exc, "http_status", None), "connector_id": connector_id})
             raise ToolError(exc.code, exc.message, getattr(exc, "http_status", None),
                             getattr(exc, "user_message", "")) from exc
         count = len(result.get("list", [])) if spec.result_kind == "list" else (1 if result else 0)
         summary = {"result_count": count, "total": result.get("total")}
         rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
                   duration_ms=resp.duration_ms, output_summary={**summary, "message": resp.message} if resp.message
-                  else summary, metadata={"http_status": resp.http_status})
+                  else summary, metadata={"http_status": resp.http_status, "connector_id": connector_id})
         return {"ok": True, "capability": name, "data": result, "message": resp.message}

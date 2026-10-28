@@ -26,8 +26,19 @@ log = logging.getLogger(__name__)
 DRAFT, VALIDATED, PUBLISHED = "draft", "validated", "published"
 PUBLISH, ROLLBACK = "publish", "rollback"
 
-BASIC, DIALOG, MEMORY, OUTPUT = "基础", "对话与角色", "多轮对话与会话压缩", "工具串联与输出"
-GROUPS = (BASIC, DIALOG, MEMORY, OUTPUT)
+BASIC, DIALOG, MEMORY, OUTPUT, ROUTING = "基础", "对话与角色", "多轮对话与会话压缩", "工具串联与输出", "工具路由"
+GROUPS = (BASIC, DIALOG, MEMORY, OUTPUT, ROUTING)
+
+ROUTING_MODE_OPTIONS = [
+    {"value": "legacy_prompt", "label": "提示词海选（兼容）"},
+    {"value": "skill_then_tool", "label": "先选 Skill 再选 Tool"},
+    {"value": "retrieve_then_tool", "label": "检索召回再精选"},
+    {"value": "meta_search", "label": "元工具渐进披露"},
+    {"value": "deterministic_first", "label": "确定性优先"},
+    {"value": "router_then_fill", "label": "小路由大填参"},
+]
+FALLBACK_MODE_OPTIONS = [o for o in ROUTING_MODE_OPTIONS if o["value"] != "deterministic_first"
+                         and o["value"] != "meta_search"]
 
 FIELDS = (
     {"key": "intent_mode", "group": BASIC, "label": "意图解析方式", "kind": "enum",
@@ -104,6 +115,57 @@ FIELDS = (
     {"key": "stream_output", "group": OUTPUT, "label": "流式输出", "kind": "bool",
      "help": "开启后模型边生成边显示：网页对话逐字出现，企业微信按「企业微信流式刷新间隔」逐段刷新"
              "查询结果表格由系统生成，会一次性显示。关闭则等完整回复生成后一次显示"},
+    {"key": "tool_routing_mode", "group": ROUTING, "label": "工具路由模式", "kind": "enum",
+     "options": ROUTING_MODE_OPTIONS,
+     "help": "本工作流「发布后」绑定的选 Tool 策略，一次运行从头到尾只用这一份，中途改配置不影响已绑定的运行。"
+             "写进发布快照后优先于「连接配置 → 运行参数」里的全局默认；草稿里若不写路由相关项，新运行仍可读全局默认。"
+             "固定写流程（如报销提交）不走本项。"
+             "模式白话——提示词海选：说明书一次塞给模型（默认兼容）；先选 Skill 再选 Tool：先定业务类再选接口；"
+             "检索召回再精选：先捞候选再精选（Tool 多时更合适）；"
+             "元工具渐进披露：先搜能力再拉参数说明（受元工具往返上限约束），不一次塞入全部说明书；"
+             "确定性优先：规则/固定串联能定就不调选 Tool 模型；小路由大填参：先定唯一 Tool 再只带一份说明书填参"},
+    {"key": "prompt_topk", "group": ROUTING, "label": "提示词候选 Tool 上限", "kind": "int",
+     "min": 1, "max": 64, "unit": "",
+     "help": "「提示词海选」或「检索后再精选」时，最多把多少个查询能力的说明书放进模型。"
+             "员工可见 Tool 数不超过该值时等于全量放入。Tool 很多时调小可省 Token；调太小可能漏掉相关能力。默认 8"},
+    {"key": "routing_skill_method", "group": ROUTING, "label": "Skill 选择方式", "kind": "enum",
+     "options": [{"value": "rules_then_llm", "label": "规则优先，失败再用模型"},
+                 {"value": "rules", "label": "仅规则"},
+                 {"value": "llm", "label": "仅模型"}],
+     "help": "仅「先选 Skill 再选 Tool」「小路由大填参」生效：怎么判断员工问的是哪一类业务。"
+             "规则优先再用模型（推荐）；仅规则最省但只认固定说法；仅模型本期若无单独路由模型则仍按相关度打分"},
+    {"key": "retrieve_topk", "group": ROUTING, "label": "检索召回条数", "kind": "int",
+     "min": 1, "max": 64, "unit": "",
+     "help": "仅「检索召回再精选」：先捞出最相关的前 N 个 Tool，再交给模型精选填参。"
+             "N 越大越不易漏、费用越高。默认 8"},
+    {"key": "retrieve_backend", "group": ROUTING, "label": "检索后端", "kind": "enum",
+     "options": [{"value": "keyword", "label": "关键词"},
+                 {"value": "embedding", "label": "向量（未就绪则降级）"}],
+     "help": "检索用关键词匹配，还是语义向量。"
+             "选向量但服务未接通时，系统强制改用关键词，并在调用过程事件里标明降级，不会假装向量已通"},
+    {"key": "retrieve_must_include_recent", "group": ROUTING, "label": "必留最近用过 Tool 数", "kind": "int",
+     "min": 0, "max": 16, "unit": "",
+     "help": "召回时强制保留本会话最近成功用过的若干 Tool，方便追问「那上个月的呢」。"
+             "0 = 不强行保留，只按相关度。默认 2"},
+    {"key": "meta_max_rounds", "group": ROUTING, "label": "元工具往返上限", "kind": "int",
+     "min": 1, "max": 10, "unit": "",
+     "help": "仅「元工具渐进披露」：search_capabilities / get_tool_schema 最多往返几次，防止无限追问说明书。"
+             "用尽仍未选定业务 Tool 时会向员工澄清（若开启低置信澄清）。默认 3"},
+    {"key": "deterministic_fallback_mode", "group": ROUTING, "label": "确定性未命中回退", "kind": "enum",
+     "options": FALLBACK_MODE_OPTIONS,
+     "help": "仅「确定性优先」：固定规则认不出意图时改走哪种选 Tool 方式。"
+             "不能再选「确定性优先」本身。建议「先选 Skill 再选 Tool」或「提示词海选」"},
+    {"key": "router_model_id", "group": ROUTING, "label": "路由用模型 ID", "kind": "text", "max": 64,
+     "help": "「小路由大填参」在选 Tool（stage=router）时使用的模型；填参仍用默认对话模型。"
+             "填 LLM 配置里的模型数字 ID，不要填密钥。留空则路由与填参共用默认模型。"
+             "适合用便宜小模型做分类、主模型只填参"},
+    {"key": "routing_clarify_on_low_confidence", "group": ROUTING, "label": "低置信时澄清", "kind": "bool",
+     "help": "拿不准该用哪个查询能力时：开启则向员工澄清、不瞎猜接口（推荐）；"
+             "关闭则按模式兜底继续选（可能选错或落到帮助）"},
+    {"key": "routing_trace_enabled", "group": ROUTING, "label": "写入路由过程事件", "kind": "bool",
+     "help": "是否把「怎么选出这个 Tool」记进运行事件，供「调用过程」页查看与统计。"
+             "开启写开始/阶段/决定/澄清（只含名称、分数、耗时）；关闭则统计页模式占比等能力降级。"
+             "排障与验收时请保持开启"},
 )
 FIELD_MAP = {f["key"]: f for f in FIELDS}
 # 旧版本配置里的字段：仍可校验通过，运行时忽略（可"Skill 改由「Skill 管理」决定）
@@ -148,6 +210,11 @@ def validate_content(db: Session, tenant_id: str, content: dict) -> list[str]:
         elif db.scalar(sa.select(LlmModel.id).where(LlmModel.tenant_id == tenant_id, LlmModel.id == model_id,
                                                     LlmModel.enabled.is_(True))) is None:
             errors.append(f"指定模型 {model_id} 不存在或未启用")
+    fallback = content.get("deterministic_fallback_mode")
+    if fallback == "deterministic_first":
+        errors.append("确定性未命中回退不能设为 deterministic_first")
+    if content.get("tool_routing_mode") == "deterministic_first" and fallback == "deterministic_first":
+        errors.append("确定性优先的回退模式不能指向自身")
     return errors
 
 
@@ -162,6 +229,8 @@ def _field_error(f: dict, value) -> str | None:
         ok = isinstance(value, int) and not isinstance(value, bool) and f["min"] <= value <= f["max"]
         return None if ok else f"{label}必须在 {f['min']}～{f['max']} 的整"
     if kind == "text":
+        if value is None:
+            return None  # 可空文本（如路由模型 ID）
         ok = isinstance(value, str) and len(value) <= f["max"]
         return None if ok else f"{label}必须是不超过 {f['max']} 字的文本"
     return None
@@ -171,6 +240,20 @@ def diff_content(old: dict | None, new: dict | None) -> list[dict]:
     old, new = old or {}, new or {}
     return [{"key": k, "old": old.get(k), "new": new.get(k)}
             for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
+
+
+# 工具路由键：未写入发布快照时不从 DEFAULT 填死，运行时叠 runtime 全局默认（热生效）
+_ROUTING_KEYS = frozenset({
+    "tool_routing_mode", "prompt_topk", "routing_skill_method", "retrieve_topk", "retrieve_backend",
+    "retrieve_must_include_recent", "meta_max_rounds", "deterministic_fallback_mode", "router_model_id",
+    "routing_clarify_on_low_confidence", "routing_trace_enabled",
+})
+
+
+def merge_release_config(content: dict | None) -> dict:
+    """合并代码默认；路由键仅在快照显式写出时带上。"""
+    base = {k: v for k, v in travel_query.DEFAULT_CONFIG.items() if k not in _ROUTING_KEYS}
+    return {**base, **(content or {})}
 
 
 class ReleaseService:
@@ -219,10 +302,9 @@ class ReleaseService:
             if self._current is not None:
                 return self._current
         if row is None:
-            return self._current or Release(None, None, dict(travel_query.DEFAULT_CONFIG))
+            return self._current or Release(None, None, merge_release_config(None))
         release, version = row
-        result = Release(release.release_id, version.version_no, {**travel_query.DEFAULT_CONFIG,
-                                                                   **version.content_json})
+        result = Release(release.release_id, version.version_no, merge_release_config(version.content_json))
         with self._lock:
             self._current = result
             self._by_id[release.release_id] = result
@@ -241,8 +323,7 @@ class ReleaseService:
         if row is None:
             raise ReleaseError(409, "RELEASE_NOT_FOUND", f"运行绑定的发布 {release_id} 不存在")
         release, version = row
-        result = Release(release.release_id, version.version_no, {**travel_query.DEFAULT_CONFIG,
-                                                                   **version.content_json})
+        result = Release(release.release_id, version.version_no, merge_release_config(version.content_json))
         with self._lock:
             self._by_id[release_id] = result
         return result

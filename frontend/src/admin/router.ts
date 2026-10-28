@@ -35,6 +35,7 @@ export const menuGroups: MenuGroup[] = [
 
 export const menu: MenuItem[] = [
   { path: '/runs', title: '运行记录', code: 'RUNS', perm: 'ops.run.view', group: 'monitor', icon: List, component: () => import('./views/RunsView.vue') },
+  { path: '/routing', title: '调用过程', code: 'ROUTING', perm: 'ops.run.view', group: 'monitor', icon: Share, component: () => import('./views/RoutingView.vue') },
   { path: '/conversations', title: '对话记录', code: 'DIALOGS', perm: 'ops.run.view_sensitive', group: 'monitor', icon: ChatDotRound, component: () => import('./views/ConversationsView.vue') },
   { path: '/employees', title: '员工治理', code: 'EMPLOYEES', perm: 'ops.employee.view', group: 'monitor', icon: User, component: () => import('./views/EmployeesView.vue') },
   { path: '/interventions', title: '介入中心', code: 'HANDOFF', perm: 'ops.intervention.handle', group: 'handoff', icon: Aim, component: () => import('./views/InterventionsView.vue') },

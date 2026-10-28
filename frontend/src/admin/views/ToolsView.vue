@@ -1,9 +1,22 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { errorMessage, http } from '@/shared/http'
 import { formatTime } from '@/shared/format'
 import { COMPAT_LEVEL, syncTag, type DiffChange, type ToolDetail, type ToolItem, type ToolKind } from '../ops'
+import { resolveToolGuide } from '../toolGuides'
+
+function paramEntries(params: Record<string, { type?: string; label?: string; description?: string; required?: boolean; enum?: string[] }> | undefined) {
+  if (!params) return []
+  return Object.entries(params).map(([name, rule]) => ({
+    name,
+    label: rule.label || name,
+    type: rule.type || 'string',
+    required: !!rule.required,
+    description: rule.description || '',
+    enum: rule.enum?.join(' / ') || '',
+  }))
+}
 import AbilityHelpBanner from '../components/AbilityHelpBanner.vue'
 import { emptyParam, emptyToolForm, toolFormFromSchema, toolPayload, type ToolForm } from '../catalogForm'
 
@@ -21,6 +34,8 @@ const report = ref<{ files: { file: string; ok: boolean; errors: string[] }[]; t
 
 const drawer = ref(false)
 const detail = ref<ToolDetail | null>(null)
+const guide = computed(() => resolveToolGuide(detail.value))
+const guideParams = computed(() => paramEntries(guide.value?.model_params))
 const diffRange = ref<{ from: number | null; to: number | null }>({ from: null, to: null })
 const diff = ref<{ compat_level: string; changes: DiffChange[] } | null>(null)
 
@@ -217,15 +232,32 @@ async function createSkill(draft: SkillDraft, toolName: string) {
   }
 }
 
+function isOfficeTool(tool: { kind?: string | null } | null | undefined): boolean {
+  return !tool?.kind || tool.kind === 'office'
+}
+
+function editBlockedReason(tool: { kind?: string | null; current_schema?: unknown } | null): string | null {
+  if (!tool) return 'Tool 不存在'
+  if (!isOfficeTool(tool)) {
+    if (tool.kind === 'builtin') {
+      return '内置 Tool 由系统提供，不能用此表单改路径/参数；请用列表里的启停开关。'
+    }
+    return 'MCP Tool 的定义来自「MCP 连接」同步，不能用此表单改路径/参数；请到 MCP 连接页重新同步，或用启停开关。'
+  }
+  if (!tool.current_schema) return '该 OA 接口 Tool 没有有效版本，无法编辑（可尝试「从文件导入」或新建）'
+  return null
+}
+
 async function edit(name: string) {
   try {
     const d = await http.get<ToolDetail>(`/v1/admin/tools/${name}`)
-    if (!d.current_schema) {
-      ElMessage.warning('该 Tool 没有有效版本，无法编辑')
+    const blocked = editBlockedReason(d)
+    if (blocked) {
+      ElMessage.warning(blocked)
       return
     }
     editing.value = true
-    form.value = toolFormFromSchema(d.current_schema)
+    form.value = toolFormFromSchema(d.current_schema!)
     reason.value = ''
     draftWarnings.value = []
     skillDraft.value = null
@@ -275,7 +307,7 @@ onMounted(load)
       type="info"
       :closable="false"
       show-icon
-      title="Tool 是对业务上游只读接口的声明，在此新建、编辑后立即生效，无需改代码。保存时：兼容变更直接生效；不兼容变更（删参数、改路径等）存为待激活版本。员工身份由服务端注入，模型无法指定。停用后立即拒绝调用。"
+      title="「编辑」只适用于 OA 接口 Tool（路径/参数/返回字段）。内置与 MCP Tool 没有这套版本定义：请用启停开关；MCP 定义请到「MCP 连接」页同步。保存时兼容变更立即生效，不兼容变更需激活。员工身份由服务端注入。"
       style="margin-bottom: 12px"
     />
     <div style="margin-bottom: 12px">
@@ -353,9 +385,12 @@ onMounted(load)
       <el-table-column label="来源" width="150">
         <template #default="{ row }">{{ row.source_file === 'admin' ? '管理后台' : row.source_file }}</template>
       </el-table-column>
-      <el-table-column label="" width="80" fixed="right">
+      <el-table-column label="" width="100" fixed="right">
         <template #default="{ row }">
-          <el-button link type="primary" @click="edit(row.name)">编辑</el-button>
+          <el-tooltip v-if="!isOfficeTool(row)" :content="editBlockedReason(row) || ''">
+            <span class="muted">不可编辑</span>
+          </el-tooltip>
+          <el-button v-else link type="primary" @click="edit(row.name)">编辑</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -577,63 +612,138 @@ onMounted(load)
           :title="`未注册到运行时：${detail.unregistered_reasons.join('；')}`"
           style="margin-bottom: 12px"
         />
-        <el-button type="primary" plain size="small" @click="edit(detail.name)">编辑定义</el-button>
-        <h4>版本</h4>
-        <el-table :data="detail.versions" size="small">
-          <el-table-column label="版本" width="80">
-            <template #default="{ row }">v{{ row.version_no }}</template>
-          </el-table-column>
-          <el-table-column label="规范版本" prop="spec_version" width="90" />
-          <el-table-column label="兼容性" width="90">
-            <template #default="{ row }">
-              <el-tag size="small" :type="COMPAT_LEVEL[row.compat_level]?.type">{{ COMPAT_LEVEL[row.compat_level]?.label || row.compat_level }}</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="哈希" prop="schema_hash" width="150" />
-          <el-table-column label="同步时间" width="160">
-            <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
-          </el-table-column>
-          <el-table-column label="" min-width="120">
-            <template #default="{ row }">
-              <el-tag v-if="row.is_current" type="success" size="small">当前</el-tag>
-              <el-tag v-if="row.is_pending" type="warning" size="small">待激活</el-tag>
-              <el-button v-if="!row.is_current" link type="primary" size="small" @click="activate(row.version_no)">激活</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+        <el-alert
+          v-if="!isOfficeTool(detail)"
+          type="info"
+          :closable="false"
+          show-icon
+          :title="editBlockedReason(detail) || ''"
+          style="margin-bottom: 12px"
+        />
+        <el-button v-else type="primary" plain size="small" @click="edit(detail.name)">编辑定义</el-button>
 
-        <h4>版本对比</h4>
-        <div style="display: flex; gap: 8px; align-items: center">
-          <el-select v-model="diffRange.from" style="width: 110px">
-            <el-option v-for="v in detail.versions" :key="v.version_no" :label="`v${v.version_no}`" :value="v.version_no" />
-          </el-select>
-          →
-          <el-select v-model="diffRange.to" style="width: 110px">
-            <el-option v-for="v in detail.versions" :key="v.version_no" :label="`v${v.version_no}`" :value="v.version_no" />
-          </el-select>
-          <el-button @click="loadDiff">对比</el-button>
-        </div>
-        <template v-if="diff">
-          <p>
-            结论：<el-tag :type="COMPAT_LEVEL[diff.compat_level]?.type || 'info'">{{ COMPAT_LEVEL[diff.compat_level]?.label || '无变化' }}</el-tag>
-          </p>
-          <el-table :data="diff.changes" size="small" empty-text="无差异">
-            <el-table-column label="字段" prop="field" width="200" />
-            <el-table-column label="变化" width="80" prop="change" />
-            <el-table-column label="旧" min-width="140">
-              <template #default="{ row }"><code>{{ fmt(row.old) }}</code></template>
+        <template v-if="guide">
+          <h4>实现说明</h4>
+          <p class="guide-summary">{{ guide.summary || detail.summary || '—' }}</p>
+          <dl class="guide-meta">
+            <div v-if="guide.runtime"><dt>运行时</dt><dd>{{ guide.runtime }}</dd></div>
+            <div v-if="guide.builtin_id"><dt>内置 ID</dt><dd><code>{{ guide.builtin_id }}</code></dd></div>
+            <div v-if="guide.mcp_server">
+              <dt>MCP 连接</dt>
+              <dd>
+                {{ guide.mcp_server.display_name || guide.mcp_server.name || guide.mcp_server.id }}
+                <span v-if="guide.mcp_server.transport" class="muted">· {{ guide.mcp_server.transport }}</span>
+                <el-tag v-if="guide.mcp_server.missing" size="small" type="danger" style="margin-left: 6px">连接缺失</el-tag>
+              </dd>
+            </div>
+            <div v-if="guide.mcp_tool_name"><dt>远端工具名</dt><dd><code>{{ guide.mcp_tool_name }}</code></dd></div>
+            <div v-if="guide.http">
+              <dt>HTTP</dt>
+              <dd>
+                <code>{{ guide.http.method || '—' }} {{ guide.http.path || '—' }}</code>
+                <span v-if="guide.http.upstream" class="muted">· 上游 {{ guide.http.upstream }}</span>
+              </dd>
+            </div>
+            <div v-if="guide.risk_level"><dt>风险等级</dt><dd>{{ guide.risk_level }}</dd></div>
+          </dl>
+          <p v-if="guide.how" class="guide-how">{{ guide.how }}</p>
+          <p v-if="guide.description" class="guide-desc">{{ guide.description }}</p>
+          <ul v-if="guide.constraints?.length" class="warn-list">
+            <li v-for="(c, i) in guide.constraints" :key="i">{{ c }}</li>
+          </ul>
+          <p v-if="guide.edit_hint" class="muted">{{ guide.edit_hint }}</p>
+
+          <h4 v-if="guideParams.length">模型可填参数</h4>
+          <el-table v-if="guideParams.length" :data="guideParams" size="small" empty-text="无">
+            <el-table-column label="参数" prop="name" width="120" />
+            <el-table-column label="说明" min-width="160">
+              <template #default="{ row }">{{ row.label }}{{ row.description ? `：${row.description}` : '' }}</template>
             </el-table-column>
-            <el-table-column label="新" min-width="140">
-              <template #default="{ row }"><code>{{ fmt(row.new) }}</code></template>
+            <el-table-column label="类型" width="90" prop="type" />
+            <el-table-column label="必填" width="70">
+              <template #default="{ row }">{{ row.required ? '是' : '否' }}</template>
             </el-table-column>
-            <el-table-column label="" width="80">
-              <template #default="{ row }"><el-tag v-if="row.breaking" type="danger" size="small">不兼容</el-tag></template>
+            <el-table-column label="枚举" min-width="100">
+              <template #default="{ row }">{{ row.enum || '—' }}</template>
             </el-table-column>
           </el-table>
+
+          <h4 v-if="guide.sandbox_policy || detail.sandbox_policy">沙箱策略</h4>
+          <pre
+            v-if="guide.sandbox_policy || detail.sandbox_policy"
+            class="schema"
+          >{{ JSON.stringify(guide.sandbox_policy || detail.sandbox_policy, null, 2) }}</pre>
+
+          <h4 v-if="guide.result">结果形态</h4>
+          <pre v-if="guide.result" class="schema">{{ JSON.stringify(guide.result, null, 2) }}</pre>
+
+          <h4 v-if="guide.input_schema">MCP inputSchema</h4>
+          <pre v-if="guide.input_schema" class="schema">{{ JSON.stringify(guide.input_schema, null, 2) }}</pre>
         </template>
 
-        <h4>当前版本定义</h4>
-        <pre class="schema">{{ JSON.stringify(detail.current_schema, null, 2) }}</pre>
+        <h4>{{ isOfficeTool(detail) ? '版本' : (detail.versions?.length ? '同步记录' : '版本') }}</h4>
+        <el-empty
+          v-if="!detail.versions?.length"
+          :description="guide ? '此类 Tool 无版本链（实现见上方「实现说明」）' : '此类 Tool 无版本链'"
+          :image-size="48"
+        />
+        <template v-else>
+          <el-table :data="detail.versions" size="small">
+            <el-table-column label="版本" width="80">
+              <template #default="{ row }">v{{ row.version_no }}</template>
+            </el-table-column>
+            <el-table-column label="规范版本" prop="spec_version" width="90" />
+            <el-table-column label="兼容性" width="90">
+              <template #default="{ row }">
+                <el-tag size="small" :type="COMPAT_LEVEL[row.compat_level]?.type">{{ COMPAT_LEVEL[row.compat_level]?.label || row.compat_level }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="哈希" prop="schema_hash" width="150" />
+            <el-table-column label="同步时间" width="160">
+              <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column label="" min-width="120">
+              <template #default="{ row }">
+                <el-tag v-if="row.is_current" type="success" size="small">当前</el-tag>
+                <el-tag v-if="row.is_pending" type="warning" size="small">待激活</el-tag>
+                <el-button v-if="!row.is_current && isOfficeTool(detail)" link type="primary" size="small" @click="activate(row.version_no)">激活</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <h4>版本对比</h4>
+          <div style="display: flex; gap: 8px; align-items: center">
+            <el-select v-model="diffRange.from" style="width: 110px">
+              <el-option v-for="v in detail.versions" :key="v.version_no" :label="`v${v.version_no}`" :value="v.version_no" />
+            </el-select>
+            →
+            <el-select v-model="diffRange.to" style="width: 110px">
+              <el-option v-for="v in detail.versions" :key="v.version_no" :label="`v${v.version_no}`" :value="v.version_no" />
+            </el-select>
+            <el-button @click="loadDiff">对比</el-button>
+          </div>
+          <template v-if="diff">
+            <p>
+              结论：<el-tag :type="COMPAT_LEVEL[diff.compat_level]?.type || 'info'">{{ COMPAT_LEVEL[diff.compat_level]?.label || '无变化' }}</el-tag>
+            </p>
+            <el-table :data="diff.changes" size="small" empty-text="无差异">
+              <el-table-column label="字段" prop="field" width="200" />
+              <el-table-column label="变化" width="80" prop="change" />
+              <el-table-column label="旧" min-width="140">
+                <template #default="{ row }"><code>{{ fmt(row.old) }}</code></template>
+              </el-table-column>
+              <el-table-column label="新" min-width="140">
+                <template #default="{ row }"><code>{{ fmt(row.new) }}</code></template>
+              </el-table-column>
+              <el-table-column label="" width="80">
+                <template #default="{ row }"><el-tag v-if="row.breaking" type="danger" size="small">不兼容</el-tag></template>
+              </el-table-column>
+            </el-table>
+          </template>
+
+          <h4>当前版本定义</h4>
+          <pre class="schema">{{ JSON.stringify(detail.current_schema, null, 2) }}</pre>
+        </template>
       </template>
     </el-drawer>
   </div>
@@ -662,6 +772,38 @@ onMounted(load)
   font-size: 12px;
   max-height: 360px;
   overflow: auto;
+}
+.guide-summary {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: var(--tech-text-1);
+}
+.guide-how,
+.guide-desc {
+  margin: 8px 0;
+  line-height: 1.65;
+  color: var(--tech-text-1);
+  white-space: pre-wrap;
+}
+.guide-meta {
+  margin: 0 0 8px;
+  display: grid;
+  gap: 6px;
+}
+.guide-meta > div {
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.guide-meta dt {
+  margin: 0;
+  color: var(--tech-text-2);
+}
+.guide-meta dd {
+  margin: 0;
+  word-break: break-all;
 }
 code {
   font-size: 12px;

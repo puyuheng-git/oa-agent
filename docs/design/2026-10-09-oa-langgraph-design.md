@@ -1,8 +1,8 @@
 # OA LangGraph Agent 设计（独立系统 + 运营管理后台）
 
-**日期：** 2026-10-09
-**状态：** 设计待确认；确认后按 §13 分阶段实施
-**仓库：** `E:\python_project\oa-langGraph`（独立于 OA / puyueheng）
+**日期：** 2026-10-09  
+**状态：** **P0–P6 已按 §13 落地**；子系统与扩展进度见 [`docs/STATUS.md`](../STATUS.md)（冲突仍以本文硬约束为准）  
+**仓库：** `E:\python_project\oa-langGraph`（独立于 OA / puyueheng）  
 **OA/Service 侧配套：** [`2026-10-09-oa-service-side-design.md`](2026-10-09-oa-service-side-design.md)
 
 **来源与取代关系：**
@@ -82,6 +82,15 @@
 7. 不伪造指标、Token、成本、健康状态；无数据显示「暂无数据 / 未检测」。
 8. 不展示模型隐藏推理链。
 9. 管理员身份与员工身份是两套主体，互不代替：管理员不能代员工确认业务操作。
+
+### 3.1 Principal / Connector（平台抽象，M1）
+
+多系统平台路线图见 [`docs/superpowers/specs/2026-10-28-multi-system-platform-design.md`](../superpowers/specs/2026-10-28-multi-system-platform-design.md)。M1 在**不改变现网行程报销对话行为**的前提下引入：
+
+- **Principal**：平台认定的对话主体；`principal_id` 写入会话与执行 `Identity`，缺省等于现网 `oa`（双写兼容，模型/客户端仍不得自报身份）。
+- **Connector**：对业务上游 HTTP 调用的统一接口（`Connector` Protocol + `ConnectorResult` / `ConnectorError`）。现网 OA office 目录中的 peer 包装为 **`HttpJsonConnector`**，由 **`ConnectorHub`** 按 `connector_id`（与上游 `key` 同源，默认 `office`）注册；内部仍委托既有 `OfficeApiClient`。
+- 执行路径：**优先**经 hub `invoke`，无对应 connector 时回退原 `clients` 字典；`tool_call` 事件 metadata 带 `connector_id`。
+- M1 **不做**：envelope 可配、Domain Pack 加载、OIDC / IdP 插件化、管理端连接器 UI 重做。
 
 ---
 
@@ -280,6 +289,15 @@ oa-langGraph/
 6. 业务提示语：office-api 响应的 `msg`/`message`/`errMsg` 经清洗（去 HTML、`redact_secrets`、≤200 字；「成功/ok」等通用词视为无提示）后：业务错误码或 HTTP 4xx → 员工回复「业务系统提示：{msg}」（`error_code` 不变，事件照常记录）；HTTP 5xx 不展示原文；成功且无数据 → 以 `msg` 代替「没有查到」；成功且有数据 → 回复附 `notice` 字段，前端在表格下方展示。提示语来自该员工 token 的接口返回，属于业务数据，不参与任何判定。
 7. 上文中的 6 轮、600 字、20 个 ID、4000 字、50 行等数值均为工作流配置项的默认值（§5.2.1），提示词开头的身份描述来自 `assistant_persona`。
 
+### 8.1.1 工具路由模式（2026-10-28 增）
+
+完整规格见 [`specs/2026-10-28-tool-routing-modes-design.md`](../superpowers/specs/2026-10-28-tool-routing-modes-design.md)。
+
+- **配置**：`runtime.tool_routing_mode` 等为全局默认（热生效于「快照未显式写出路由键」的新运行）；工作流 `content_json` 同名字段随发布快照绑定，**快照优先**。`deterministic_fallback_mode` 禁止再设为 `deterministic_first`。
+- **入口**：`oa_agent.executor.tool_routing.route()`；`oa_assistant.understand` 只走该入口。模式含 `legacy_prompt` / `skill_then_tool` / `retrieve_then_tool`（本期 keyword）/ `deterministic_first`（真正调用 `plan_list_then_detail`）/ `meta_search`（`search_capabilities` / `get_tool_schema`，受 `meta_max_rounds` 限制）/ `router_then_fill`。
+- **观测**：`routing_trace_enabled` 时写 `routing_start` / `routing_stage` / `routing_decision` / `routing_clarify`；metadata 仅 name/分数/耗时，无 token/密钥。管理端「调用过程」`/routing`（`ops.run.view`）提供过程明细与真实聚合统计；无数据「暂无数据」。
+- **硬约束不变**：路由只影响候选可见性；权限与写路径仍走注册表 + 身份注入 + office-api / 固定写 Workflow。
+
 ### 8.2 引用式多工具串联（2026-10-14 增）
 
 问题需要「先查 A，再用 A 的结果查 B」时（如「我最近一笔报销的详情」），**模型看不到 A 的结果**，由服务端代为取值：
@@ -371,7 +389,7 @@ cancel_requested → cancelled | succeeded | failed   (以实际停止结果为�
 | `/v1/chat/launch`、`/v1/chat/session`、`/v1/chat/session/switch`、`/v1/chat/threads*`（列表/新建/消息/重命名/归档/软删）、`/v1/chat/memory*`（列表/单条软删/一键清空需 `confirm`）、`/v1/chat/messages`、`/v1/chat/messages/stream`（SSE） | 员工对话 |
 | （无 HTTP 入口） | 企微走长连接（§6.2），Agent 主动连出 |
 | `/v1/admin/auth/*` | 后台登录、登出、改密 |
-| `/v1/admin/settings/*`、`/v1/admin/llm/*` | 配置中心、测试连接 |
+| `/v1/admin/settings/*`、`/v1/admin/llm/*` | 配置中心、测试连接；`GET /providers/{id}/remote-models` 按提供方拉取远端模型列表（`sys.setting.view`，只读、不写审计） |
 | `/v1/admin/accounts/*`、`/v1/admin/roles/*` | 账号角色 |
 | `/v1/admin/runs/*` | stats、列表、详情、events、errors/top、cancel、resume、retry |
 | `/v1/admin/interventions/*` | 介入任务 |

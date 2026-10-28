@@ -52,6 +52,11 @@ class ChatSession:
     token_expires_at: int
     created_at: int
     channel: str = "oa_web"
+    principal_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.principal_id:
+            self.principal_id = self.oa
 
 
 def _b64decode(text: str) -> bytes:

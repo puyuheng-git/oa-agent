@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { can } from '../auth'
 import { errorMessage, http } from '@/shared/http'
@@ -23,6 +23,11 @@ const mForm = reactive({
   temperature: undefined as number | undefined, max_tokens: undefined as number | undefined,
   purpose_tags: '', enabled: true,
 })
+const remoteModels = ref<string[]>([])
+const remoteLoading = ref(false)
+const remoteHint = ref('')
+let displayNameTouched = false
+let fetchSeq = 0
 
 async function load() {
   try {
@@ -64,12 +69,67 @@ async function removeProvider(p: any) {
   }
 }
 
+async function fetchRemoteModels() {
+  const providerId = mForm.provider_id
+  if (!providerId || !mDialog.value) {
+    remoteModels.value = []
+    remoteHint.value = ''
+    return
+  }
+  const seq = ++fetchSeq
+  remoteLoading.value = true
+  remoteHint.value = ''
+  try {
+    const body = await http.get<any>(`/v1/admin/llm/providers/${providerId}/remote-models`)
+    if (seq !== fetchSeq) return
+    if (!body.ok) {
+      remoteModels.value = []
+      remoteHint.value = `无法获取模型列表：${body.error || '未知错误'}`
+      ElMessage.warning(remoteHint.value)
+      return
+    }
+    remoteModels.value = body.models ?? []
+    if (!remoteModels.value.length) {
+      remoteHint.value = '该提供方未返回模型列表，可手动输入模型名'
+      ElMessage.info(remoteHint.value)
+    } else if (body.truncated) {
+      remoteHint.value = '仅显示前 200 个，可用搜索或手动输入'
+      ElMessage.info(remoteHint.value)
+    } else {
+      remoteHint.value = `已加载 ${body.model_count} 个远端模型`
+    }
+  } catch (e) {
+    if (seq !== fetchSeq) return
+    remoteModels.value = []
+    remoteHint.value = `无法获取模型列表：${errorMessage(e)}`
+    ElMessage.warning(remoteHint.value)
+  } finally {
+    if (seq === fetchSeq) remoteLoading.value = false
+  }
+}
+
 function openModel(m?: any) {
   mEditing.value = m ?? null
+  displayNameTouched = Boolean(m?.display_name)
   Object.assign(mForm, m
     ? { ...m, purpose_tags: (m.purpose_tags ?? []).join(', '), temperature: m.temperature ?? undefined, max_tokens: m.max_tokens ?? undefined }
     : { provider_id: providers.value[0]?.id, model_name: '', display_name: '', temperature: undefined, max_tokens: undefined, purpose_tags: '', enabled: true })
+  remoteModels.value = []
+  remoteHint.value = ''
   mDialog.value = true
+  void fetchRemoteModels()
+}
+
+function onModelNameChange(name: string | null) {
+  if (!name) return
+  if (!displayNameTouched || !mForm.display_name) {
+    mForm.display_name = name
+    displayNameTouched = false
+  }
+}
+
+function onDisplayNameInput() {
+  displayNameTouched = Boolean(mForm.display_name)
 }
 
 async function saveModel() {
@@ -108,6 +168,10 @@ async function test(kind: 'providers' | 'models', id: number) {
     ElMessage.error(errorMessage(e))
   }
 }
+
+watch(() => mForm.provider_id, () => {
+  if (mDialog.value) void fetchRemoteModels()
+})
 
 onMounted(load)
 </script>
@@ -188,12 +252,35 @@ onMounted(load)
   <el-dialog v-model="mDialog" :title="mEditing ? '编辑模型' : '新增模型'" width="560px">
     <el-form label-width="110px">
       <el-form-item label="提供方">
-        <el-select v-model="mForm.provider_id">
+        <el-select v-model="mForm.provider_id" style="width: 100%">
           <el-option v-for="p in providers" :key="p.id" :label="p.name" :value="p.id" />
         </el-select>
       </el-form-item>
-      <el-form-item label="模型名"><el-input v-model="mForm.model_name" /></el-form-item>
-      <el-form-item label="显示名"><el-input v-model="mForm.display_name" /></el-form-item>
+      <el-form-item label="模型名">
+        <div class="model-name-row">
+          <el-select
+            v-model="mForm.model_name"
+            filterable
+            allow-create
+            default-first-option
+            clearable
+            :loading="remoteLoading"
+            placeholder="从列表选择或手动输入"
+            style="flex: 1"
+            @change="onModelNameChange"
+          >
+            <el-option v-for="id in remoteModels" :key="id" :label="id" :value="id" />
+            <el-option
+              v-if="mForm.model_name && !remoteModels.includes(mForm.model_name)"
+              :label="mForm.model_name"
+              :value="mForm.model_name"
+            />
+          </el-select>
+          <el-button :loading="remoteLoading" :disabled="!mForm.provider_id" @click="fetchRemoteModels">刷新</el-button>
+        </div>
+        <el-text v-if="remoteHint" type="info" size="small">{{ remoteHint }}</el-text>
+      </el-form-item>
+      <el-form-item label="显示名"><el-input v-model="mForm.display_name" @input="onDisplayNameInput" /></el-form-item>
       <el-form-item label="温度"><el-input-number v-model="mForm.temperature" :min="0" :max="2" :step="0.1" /></el-form-item>
       <el-form-item label="最大 Token"><el-input-number v-model="mForm.max_tokens" :min="1" /></el-form-item>
       <el-form-item label="用途标签"><el-input v-model="mForm.purpose_tags" placeholder="如 intent, answer（逗号分隔）" /></el-form-item>
@@ -205,3 +292,12 @@ onMounted(load)
     </template>
   </el-dialog>
 </template>
+
+<style scoped>
+.model-name-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  align-items: center;
+}
+</style>

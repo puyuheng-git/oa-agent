@@ -156,6 +156,15 @@ def test_provider(provider_id: int, ctx: AdminCtx = Depends(admin_write("sys.set
     return check_provider(p.base_url, key, p.timeout_seconds)
 
 
+@router.get("/providers/{provider_id}/remote-models")
+def list_remote_models(provider_id: int, ctx: AdminCtx = Depends(admin_read("sys.setting.view"))):
+    p = _get_provider(ctx, provider_id)
+    key = ctx.runtime.vault.reveal(ctx.db, p.secret_ref)
+    if not key:
+        return {"ok": False, "error": "未配置 API Key，无法获取模型列表"}
+    return check_provider(p.base_url, key, p.timeout_seconds, limit=200)
+
+
 # ---- models ----
 
 @router.get("/models")

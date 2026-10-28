@@ -5,11 +5,19 @@ import type { Mood } from './telemetry'
 import type { CoreMode, NeuralCore } from './NeuralCore'
 
 const props = withDefaults(
-  defineProps<{ mood: Mood; mode: CoreMode; nodes?: NodeLayout[]; paused?: boolean; activity?: number }>(),
+  defineProps<{
+    mood: Mood
+    mode: CoreMode
+    nodes?: NodeLayout[]
+    paused?: boolean
+    activity?: number
+    lerpRate?: number
+  }>(),
   {
     nodes: () => [],
     paused: false,
     activity: 0,
+    lerpRate: 2.5,
   },
 )
 
@@ -54,8 +62,11 @@ function place(dt: number) {
   const el = root.value
   if (!el) return
   if (props.paused) timeScale = 0
+  // 悬停时尽快刹停轨道，避免与指针视差叠成抖动
   const target = hovering > 0 || reduced || props.paused ? 0 : 1
-  timeScale += (target - timeScale) * Math.min(1, dt * 4)
+  const brake = hovering > 0 ? 10 : 4
+  timeScale += (target - timeScale) * Math.min(1, dt * brake)
+  if (timeScale < 0.002) timeScale = 0
   orbitT += dt * timeScale
   const w = el.clientWidth
   const h = el.clientHeight
@@ -70,6 +81,7 @@ function place(dt: number) {
     node.style.transform = `translate3d(${s.x.toFixed(1)}px, ${s.y.toFixed(1)}px, 0) translate(-50%, -50%) scale(${depth.toFixed(3)})`
     node.style.zIndex = String(Math.round(depth * 100))
     node.style.setProperty('--depth', ((depth - 0.6) / 0.65).toFixed(3))
+    node.style.opacity = ''
   }
 }
 
@@ -80,8 +92,20 @@ function fallbackLoop(now: number) {
   if (!document.hidden) place(dt)
 }
 
+let pointerRaf = 0
+let pendingPtr: PointerEvent | null = null
 function onPointer(e: PointerEvent) {
-  core?.setPointer((e.clientX / window.innerWidth) * 2 - 1, -((e.clientY / window.innerHeight) * 2 - 1))
+  // 悬停卫星时冻结视差，否则相机跟着鼠标动、节点投影跟着抖
+  if (props.paused || hovering > 0) return
+  pendingPtr = e
+  if (pointerRaf) return
+  pointerRaf = requestAnimationFrame(() => {
+    pointerRaf = 0
+    const p = pendingPtr
+    pendingPtr = null
+    if (!p || props.paused || hovering > 0) return
+    core?.setPointer((p.clientX / window.innerWidth) * 2 - 1, -((p.clientY / window.innerHeight) * 2 - 1))
+  })
 }
 
 const resizer = new ResizeObserver(() => {
@@ -96,10 +120,11 @@ onMounted(async () => {
     if (!disposed && mod.webglSupported()) {
       try {
         webgl.value = true
-        core = new mod.NeuralCore(canvas.value!, place)
+        core = new mod.NeuralCore(canvas.value!, place, props.mode)
         core.setMood(props.mood)
-        core.setMode(props.mode)
         core.setActivity(props.activity)
+        core.setPaused(props.paused)
+        core.setLerpRate(props.lerpRate)
         return
       } catch {
         webgl.value = false
@@ -113,10 +138,13 @@ onMounted(async () => {
 watch(() => props.mood, (m) => core?.setMood(m))
 watch(() => props.mode, (m) => core?.setMode(m))
 watch(() => props.activity, (a) => core?.setActivity(a))
+watch(() => props.paused, (p) => core?.setPaused(p))
+watch(() => props.lerpRate, (r) => core?.setLerpRate(r))
 
 onBeforeUnmount(() => {
   disposed = true
   cancelAnimationFrame(raf)
+  cancelAnimationFrame(pointerRaf)
   resizer.disconnect()
   window.removeEventListener('pointermove', onPointer)
   core?.dispose()
@@ -129,7 +157,7 @@ defineExpose({
 </script>
 
 <template>
-  <div ref="root" class="stage" :class="[`mood-${mood}`, `mode-${mode}`, { webgl }]">
+  <div ref="root" class="stage" :class="[`mood-${mood}`, `mode-${mode}`, { webgl, paused }]">
     <canvas v-show="webgl" ref="canvas" class="gl" />
     <div v-if="!webgl" class="fallback" :style="{ '--think': String(1.8 - activity * 1.1) + 's' }">
       <svg class="brain-svg" viewBox="0 0 240 180" aria-hidden="true">
@@ -185,6 +213,17 @@ defineExpose({
   height: 100%;
   display: block;
   mix-blend-mode: screen;
+  contain: strict;
+}
+/* 面板打开时冻结画面并弱化混合，避免滚动时每帧重算 screen blend */
+.stage.paused .gl {
+  mix-blend-mode: normal;
+  opacity: 0.35;
+  pointer-events: none;
+}
+.stage.paused .floor,
+.stage.paused .fallback {
+  animation: none;
 }
 
 .fallback {
@@ -257,14 +296,10 @@ defineExpose({
   opacity: 0.6;
 }
 .mode-dormant .fallback {
-  opacity: 0.5;
-  transform: scale(0.8);
+  opacity: 0.55;
 }
 .mode-focus .fallback {
   opacity: 0.35;
-}
-.mode-awaken .fallback {
-  transform: scale(1.5);
 }
 
 .floor {

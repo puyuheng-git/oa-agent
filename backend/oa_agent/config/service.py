@@ -60,7 +60,12 @@ def _coerce(f: FieldDef, value):
         text = str(value) if f.kind == "text" else str(value).strip()
         if len(text) > f.max:
             raise AppError(422, "VALIDATION_ERROR", f"{f.label} 不能超过 {f.max} 字")
-        return text if text.strip() else f.default
+        if not text.strip():
+            return f.default
+        return text if f.kind == "text" else text.strip()
+    if f.kind == "str":
+        text = str(value).strip()
+        return text if text else f.default
     if f.kind == "url":
         return _url(f.label, value)
     if f.kind == "upstreams":
@@ -160,6 +165,16 @@ def validate_oa_upstream_refs(values: dict) -> None:
     default = (values.get("default_upstream_key") or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
     if default not in keys:
         raise AppError(422, "VALIDATION_ERROR", f"新建 Tool 默认上游「{default}」不在业务上游列表中")
+
+
+def validate_runtime_routing(values: dict) -> None:
+    """确定性优先的回退模式禁止指向自身，避免递归。"""
+    mode = values.get("tool_routing_mode")
+    fallback = values.get("deterministic_fallback_mode")
+    if mode == "deterministic_first" and fallback == "deterministic_first":
+        raise AppError(422, "VALIDATION_ERROR", "确定性未命中回退模式不能再设为 deterministic_first")
+    if fallback == "deterministic_first":
+        raise AppError(422, "VALIDATION_ERROR", "确定性未命中回退模式不能设为 deterministic_first")
 
 
 def normalize_origin(text: str) -> str | None:
@@ -267,6 +282,8 @@ class SettingsService:
             raise AppError(422, "VALIDATION_ERROR", f"未知字段：{', '.join(sorted(unknown))}")
         if group == "oa":
             validate_oa_upstream_refs(self.merged_candidate(db, group, values))
+        if group == "runtime":
+            validate_runtime_routing(self.merged_candidate(db, group, values))
         rows = self._rows(db, group)
         changed: list[str] = []
         for f in g.fields:

@@ -1,51 +1,57 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Lock, User } from '@element-plus/icons-vue'
 import { login } from '../auth'
 import { errorMessage } from '@/shared/http'
-import CoreStage from '../console/CoreStage.vue'
-import type { CoreMode } from '../console/NeuralCore'
-import { coreMood, fetchReady, type Mood } from '../console/telemetry'
+import { brainStage, resetBrainForLogin } from '../console/brainStage'
+import { coreMood, fetchReady } from '../console/telemetry'
 
 const form = reactive({ username: '', password: '' })
 const busy = ref(false)
-const mode = ref<CoreMode>('dormant')
-const mood = ref<Mood>('unknown')
+const leaving = ref(false)
 const route = useRoute()
 const router = useRouter()
 
 onMounted(async () => {
+  resetBrainForLogin()
   try {
-    mood.value = coreMood({ ready: await fetchReady(), readyFailed: false, stats: null, pending: null }).mood
+    brainStage.mood = coreMood({ ready: await fetchReady(), readyFailed: false, stats: null, pending: null }).mood
   } catch {
-    mood.value = 'bad'
+    brainStage.mood = 'bad'
   }
+})
+
+onBeforeUnmount(() => {
+  // 登录成功切主页时保持 active，不在这里打回 dormant
 })
 
 async function submit() {
   busy.value = true
   try {
     await login(form.username, form.password)
-    mode.value = 'awaken'
-    setTimeout(() => router.replace((route.query.redirect as string) || '/'), 900)
+    leaving.value = true
+    // 共用大脑实例：只提亮，尺寸不变
+    brainStage.mode = 'active'
+    setTimeout(() => router.replace((route.query.redirect as string) || '/'), 380)
   } catch (e) {
     ElMessage.error(errorMessage(e))
     busy.value = false
+    leaving.value = false
+    brainStage.mode = 'dormant'
   }
 }
 </script>
 
 <template>
   <div class="login">
-    <CoreStage :mood="mood" :mode="mode" />
-    <div class="login-card tech-corners" :class="{ leaving: mode === 'awaken' }">
+    <div class="login-card tech-corners" :class="{ leaving }">
       <div class="scan" />
       <div class="head">
         <div class="eyebrow">OA·AGENT // NEURAL CONSOLE</div>
         <h1>管理控制台</h1>
-        <p>身份验证后唤醒神经核心</p>
+        <p>身份验证后进入神经核心</p>
       </div>
       <el-form label-position="top" @submit.prevent="submit">
         <el-form-item label="用户名">
@@ -62,7 +68,7 @@ async function submit() {
           />
         </el-form-item>
         <el-button type="primary" native-type="submit" size="large" :loading="busy" class="go">
-          {{ busy ? '正在唤醒…' : '登录' }}
+          {{ busy ? '正在登录…' : '登录' }}
         </el-button>
       </el-form>
     </div>
@@ -73,8 +79,11 @@ async function submit() {
 .login {
   position: fixed;
   inset: 0;
+  z-index: 10;
+  pointer-events: none;
 }
 .login-card {
+  pointer-events: auto;
   position: absolute;
   left: 50%;
   top: 50%;
@@ -84,16 +93,15 @@ async function submit() {
   border-radius: 12px;
   border: 1px solid var(--tech-border-strong);
   background: linear-gradient(160deg, rgba(14, 26, 48, 0.72), rgba(6, 10, 20, 0.78));
-  backdrop-filter: blur(18px) saturate(1.3);
   box-shadow: 0 0 60px rgba(34, 211, 238, 0.15), inset 0 0 40px rgba(34, 211, 238, 0.05);
   overflow: hidden;
   animation: card-in 0.9s cubic-bezier(0.16, 1, 0.3, 1);
-  transition: opacity 0.6s, transform 0.8s cubic-bezier(0.7, 0, 0.84, 0), filter 0.6s;
+  transition: opacity 0.35s, transform 0.4s ease, filter 0.35s;
 }
 .login-card.leaving {
   opacity: 0;
-  transform: translate(-50%, -50%) scale(0.85);
-  filter: blur(8px) brightness(2);
+  transform: translate(-50%, -50%) scale(0.96);
+  filter: blur(4px);
 }
 .scan {
   position: absolute;
@@ -142,7 +150,7 @@ h1 {
     transform: translate(0, -50%);
   }
   .login-card.leaving {
-    transform: translate(0, -50%) scale(0.85);
+    transform: translate(0, -50%) scale(0.96);
   }
 }
 @keyframes card-in {

@@ -533,7 +533,10 @@ def test_write_context_injects_mcp_client(installed, monkeypatch):
         pytest.skip("write context 尚未提交")
     from oa_agent.executor.mcp_runtime import get_mcp_client
 
+    from oa_agent.connectors.hub import ConnectorHub
+
     monkeypatch.setattr(svc, "tool_clients", lambda rt: {})
+    monkeypatch.setattr(svc, "tool_connectors", lambda rt: ConnectorHub({}))
     rt = installed.app.state.runtime
     sentinel = object()
     rt.mcp_client = sentinel

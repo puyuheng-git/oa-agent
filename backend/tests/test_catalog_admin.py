@@ -45,6 +45,21 @@ LEAVE_SKILL = {
 }
 
 
+def _ensure_office_upstream(admin):
+    """后台新建 office Tool 要求「OA 对接」已登记上游；chat fixture 会配，纯 admin 用例需自备。"""
+    from tests.test_chat import GATEWAY, HMAC_SECRET, OFFICE
+
+    r = admin.put("/v1/admin/settings/oa", json={"values": {
+        "mint_base_url": OFFICE,
+        "upstreams": [{"key": "office", "label": "office-api", "base_url": OFFICE}],
+        "default_upstream_key": "office",
+        "gateway_secret": GATEWAY,
+        "assertion_hmac_secret": HMAC_SECRET,
+        "allowed_frame_origins": ["https://oa.example.com"],
+    }})
+    assert r.status_code == 200, r.text
+
+
 def fake_model(monkeypatch, reply: dict, prompts: list):
     def invoke(messages):
         prompts.append(messages[0][1])
@@ -94,6 +109,7 @@ def test_admin_created_tool_is_used_without_code_change(admin, chat, office, mon
 
 
 def test_tool_form_validation(admin):
+    _ensure_office_upstream(admin)
     leaked = {**LEAVE_TOOL, "model_params": {**LEAVE_TOOL["model_params"], "oa": {"type": "string"}}}
     r = admin.post("/v1/admin/tools", json=leaked)
     assert r.status_code == 422 and "身份字段" in r.json()["error"]["message"]
@@ -120,7 +136,9 @@ def test_tool_form_validation(admin):
 
 
 def test_tool_edit_follows_version_rules(admin):
-    admin.post("/v1/admin/tools", json=LEAVE_TOOL)
+    _ensure_office_upstream(admin)
+    created = admin.post("/v1/admin/tools", json=LEAVE_TOOL)
+    assert created.status_code == 200, created.text
     relabel = {**LEAVE_TOOL, "result": {**LEAVE_TOOL["result"], "labels": {"days": "请假天数"}}, "reason": "改名称"}
     r = admin.put("/v1/admin/tools/query_my_leave_list", json=relabel)
     assert r.status_code == 200 and r.json()["result"] == "compatible" and r.json()["tool"]["current_version_no"] == 2

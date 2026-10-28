@@ -16,10 +16,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 
 from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
-from oa_agent.db.models import Skill, SkillVersion, Tool, ToolVersion
+from oa_agent.db.models import McpServer, Skill, SkillVersion, Tool, ToolVersion
 from oa_agent.errors import AppError
 from oa_agent.integrations.office_api import DEFAULT_UPSTREAM
 from oa_agent.executor import apipost
+from oa_agent.executor.builtin_catalog import TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_guide
 from oa_agent.executor.catalog import compare, normalize_skill, normalize_tool_form, registration_blockers
 from oa_agent.executor.contract_test import contract_check, is_activatable
 from oa_agent.executor.visibility import VisibilityService
@@ -114,6 +115,108 @@ def _version_no(ctx: AdminCtx, version_id: int | None) -> int | None:
     return ctx.db.scalar(sa.select(ToolVersion.version_no).where(ToolVersion.id == version_id))
 
 
+def _mcp_server_label(ctx: AdminCtx, server_id: int | None) -> dict | None:
+    if not server_id:
+        return None
+    row = ctx.db.get(McpServer, server_id)
+    if row is None or row.tenant_id != ctx.runtime.tenant_id:
+        return {"id": server_id, "name": None, "display_name": None, "transport": None, "missing": True}
+    return {
+        "id": row.id, "name": row.name, "display_name": row.display_name or row.name,
+        "transport": row.transport, "enabled": row.enabled, "missing": False,
+    }
+
+
+def _office_guide(tool: Tool, schema: dict | None) -> dict:
+    schema = schema or {}
+    method = (schema.get("method") or "").upper() or None
+    path = schema.get("path") or None
+    upstream = schema.get("upstream") or DEFAULT_UPSTREAM
+    return {
+        "kind": "office",
+        "summary": tool.summary or schema.get("summary") or "",
+        "how": (
+            "调用时由 ToolExecutor 用员工会话里的 OA token，向所选上游 office-api 发 HTTP；"
+            "路径只存相对 path，完整 URL 由上游 base_url 拼出。业务授权与校验在 office-api / Service，"
+            "本系统不访问 OA 业务库，模型输出不参与权限判定。"
+        ),
+        "constraints": [
+            "身份字段由服务端注入，模型不可伪造 oa / token",
+            "只允许契约内 method + path + 参数白名单",
+            "结果按 result.fields 白名单回图",
+        ],
+        "http": {"method": method, "path": path, "upstream": upstream,
+                 "timeout_seconds": schema.get("timeout_seconds")},
+        "model_params": dict(schema.get("model_params") or {}),
+        "identity_params": dict(schema.get("identity_params") or {}),
+        "result": dict(schema.get("result") or {}),
+        "runtime": "OfficeApiClient（员工 token）",
+        "edit_hint": "可在本页编辑 method/path/参数与结果字段，并走版本激活。",
+    }
+
+
+def _mcp_guide(ctx: AdminCtx, tool: Tool, schema: dict | None) -> dict:
+    schema = schema or {}
+    mcp = dict(schema.get("mcp") or {})
+    server = _mcp_server_label(ctx, tool.mcp_server_id)
+    transport = (server or {}).get("transport")
+    how = (
+        "定义来自 MCP 服务器 tools/list 同步。调用时由 McpRuntime 按连接配置（stdio / SSE / HTTP）"
+        "向远端 tools/call，把模型参数原样转发；结果围栏为文本块回图。"
+        "连接密钥只写不读，不出现在错误信息与审计明文中。"
+    )
+    constraints = [
+        "不能在本页改远端工具参数定义；请到「MCP 连接」改配置并重新同步",
+        "默认停用，须管理员启用后才可注册到运行时",
+        "员工身份不会自动注入到 MCP 参数（与 OA Tool 不同）",
+    ]
+    if transport == "stdio":
+        constraints.append("stdio 在本机起子进程，环境变量密钥经 Vault 注入")
+    elif transport in ("sse", "http"):
+        constraints.append("出站 URL/Headers 由 MCP 连接配置；Headers 密钥经 Vault")
+    return {
+        "kind": "mcp",
+        "summary": tool.summary or schema.get("summary") or schema.get("description") or "",
+        "how": how,
+        "constraints": constraints,
+        "mcp_server": server,
+        "mcp_tool_name": tool.mcp_tool_name or mcp.get("tool"),
+        "description": (schema.get("description") or "")[:2000] or None,
+        "model_params": dict(schema.get("model_params") or {}),
+        "input_schema": mcp.get("input_schema"),
+        "result": {
+            "kind": TEXT_RESULT_KIND,
+            "fields": list(TEXT_RESULT_FIELDS),
+            "note": "MCP 原始返回会围栏为 text，不走 OA 字段白名单。",
+        },
+        "runtime": "McpRuntime（出站 MCP）",
+        "edit_hint": "实现在远端 MCP 服务；本系统只同步清单与启停。",
+    }
+
+
+def _tool_guide(ctx: AdminCtx, tool: Tool, schema: dict | None) -> dict | None:
+    kind = tool.kind or "office"
+    if kind == "builtin":
+        guide = builtin_guide(tool.builtin_id)
+        if guide is None:
+            return {
+                "kind": "builtin",
+                "builtin_id": tool.builtin_id,
+                "summary": tool.summary or "",
+                "how": "内置工具，实现位于 Agent 进程 BuiltinRuntime；目录中未找到对应 builtin_id。",
+                "constraints": ["后台不能改实现代码"],
+                "sandbox_policy": dict(tool.sandbox_policy_json or {}) or None,
+                "runtime": "BuiltinRuntime（进程内）",
+                "edit_hint": "请用启停与 Skill 绑定控制是否开放。",
+            }
+        guide = dict(guide)
+        guide["sandbox_policy"] = dict(tool.sandbox_policy_json or {}) or guide.get("default_sandbox_policy")
+        return guide
+    if kind == "mcp":
+        return _mcp_guide(ctx, tool, schema)
+    return _office_guide(tool, schema)
+
+
 def _tool_view(ctx: AdminCtx, tool: Tool) -> dict:
     current = ctx.db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
     schema = current.schema_json if current else {}
@@ -126,6 +229,10 @@ def _tool_view(ctx: AdminCtx, tool: Tool) -> dict:
         "source_file": tool.source_file, "enabled": tool.enabled,
         "spec_enabled": tool.spec_enabled, "risk_level": tool.risk_level,
         "requires_confirmation": tool.requires_confirmation,
+        "builtin_id": tool.builtin_id,
+        "mcp_server_id": tool.mcp_server_id,
+        "mcp_tool_name": tool.mcp_tool_name,
+        "sandbox_policy": dict(tool.sandbox_policy_json or {}) or None,
         "registered": ctx.runtime.engine.registry.get(tool.name) is not None,
         "unregistered_reasons": blockers,
         "current_version_no": _version_no(ctx, tool.current_version_id),
@@ -175,7 +282,9 @@ def tool_detail(name: str, ctx: AdminCtx = Depends(admin_read(TOOL))):
                         "is_current": v.id == tool.current_version_id, "is_pending": v.id == tool.pending_version_id}
                        for v in versions]
     current = next((v for v in versions if v.id == tool.current_version_id), None)
-    out["current_schema"] = current.schema_json if current else None
+    schema = current.schema_json if current else None
+    out["current_schema"] = schema
+    out["guide"] = _tool_guide(ctx, tool, schema)
     return out
 
 

@@ -3,8 +3,6 @@
 身份只来自服务端会话：运行上下文（KV）只存会话引用，恢复/重试时重新加载并校验会话仍有效且属于同一员工"
 """
 
-# O5: domain routing hook（L1 骨架在 runtime.multi_agent，O2+O4 门禁后再挂接）
-
 from __future__ import annotations
 
 import json
@@ -23,6 +21,7 @@ from oa_agent.db.models import Run
 from oa_agent.db.types import utcnow
 from oa_agent.errors import AppError
 from oa_agent.ids import new_run_id
+from oa_agent.connectors.hub import ConnectorHub
 from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError, mint_base_url, upstream_clients
 from oa_agent.db.models import Skill
 from oa_agent.executor.catalog import SkillState
@@ -41,6 +40,8 @@ from oa_agent.runtime.intervention import DEFAULT_EXPIRE_MINUTES, USER_CONFIRM, 
 from oa_agent.executor.write_tools import WriteToolExecutor
 from oa_agent.db.models import InterventionTask
 from oa_agent.runtime.llm import build_chat_model, resolve_model
+from oa_agent.runtime import multi_agent, workflow_catalog
+from oa_agent.runtime.multi_agent import DomainSpec
 from oa_agent.runtime.releases import Release, ReleaseError
 from oa_agent.runtime.run_service import (
     CANCEL_REQUESTED, CANCELLED, FAILED, RUNNING, SUCCEEDED, TERMINAL, WAITING_CONFIRMATION, WAITING_HUMAN,
@@ -109,20 +110,48 @@ def tool_clients(rt: AppRuntime) -> dict[str, OfficeApiClient]:
         raise AppError(503, exc.code, exc.message) from exc
 
 
+def tool_connectors(rt: AppRuntime) -> ConnectorHub:
+    try:
+        return ConnectorHub.from_office_settings(load_settings(rt, "oa"))
+    except OfficeApiError as exc:
+        raise AppError(503, exc.code, exc.message) from exc
+
+
 def write_workflows_enabled(rt: AppRuntime) -> bool:
     return bool(setting(rt, "runtime", "write_workflows_enabled"))
 
 
-def _model(rt: AppRuntime, config: dict):
-    if config.get("intent_mode") == "rules":
+def _parse_model_id(raw) -> int | None:
+    if raw is None or raw == "":
         return None
     try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _model(rt: AppRuntime, config: dict, model_id: int | None = None):
+    if config.get("intent_mode") == "rules":
+        return None
+    pinned = model_id if model_id is not None else _parse_model_id(config.get("llm_model_id"))
+    try:
         with rt.session() as db:
-            cfg = resolve_model(db, rt.vault, rt.tenant_id, config.get("llm_model_id"))
+            cfg = resolve_model(db, rt.vault, rt.tenant_id, pinned)
     except SQLAlchemyError:
         log.exception("读取 LLM 配置失败，走规则解析")
         return None
     return (build_chat_model(cfg), cfg) if cfg else None
+
+
+def _router_model(rt: AppRuntime, config: dict, runtime_routing: dict):
+    """发布快照 router_model_id > runtime 默认；未配置或解析失败则 None（路由阶段回退主模型）。"""
+    raw = config.get("router_model_id")
+    if raw is None or raw == "":
+        raw = runtime_routing.get("router_model_id")
+    mid = _parse_model_id(raw)
+    if mid is None:
+        return None
+    return _model(rt, config, model_id=mid)
 
 
 # ---- 发布配置 / Skill（P4、P5 "engine 提供；未提供时用代码默认值） ----
@@ -199,6 +228,29 @@ def skill_menu(rt: AppRuntime, *, oa: str | None = None, office_token: str = "")
         "created_at": _iso_utc(getattr(s, "created_at", None)),
         "newest_tool_created_at": _iso_utc(getattr(s, "newest_tool_created_at", None)),
     } for s in skills]
+
+
+def workflow_menu(rt: AppRuntime) -> list[dict]:
+    """员工可见的固定 Workflow 目录（写类受 write_workflows_enabled 门禁）。"""
+    return workflow_catalog.list_entries(write_enabled=write_workflows_enabled(rt))
+
+
+def start_workflow(rt: AppRuntime, session: ChatSession, workflow_id: str, params: dict,
+                   correlation_id: str, *, session_key: str = "") -> dict:
+    """员工显式触发固定 Workflow（D12 按钮入口）。对话类请走普通消息。"""
+    entry = workflow_catalog.get(workflow_id)
+    if entry is None:
+        raise AppError(404, "WORKFLOW_NOT_FOUND", "Workflow 不存在")
+    if entry.kind != "write":
+        raise AppError(422, "WORKFLOW_NOT_STARTABLE", "该流程请通过对话发起，无需单独启动")
+    if entry.workflow_id == travel_reimburse_submit.WORKFLOW_ID:
+        expense_id = params.get("expense_id")
+        try:
+            expense_id = int(expense_id)
+        except (TypeError, ValueError):
+            expense_id = 0
+        return start_travel_reimburse_submit(rt, session, expense_id, correlation_id, session_key=session_key)
+    raise AppError(501, "WORKFLOW_NOT_IMPLEMENTED", "该写流程尚未接入启动入口")
 
 
 def chat_available(rt: AppRuntime) -> bool:
@@ -329,12 +381,19 @@ def start_run(rt: AppRuntime, session: ChatSession, message: str, correlation_id
               on_delta: Callable[[str], None] | None = None) -> dict:
     engine = rt.engine
     release = current_release(rt)
+    domains = multi_agent.domains_from_config(release.config)
+    domain = multi_agent.pick_domain(message, domains)
     rec = RunRecorder(run_id=run_id or new_run_id(), thread_id=session.thread_id, oa=session.oa,
                       correlation_id=correlation_id, sink=engine.sink)
     tracked = engine.runs.start(rec, channel=session.channel, agent_id=travel_query.AGENT_ID,
                                 workflow_id=travel_query.WORKFLOW_ID, workflow_version=travel_query.WORKFLOW_VERSION,
                                 business_type=travel_query.BUSINESS_TYPE, config_release_id=release.release_id,
                                 parent_run_id=parent_run_id, message=message)
+    rec.event("route_decision", status=RUNNING, metadata={
+        "domain": domain.name,
+        "rule": "keyword" if domain.name != multi_agent.GENERAL_DOMAIN else "default_general",
+        "clarify": False,
+    })
     conversation.record_user(rt.session, rec, session.channel, message)
     try:
         with rt.session() as db, db.begin():
@@ -358,7 +417,8 @@ def start_run(rt: AppRuntime, session: ChatSession, message: str, correlation_id
         except Exception:  # noqa: BLE001 —"只影响之后能否恢"重试，不影响本次对话
             log.exception("保存运行上下文失败：%s", rec.run_id)
     return _drive(rt, rec, session, release.config, tracked,
-                  lambda ctx: engine.invoke(ctx, message, session.thread_id), check=True, on_delta=on_delta)
+                  lambda ctx: engine.invoke(ctx, message, session.thread_id), check=True, on_delta=on_delta,
+                  domain=domain)
 
 
 def _load_long_term_memory(rt: AppRuntime, oa: str) -> str:
@@ -373,14 +433,21 @@ def _load_long_term_memory(rt: AppRuntime, oa: str) -> str:
         return ""
 
 
+def _session_principal_id(session: ChatSession) -> str:
+    """会话主体 id；缺省与 oa 相同（兼容测试桩等无 principal_id 的对象）。"""
+    return getattr(session, "principal_id", None) or session.oa
+
+
 def _build_write_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession) -> travel_reimburse_submit.WriteRunContext:
     return travel_reimburse_submit.WriteRunContext(
         recorder=rec,
-        identity=Identity(oa=session.oa, authorization=session.office_token),
+        identity=Identity(oa=session.oa, authorization=session.office_token,
+                          principal_id=_session_principal_id(session)),
         read_executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
                                    int(setting(rt, "oa", "tool_remark_max_chars")),
                                    mcp_client=get_mcp_client(rt),
-                                   builtin_runtime=build_builtin_runtime(rt)),
+                                   builtin_runtime=build_builtin_runtime(rt),
+                                   hub=tool_connectors(rt)),
         write_executor=WriteToolExecutor(tool_clients(rt)),
         runs=rt.engine.runs,
         tenant_id=rt.tenant_id,
@@ -388,34 +455,93 @@ def _build_write_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession)
     )
 
 
+def _runtime_routing_defaults(rt: AppRuntime) -> dict:
+    from oa_agent.executor.tool_routing import ROUTING_KEYS
+
+    raw = load_settings(rt, "runtime")
+    return {k: raw[k] for k in ROUTING_KEYS if k in raw and raw[k] is not None}
+
+
+def _recent_tool_names(rt: AppRuntime, thread_id: str | None, limit: int = 8) -> list[str]:
+    """本线程最近成功调用过的 Tool 名（供 retrieve_must_include_recent）。"""
+    if not thread_id:
+        return []
+    from oa_agent.db.models import RunEvent
+
+    try:
+        with rt.session() as db:
+            run_ids = list(db.scalars(
+                sa.select(Run.run_id).where(Run.tenant_id == rt.tenant_id, Run.thread_id == thread_id)
+                .order_by(Run.started_at.desc()).limit(20)
+            ).all())
+            if not run_ids:
+                return []
+            rows = db.execute(
+                sa.select(RunEvent.tool_name).where(
+                    RunEvent.run_id.in_(run_ids),
+                    RunEvent.event_type == "tool_call_end",
+                    RunEvent.status == "ok",
+                    RunEvent.tool_name.is_not(None),
+                ).order_by(RunEvent.id.desc()).limit(limit * 3)
+            ).all()
+        out: list[str] = []
+        for (name,) in rows:
+            if name and name not in out:
+                out.append(name)
+            if len(out) >= limit:
+                break
+        return out
+    except SQLAlchemyError:
+        log.exception("读取线程最近 Tool 失败：thread=%s", thread_id)
+        return []
+
+
 def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
-                   on_delta: Callable[[str], None] | None = None) -> travel_query.RunContext:
+                   on_delta: Callable[[str], None] | None = None,
+                   domain: DomainSpec | None = None) -> travel_query.RunContext:
+    runtime_routing = _runtime_routing_defaults(rt)
+    skills = visible_skills_for(rt, session.oa, office_token=session.office_token)
+    cfg = dict(config)
+    domain_name = None
+    if domain is not None:
+        domain_name = domain.name
+        skills = multi_agent.filter_skills(skills, domain)
+        if domain.system_extra:
+            extra = (cfg.get("chat_instructions") or "").strip()
+            cfg["chat_instructions"] = (extra + "\n" + domain.system_extra).strip() if extra else domain.system_extra
     return travel_query.RunContext(
         on_delta=on_delta,
         recorder=rec,
-        identity=Identity(oa=session.oa, authorization=session.office_token),
+        identity=Identity(oa=session.oa, authorization=session.office_token,
+                          principal_id=_session_principal_id(session)),
         executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
                               int(setting(rt, "oa", "tool_remark_max_chars")),
                               mcp_client=get_mcp_client(rt),
-                              builtin_runtime=build_builtin_runtime(rt)),
+                              builtin_runtime=build_builtin_runtime(rt),
+                              hub=tool_connectors(rt)),
         today=datetime.now(CHINA_TZ).date(),
-        model=_model(rt, config),
-        config=config,
-        skills=visible_skills_for(rt, session.oa, office_token=session.office_token),
+        model=_model(rt, cfg),
+        router_model=_router_model(rt, cfg, runtime_routing),
+        config=cfg,
+        skills=skills,
         long_term_memory=_load_long_term_memory(rt, session.oa),
         tenant_id=rt.tenant_id,
         thread_id=session.thread_id,
         session_factory=rt.session,
+        domain=domain_name,
+        runtime_routing=runtime_routing,
+        recent_tool_names=_recent_tool_names(rt, session.thread_id),
     )
 
 
 def _drive(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict, tracked: bool,
            call: Callable[[travel_query.RunContext], dict], check: bool = False,
-           on_delta: Callable[[str], None] | None = None) -> dict:
+           on_delta: Callable[[str], None] | None = None,
+           domain: DomainSpec | None = None) -> dict:
     engine = rt.engine
     try:
         try:
-            ctx = _build_context(rt, rec, session, config, on_delta)
+            ctx = _build_context(rt, rec, session, config, on_delta, domain=domain)
             if check and (ctx.model is None or not chat_enabled(config)):
                 check_skills(rt)  # 能聊天时没有可用 Skill 也照常对话，只是不能查询
             state = call(ctx)

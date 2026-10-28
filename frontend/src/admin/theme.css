@@ -104,7 +104,6 @@ html.dark .el-card {
   position: relative;
   background: var(--tech-panel);
   border: 1px solid var(--tech-border);
-  backdrop-filter: blur(10px);
   transition: border-color 0.25s, box-shadow 0.25s;
 }
 html.dark .el-card:hover {
@@ -179,10 +178,9 @@ html.dark .el-select__wrapper.is-focused {
 html.dark .el-dialog,
 html.dark .el-drawer,
 html.dark .el-message-box {
-  background: rgba(12, 20, 38, 0.96);
+  background: rgba(12, 20, 38, 0.98);
   border: 1px solid var(--tech-border-strong);
   box-shadow: 0 0 40px rgba(34, 211, 238, 0.12), 0 20px 60px rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(14px);
 }
 html.dark .el-drawer__header {
   color: var(--tech-text);
@@ -234,7 +232,6 @@ html.dark .el-loading-mask {
 
 html.dark .el-alert {
   border: 1px solid currentColor;
-  backdrop-filter: blur(6px);
 }
 html.dark .el-alert--warning.is-light {
   background: rgba(251, 191, 36, 0.08);
@@ -256,7 +253,7 @@ html.dark .el-timeline-item__node {
 html.dark .el-popper.is-light,
 html.dark .el-dropdown__popper.el-popper {
   border: 1px solid var(--tech-border-strong) !important;
-  backdrop-filter: blur(12px);
+  background: rgba(12, 20, 38, 0.98) !important;
 }
 
 /* ---------- 通用工具类 ---------- */

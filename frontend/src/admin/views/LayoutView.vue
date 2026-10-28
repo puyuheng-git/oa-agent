@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, type Component } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Back, SwitchButton, Key } from '@element-plus/icons-vue'
@@ -7,12 +7,17 @@ import { auth, can, logout } from '../auth'
 import { menu, menuGroups } from '../router'
 import { errorMessage, http } from '@/shared/http'
 import { rangeParams, type RunStats } from '../runs'
-import CoreStage from '../console/CoreStage.vue'
-import SatelliteNode from '../console/SatelliteNode.vue'
 import SubMenu from '../console/SubMenu.vue'
 import OverviewWings from '../console/OverviewWings.vue'
 import { layoutNodes } from '../console/orbits'
 import { activityLevel } from '../console/brain'
+import {
+  brainStage,
+  brainStageHandle,
+  resetBrainForLogin,
+  setBrainNodeClick,
+  type BrainNodeView,
+} from '../console/brainStage'
 import { groupOf, groupTelemetry, visibleGroups, type Point, type VisibleGroup } from '../console/menuGroups'
 import {
   buildBroadcast,
@@ -25,7 +30,6 @@ import {
 
 const route = useRoute()
 const router = useRouter()
-const stage = ref<InstanceType<typeof CoreStage>>()
 
 const groups = computed(() => visibleGroups(menuGroups, menu, can))
 const groupById = computed<Record<string, VisibleGroup>>(() => Object.fromEntries(groups.value.map((g) => [g.id, g])))
@@ -93,7 +97,7 @@ function openPath(path: string, at?: Point) {
   router.push(path)
 }
 function onGroupClick(group: VisibleGroup) {
-  const p = stage.value?.nodePosition(group.id)
+  const p = brainStageHandle.value?.nodePosition(group.id)
   const at = p ? { x: p.x, y: p.y } : screenCenter()
   if (group.items.length === 1) return openPath(group.items[0].path, at)
   expanded.value = expanded.value?.group.id === group.id ? null : { group, at }
@@ -112,6 +116,36 @@ function onKey(e: KeyboardEvent) {
   const overlayOpen = [...document.querySelectorAll<HTMLElement>('.el-overlay')].some((el) => el.style.display !== 'none')
   if (!overlayOpen) backToCore()
 }
+
+/** 把主控台状态写入共享大脑层（实例在 App 中常驻） */
+watch(
+  [mood, activity, panelOpen, expanded, nodes, groupById, telemetry],
+  () => {
+    brainStage.mood = mood.value.mood
+    brainStage.mode = panelOpen.value ? 'focus' : 'active'
+    brainStage.activity = activity.value
+    brainStage.paused = !!expanded.value || panelOpen.value
+    brainStage.layouts = nodes.value
+    const views: Record<string, BrainNodeView> = {}
+    for (const n of nodes.value) {
+      const g = groupById.value[n.key]
+      if (!g) continue
+      views[n.key] = {
+        key: n.key,
+        title: g.title,
+        code: g.code,
+        motif: n.key,
+        group: g.orbit,
+        telemetry: groupTelemetry(g, telemetry.value),
+        count: g.items.length,
+        active: expanded.value?.group.id === n.key,
+        dimmed: !!expanded.value && expanded.value.group.id !== n.key,
+      }
+    }
+    brainStage.views = views
+  },
+  { immediate: true, deep: true },
+)
 
 const broadcast = computed(() => buildBroadcast(data))
 const typed = ref('')
@@ -140,6 +174,11 @@ const today = computed(() => now.value.toLocaleDateString('zh-CN', { year: 'nume
 let pollTimer = 0
 let clockTimer = 0
 onMounted(() => {
+  sessionStorage.removeItem('oa-admin-core-enter')
+  setBrainNodeClick((key) => {
+    const g = groupById.value[key]
+    if (g) onGroupClick(g)
+  })
   refresh().finally(playBroadcast)
   pollTimer = window.setInterval(refresh, 30_000)
   clockTimer = window.setInterval(() => (now.value = new Date()), 1000)
@@ -151,11 +190,13 @@ onBeforeUnmount(() => {
   clearInterval(typeTimer)
   clearTimeout(typeTimer)
   window.removeEventListener('keydown', onKey)
+  setBrainNodeClick(null)
 })
 const pwdOpen = ref(false)
 const pwd = reactive({ old_password: '', new_password: '', confirm: '' })
 
 async function doLogout() {
+  resetBrainForLogin()
   await logout()
   router.replace('/login')
 }
@@ -175,23 +216,6 @@ async function changePassword() {
 
 <template>
   <div class="deck">
-    <CoreStage ref="stage" :mood="mood.mood" :mode="panelOpen ? 'focus' : 'active'" :nodes="nodes" :paused="!!expanded" :activity="activity">
-      <template #node="{ node }">
-        <SatelliteNode
-          v-if="groupById[node.key]"
-          :title="groupById[node.key].title"
-          :code="groupById[node.key].code"
-          :motif="node.key"
-          :group="groupById[node.key].orbit"
-          :telemetry="groupTelemetry(groupById[node.key], telemetry)"
-          :count="groupById[node.key].items.length"
-          :active="expanded?.group.id === node.key"
-          :dimmed="!!expanded && expanded.group.id !== node.key"
-          @click="onGroupClick(groupById[node.key])"
-        />
-      </template>
-    </CoreStage>
-
     <transition name="wings">
       <OverviewWings v-if="showWings && !panelOpen" />
     </transition>
@@ -324,6 +348,14 @@ async function changePassword() {
   inset: 0;
   overflow: hidden;
   color: var(--tech-text);
+  /* 空白处穿透到 App 层共用大脑/卫星；HUD/面板等再自行接收点击 */
+  pointer-events: none;
+}
+.hud,
+.holo,
+.ticker,
+:deep(.layer) {
+  pointer-events: auto;
 }
 
 /* ---------- HUD ---------- */
@@ -543,13 +575,14 @@ async function changePassword() {
   border-radius: 10px;
   background:
     linear-gradient(180deg, rgba(34, 211, 238, 0.06), transparent 120px),
-    rgba(6, 12, 24, 0.82);
-  backdrop-filter: blur(16px) saturate(1.2);
+    rgba(6, 12, 24, 0.96);
+  /* 不用 backdrop-filter：背后若有 WebGL/动画，滚动时每帧重模糊会导致明显卡顿 */
   box-shadow:
     0 0 0 1px rgba(34, 211, 238, 0.08),
     0 0 60px rgba(34, 211, 238, 0.12),
     inset 0 0 80px rgba(34, 211, 238, 0.04);
   overflow: hidden;
+  contain: layout paint;
 }
 .holo-head {
   display: flex;
@@ -675,16 +708,19 @@ async function changePassword() {
   left: 0;
   right: 0;
   top: 0;
-  height: 140px;
+  height: 2px;
   pointer-events: none;
-  background: linear-gradient(180deg, transparent, rgba(34, 211, 238, 0.035) 85%, rgba(34, 211, 238, 0.16) 99%, transparent);
-  animation: scan 9s ease-in-out infinite;
+  background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.45), transparent);
+  opacity: 0.5;
   z-index: 2;
 }
 .holo-body {
   flex: 1;
   overflow: auto;
   padding: 18px 20px 24px;
+  /* 独立合成层，滚动时不带动整页 WebGL/HUD 重绘 */
+  will-change: scroll-position;
+  contain: content;
 }
 
 .holo-enter-active {
