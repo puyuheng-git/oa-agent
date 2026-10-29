@@ -1,0 +1,5 @@
+# oa_travel 确定性意图 → Tool 名（供 PackRegistry.aggregated_rule_tools 聚合）
+# key 与 intent_rules.LIST / DETAIL 对齐（list / detail）
+rule_tools:
+  list: query_my_travel_expense_list
+  detail: query_my_travel_expense_detail

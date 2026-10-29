@@ -50,11 +50,11 @@
 - `parse_envelope(profile: str, status_code: int, body: object, *, success_codes: set[str], hint_max: int) -> tuple[object, str]` 成功返回 (data, hint)；失败抛 `ConnectorError`
 - Profiles: `oa_office`（对齐今日 `_unwrap`）、注册表 `get_profile(name)`
 
-- [ ] **Step 1: 写失败测试** — 同一 JSON 用 oa_office：成功码取 data；错误码 `UPSTREAM_BIZ_ERROR`；401→`OFFICE_TOKEN_EXPIRED`（或统一为 `UPSTREAM_AUTH` 但 **M2 保持与 OfficeApiError 同名 code** 以免破坏文案映射）
+- [x] **Step 1: 写失败测试** — 同一 JSON 用 oa_office：成功码取 data；错误码 `UPSTREAM_BIZ_ERROR`；401→`OFFICE_TOKEN_EXPIRED`（或统一为 `UPSTREAM_AUTH` 但 **M2 保持与 OfficeApiError 同名 code** 以免破坏文案映射）
 
-- [ ] **Step 2: 实现 oa_office（可从 OfficeApiClient 抽逻辑，client 改调 profile 或保持委托二选一：优先抽共享函数避免双份）**
+- [x] **Step 2: 实现 oa_office（可从 OfficeApiClient 抽逻辑，client 改调 profile 或保持委托二选一：优先抽共享函数避免双份）**
 
-- [ ] **Step 3:** `uv run pytest tests/test_envelope_m2.py -q`
+- [x] **Step 3:** `uv run pytest tests/test_envelope_m2.py -q`
 
 ---
 
@@ -68,7 +68,7 @@
 - HTTP status &lt; 400：data = 解析后的 JSON（或 raw text 策略：仅 JSON）；hint=""  
 - 4xx/5xx：`UPSTREAM_HTTP_ERROR`（4xx 可带清洗后的 body 片段作 user_message，5xx 不展示堆栈）
 
-- [ ] **Step 1–3: TDD + pytest 绿**
+- [x] **Step 1–3: TDD + pytest 绿**
 
 ---
 
@@ -79,9 +79,9 @@
 - Modify: `backend/oa_agent/integrations/office_api.py`（若抽共享 unwrap，保持对外行为）
 - Test: 扩展 `tests/test_connectors_m1.py` 或 `test_envelope_m2.py` — 默认 profile 下与改前 GET 业务错误一致
 
-- [ ] **Step 1: Connector 构造增加 `envelope_profile: str = "oa_office"`、`success_codes`**
-- [ ] **Step 2: invoke 在拿到 httpx 响应后走 profile（若仍委托 OfficeApiClient.get，则需让 Client 可切换 profile，或 Connector 自己发 HTTP——推荐：**Connector 自管 httpx、profile 解析**，OfficeApiClient 薄封装调同一底层，避免分叉。若改动过大，M2 允许：OfficeApiClient 仍 oa_office；HttpJsonConnector(raw_json) 走独立 httpx 路径。**）**
-- [ ] **Step 3: pytest connectors + envelope 绿**
+- [x] **Step 1: Connector 构造增加 `envelope_profile: str = "oa_office"`、`success_codes`**
+- [x] **Step 2: invoke 在拿到 httpx 响应后走 profile（若仍委托 OfficeApiClient.get，则需让 Client 可切换 profile，或 Connector 自己发 HTTP——推荐：**Connector 自管 httpx、profile 解析**，OfficeApiClient 薄封装调同一底层，避免分叉。若改动过大，M2 允许：OfficeApiClient 仍 oa_office；HttpJsonConnector(raw_json) 走独立 httpx 路径。**）**
+- [x] **Step 3: pytest connectors + envelope 绿**
 
 ---
 
@@ -98,9 +98,9 @@
   - `from` 允许：`principal_id`、`principal.external_keys.<key>`、`credential.authorization`（一般不注入 query）、现网等价：`oa` ← `identity.oa` / `principal_id`
 - 模型 args 含绑定 param → 丢弃并记 dropped
 
-- [ ] **Step 1: 单测旧 inject 与新 bindings 注入结果一致**
-- [ ] **Step 2: 实现**
-- [ ] **Step 3: catalog / chat 相关测不破**
+- [x] **Step 1: 单测旧 inject 与新 bindings 注入结果一致**
+- [x] **Step 2: 实现**
+- [x] **Step 3: catalog / chat 相关测不破**
 
 ---
 
@@ -115,7 +115,7 @@
 - `ChatSession.credentials: dict[str, dict]` 形如 `{ "office": {"authorization": "...", "expires_at": int} }`  
 - 属性兼容：`office_token` property 读写映射到 `credentials["office"]`（减少调用点爆炸）或双写字段一期并存
 
-- [ ] **Step 1–3: TDD；launch/redeem/refresh 冒烟 `tests/test_chat.py tests/test_auth.py`**
+- [x] **Step 1–3: TDD；launch/redeem/refresh 冒烟 `tests/test_chat.py tests/test_auth.py`**
 
 ---
 
@@ -131,17 +131,17 @@
 2. 不经过 office success_codes  
 3. 事件 metadata `connector_id=demo`
 
-- [ ] **Step 1: 写测 → 红**
-- [ ] **Step 2: 补齐装配缺口 → 绿**
-- [ ] **Step 3:** `uv run pytest tests/test_raw_json_mock_tool_m2.py tests/test_envelope_m2.py tests/test_identity_bindings_m2.py tests/test_connectors_m1.py -q`
+- [x] **Step 1: 写测 → 红**
+- [x] **Step 2: 补齐装配缺口 → 绿**
+- [x] **Step 3:** `uv run pytest tests/test_raw_json_mock_tool_m2.py tests/test_envelope_m2.py tests/test_identity_bindings_m2.py tests/test_connectors_m1.py -q`
 
 ---
 
 ### Task 7: 全量回归 + 文档
 
-- [ ] **Step 1:** `cd backend && uv run pytest -q`
-- [ ] **Step 2: 写 `docs/delivery/2026-10-28-multi-system-m2-delivery.md`**
-- [ ] **Step 3: 更新 STATUS；权威设计 §3.1 补 envelope/bindings 一句**
+- [x] **Step 1:** `cd backend && uv run pytest -q`
+- [x] **Step 2: 写 `docs/delivery/2026-10-28-multi-system-m2-delivery.md`**
+- [x] **Step 3: 更新 STATUS；权威设计 §3.1 补 envelope/bindings 一句**
 - [ ] **Step 4: 用户要求时再 commit / push**
 
 ---

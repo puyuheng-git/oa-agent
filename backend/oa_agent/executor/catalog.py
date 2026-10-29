@@ -43,9 +43,68 @@ RESULT_KINDS = {"list", "object"}
 RISK_LEVELS = {"low", "medium", "high"}
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+# identity_bindings.from：现网 oa / principal_id / principal.external_keys.*
+_BINDING_FROM_SIMPLE = frozenset({"oa", "identity.oa", "principal_id", "identity.principal_id"})
+_EXTERNAL_KEY_FROM_RE = re.compile(r"^principal\.external_keys\.([A-Za-z_][A-Za-z0-9_]{0,63})$")
 ADMIN_SOURCE = "admin"
 MAX_TEXT = 2000
 MAX_EXAMPLES = 10
+
+
+def _validate_binding_from(source: str) -> bool:
+    if source in _BINDING_FROM_SIMPLE:
+        return True
+    return _EXTERNAL_KEY_FROM_RE.fullmatch(source) is not None
+
+
+def synthesize_identity_bindings(inject: list[str] | tuple[str, ...]) -> list[dict]:
+    """旧 inject_identity_fields → bindings；现网 oa ← identity.oa。"""
+    out: list[dict] = []
+    for field in inject:
+        source = f"identity.{field}" if field in IDENTITY_FIELDS else field
+        out.append({"param": field, "from": source})
+    return out
+
+
+def _normalize_identity_bindings(
+    name: str, xa: dict, inject: list[str], params: dict, errors: list[str],
+) -> tuple[list[dict], bool]:
+    """显式 identity_bindings 优先；否则由 inject 合成。返回 (bindings, explicit_in_schema)。
+
+    由 inject 合成时不写入规范化 schema（避免现网 OpenAPI 哈希漂移）；运行时 to_tool_spec 再合成。
+    """
+    raw = xa.get("identity_bindings")
+    bindings: list[dict] = []
+    explicit = False
+    if raw is not None:
+        explicit = True
+        if not isinstance(raw, list):
+            errors.append(f"{name}.identity_bindings 必须是数组")
+            return [], True
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                errors.append(f"{name}.identity_bindings[{i}] 必须是对象")
+                continue
+            param = str(item.get("param") or "").strip()
+            source = str(item.get("from") or "").strip()
+            if not param or not FIELD_RE.match(param):
+                errors.append(f"{name}.identity_bindings[{i}].param 无效")
+                continue
+            if not source or not _validate_binding_from(source):
+                errors.append(
+                    f"{name}.identity_bindings[{i}].from 只允许 "
+                    f"identity.oa / oa / principal_id / principal.external_keys.<key>"
+                )
+                continue
+            bindings.append({"param": param, "from": source})
+    elif inject:
+        bindings = synthesize_identity_bindings(inject)
+
+    bound_params = {b["param"] for b in bindings}
+    leaked = set(params) & bound_params
+    if leaked:
+        errors.append(f"{name}.model_params 不得包含身份绑定参数 {sorted(leaked)}（身份只能由服务端注入）")
+    return bindings, explicit
 
 UNCHANGED, COMPATIBLE, BREAKING, INITIAL = "unchanged", "compatible", "breaking", "initial"
 
@@ -106,6 +165,7 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
     leaked = set(params) & IDENTITY_FIELDS
     if leaked:
         errors.append(f"{name}.model_params 不得包含身份字段 {sorted(leaked)}（身份只能由服务端注入）")
+    bindings, bindings_explicit = _normalize_identity_bindings(name, xa, inject, params, errors)
     result = xa.get("result") or {}
     kind = result.get("kind", "object")
     if kind not in RESULT_KINDS:
@@ -122,7 +182,8 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
     if not set(columns) <= set(fields):
         errors.append(f"{name}.result.list_columns 只能从返回字段中选择")
     query_field = xa.get("query_params_field")
-    if inject and not query_field:
+    needs_qp = bool(inject) or bool(bindings)
+    if needs_qp and not query_field:
         errors.append(f"{name} 需要注入身份字段但未声明 query_params_field")
     identity_params = xa.get("identity_params") or {}
     if not isinstance(identity_params, dict):
@@ -164,6 +225,9 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
         "result": {"kind": kind, "fields": fields, "labels": labels,
                    "list_columns": [c for c in columns if c in fields]},
     }
+    if bindings_explicit:
+        # 仅显式声明写入 schema（哈希）；inject 合成留给 to_tool_spec
+        spec["identity_bindings"] = bindings
     if upstream != DEFAULT_UPSTREAM:  # 默认值不写入，已有版本的哈希保持不变
         spec["upstream"] = upstream
     return spec, errors
@@ -201,6 +265,8 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
                        "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or []},
         },
     }
+    if form.get("identity_bindings") is not None:
+        op["x-agent"]["identity_bindings"] = form.get("identity_bindings") or []
     if not str(op["summary"]).strip():
         errors.append("请填写 Tool 名称说明（summary）")
     for key in [*(op["x-agent"]["model_params"] or {}), *(op["x-agent"]["result"]["fields"] or []),
@@ -270,6 +336,8 @@ def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
             add(key, "changed", old.get(key), new.get(key), True)
     if (old.get("identity_params") or {}) != (new.get("identity_params") or {}):
         add("identity_params", "changed", old.get("identity_params"), new.get("identity_params"), True)
+    if (old.get("identity_bindings") or []) != (new.get("identity_bindings") or []):
+        add("identity_bindings", "changed", old.get("identity_bindings"), new.get("identity_bindings"), True)
     for key in ("summary", "description", "timeout_seconds"):
         if old.get(key) != new.get(key):
             add(key, "changed", old.get(key), new.get(key))
@@ -368,6 +436,12 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
                  mcp_tool_name: str | None = None, sandbox_policy: dict | None = None) -> ToolSpec:
     result = schema["result"]
     text_result = (kind or "office") != "office"  # mcp / builtin：结果统一为围栏文本 {"text": ...}
+    inject = tuple(schema.get("inject_identity_fields") or ())
+    raw_bindings = schema.get("identity_bindings")
+    if raw_bindings:
+        bindings = tuple(dict(b) for b in raw_bindings if isinstance(b, dict))
+    else:
+        bindings = tuple(synthesize_identity_bindings(inject))
     return ToolSpec(
         kind=kind or "office",
         builtin_id=builtin_id,
@@ -386,7 +460,7 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
         risk_level=schema["risk_level"],
         requires_confirmation=schema["requires_confirmation"],
         timeout_seconds=float(schema["timeout_seconds"]),
-        inject_identity_fields=tuple(schema["inject_identity_fields"]),
+        inject_identity_fields=inject,
         top_level_fields=tuple(schema["top_level_fields"]),
         query_params_field=schema.get("query_params_field"),
         identity_params=dict(schema.get("identity_params") or {}),
@@ -394,6 +468,7 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
         model_params=dict(schema["model_params"]),
         result_kind=TEXT_RESULT_KIND if text_result else schema["result"]["kind"],
         result_fields=TEXT_RESULT_FIELDS if text_result else tuple(schema["result"]["fields"]),
+        identity_bindings=bindings,
     )
 
 

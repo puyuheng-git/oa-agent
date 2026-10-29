@@ -22,7 +22,13 @@ from oa_agent.db.types import utcnow
 from oa_agent.errors import AppError
 from oa_agent.ids import new_run_id
 from oa_agent.connectors.hub import ConnectorHub
-from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError, mint_base_url, upstream_clients
+from oa_agent.integrations.office_api import (
+    DEFAULT_UPSTREAM,
+    OfficeApiClient,
+    OfficeApiError,
+    mint_base_url,
+    upstream_clients,
+)
 from oa_agent.db.models import Skill
 from oa_agent.executor.catalog import SkillState
 from oa_agent.executor.executor import Identity, ToolError, ToolExecutor
@@ -47,6 +53,8 @@ from oa_agent.runtime.run_service import (
     CANCEL_REQUESTED, CANCELLED, FAILED, RUNNING, SUCCEEDED, TERMINAL, WAITING_CONFIRMATION, WAITING_HUMAN,
     StaleState,
 )
+from oa_agent.packs.registry import PackRegistry
+from oa_agent.packs.state import load_disabled_ids
 from oa_agent.runtime_state import AppRuntime
 
 log = logging.getLogger(__name__)
@@ -121,6 +129,19 @@ def write_workflows_enabled(rt: AppRuntime) -> bool:
     return bool(setting(rt, "runtime", "write_workflows_enabled"))
 
 
+def get_pack_registry(rt: AppRuntime) -> PackRegistry:
+    """取得进程级 PackRegistry；未挂载时惰性创建，并按 settings.packs 刷新 disabled_ids。"""
+    reg = getattr(rt, "pack_registry", None)
+    if reg is None:
+        reg = PackRegistry.from_disk()
+        rt.pack_registry = reg
+    try:
+        reg.reload(settings=load_settings(rt, "packs"))
+    except Exception:  # noqa: BLE001 — 配置暂不可用时保留内存中的启停状态
+        log.exception("刷新 packs 启停失败，沿用内存状态")
+    return reg
+
+
 def _parse_model_id(raw) -> int | None:
     if raw is None or raw == "":
         return None
@@ -186,7 +207,8 @@ def _skills_with_tools(rt: AppRuntime) -> list[SkillState]:
     engine = rt.engine
     if engine is None or not hasattr(engine, "available_skills"):
         return []
-    return [s for s in engine.available_skills() if any(engine.registry.get(t) for t in s.tools)]
+    skills = [s for s in engine.available_skills() if any(engine.registry.get(t) for t in s.tools)]
+    return get_pack_registry(rt).filter_skills(skills)
 
 
 def visible_skills_for(rt: AppRuntime, oa: str, *, office_token: str = "") -> list[SkillState]:
@@ -231,8 +253,11 @@ def skill_menu(rt: AppRuntime, *, oa: str | None = None, office_token: str = "")
 
 
 def workflow_menu(rt: AppRuntime) -> list[dict]:
-    """员工可见的固定 Workflow 目录（写类受 write_workflows_enabled 门禁）。"""
-    return workflow_catalog.list_entries(write_enabled=write_workflows_enabled(rt))
+    """员工可见的固定 Workflow 目录（写类受 write_workflows_enabled / Pack 启停门禁）。"""
+    return workflow_catalog.list_entries(
+        write_enabled=write_workflows_enabled(rt),
+        pack_registry=get_pack_registry(rt),
+    )
 
 
 def start_workflow(rt: AppRuntime, session: ChatSession, workflow_id: str, params: dict,
@@ -438,11 +463,37 @@ def _session_principal_id(session: ChatSession) -> str:
     return getattr(session, "principal_id", None) or session.oa
 
 
+def _authorization_for_tool(session: ChatSession, connector_id: str | None = None) -> str:
+    """按 Tool upstream/connector 取会话凭证；非 office 缺票不回落 office_token。"""
+    cid = (connector_id or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+    getter = getattr(session, "get_authorization", None)
+    if callable(getter):
+        auth = getter(cid)
+        if auth:
+            return auth
+    elif cid == DEFAULT_UPSTREAM:
+        auth = getattr(session, "office_token", None) or ""
+        if auth:
+            return auth
+    raise AppError(401, "CONNECTOR_CREDENTIAL_MISSING", f"会话缺少连接器凭证：{cid}")
+
+
+def _identity_from_session(session: ChatSession, connector_id: str | None = None) -> Identity:
+    """从会话构造 Identity；默认 connector=office，credentials 一并带入供按 Tool 选票。"""
+    cid = (connector_id or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+    creds = dict(getattr(session, "credentials", None) or {})
+    return Identity(
+        oa=session.oa,
+        authorization=_authorization_for_tool(session, cid),
+        principal_id=_session_principal_id(session),
+        credentials=creds,
+    )
+
+
 def _build_write_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession) -> travel_reimburse_submit.WriteRunContext:
     return travel_reimburse_submit.WriteRunContext(
         recorder=rec,
-        identity=Identity(oa=session.oa, authorization=session.office_token,
-                          principal_id=_session_principal_id(session)),
+        identity=_identity_from_session(session),
         read_executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
                                    int(setting(rt, "oa", "tool_remark_max_chars")),
                                    mcp_client=get_mcp_client(rt),
@@ -512,8 +563,7 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
     return travel_query.RunContext(
         on_delta=on_delta,
         recorder=rec,
-        identity=Identity(oa=session.oa, authorization=session.office_token,
-                          principal_id=_session_principal_id(session)),
+        identity=_identity_from_session(session),
         executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
                               int(setting(rt, "oa", "tool_remark_max_chars")),
                               mcp_client=get_mcp_client(rt),
@@ -531,6 +581,7 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
         domain=domain_name,
         runtime_routing=runtime_routing,
         recent_tool_names=_recent_tool_names(rt, session.thread_id),
+        rule_tool_map=get_pack_registry(rt).aggregated_rule_tools(),
     )
 
 

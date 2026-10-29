@@ -401,6 +401,23 @@ GROUPS: dict[str, GroupDef] = {
             ),
             description="出站 MCP 连接的全局安全边界。MCP 连接本身在「MCP 连接」页配置，密钥只写不读。",
         ),
+        GroupDef(
+            "packs",
+            "领域包",
+            "热生效",
+            (
+                FieldDef(
+                    "disabled_ids",
+                    "已禁用领域包",
+                    "list",
+                    [],
+                    "写入包 id 后该包对员工侧不可见（规则/Skill/Workflow 聚合会排除）。"
+                    "未列入的包仍按各自默认启用状态生效；默认空列表表示不额外禁用。",
+                ),
+            ),
+            description="Domain Pack 启停覆盖。默认启用的包（如 oa_travel）无需列出；"
+                        "只需把要关闭的包 id 写入 disabled_ids。",
+        ),
     )
 }
 

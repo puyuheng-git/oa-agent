@@ -226,6 +226,8 @@ class RunContext:
     domain: str | None = None  # O5: domain routing hook（L1 预留，引擎未接）
     runtime_routing: dict = field(default_factory=dict)  # 配置中心 runtime 路由默认（热）
     recent_tool_names: list[str] = field(default_factory=list)  # 本线程最近用过的 Tool
+    # Domain Pack 聚合的意图→Tool 映射；None 时 tool_routing 使用 FALLBACK（单测）
+    rule_tool_map: dict[str, str] | None = None
 
     def tools(self) -> dict[str, tuple[ToolSpec, SkillState | None]]:
         """员工本次可用"Tool "(定义, 所"Skill)。以执行器的实时注册表为准"""
@@ -479,6 +481,7 @@ def _understand(state: TravelState, ctx: RunContext, tools: dict) -> dict:
         llm_select=llm_select,
         rules_select=_rules,
         chat_enabled=chat,
+        rule_tool_map=ctx.rule_tool_map,
     )
 
 

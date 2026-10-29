@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 from oa_agent.connectors.base import ConnectorError
 from oa_agent.connectors.hub import ConnectorHub
-from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError
+from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, OfficeApiClient, OfficeApiError
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.events import RunRecorder
 
@@ -43,17 +43,87 @@ class Identity:
     oa: str
     authorization: str
     principal_id: str = ""
+    credentials: dict = field(default_factory=dict)  # connector_id -> {authorization, expires_at}
 
     def __post_init__(self) -> None:
         if not self.principal_id:
             self.principal_id = self.oa
+        if self.credentials is None:
+            self.credentials = {}
+
+
+def authorization_for(
+    identity: Identity,
+    connector_id: str | None,
+    *,
+    allow_office_fallback: bool = False,
+) -> str:
+    """按 connector 取 Authorization。
+
+    默认禁止跨 connector 默认同票。``allow_office_fallback=True`` 仅用于 OA
+    upstreams 信任域（认同同一员工 token 的 peer），可回落 office 凭证。
+    """
+    cid = (connector_id or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+    entry = (identity.credentials or {}).get(cid)
+    if isinstance(entry, dict) and entry.get("authorization"):
+        return str(entry["authorization"])
+    if cid == DEFAULT_UPSTREAM or allow_office_fallback:
+        if identity.authorization:
+            return identity.authorization
+        office = (identity.credentials or {}).get(DEFAULT_UPSTREAM)
+        if isinstance(office, dict) and office.get("authorization"):
+            return str(office["authorization"])
+    raise ToolError("CONNECTOR_CREDENTIAL_MISSING", f"会话缺少连接器凭证：{cid}")
+
+
+def _bound_param_names(spec: ToolSpec) -> set[str]:
+    """身份绑定目标参数名：模型不得写入。"""
+    names = set(getattr(spec, "inject_identity_fields", None) or ())
+    for binding in getattr(spec, "identity_bindings", None) or ():
+        if isinstance(binding, dict) and binding.get("param"):
+            names.add(str(binding["param"]))
+    return names
+
+
+def _effective_identity_bindings(spec: ToolSpec) -> list[dict]:
+    """显式 bindings 优先；否则由 inject_identity_fields 合成（现网 oa ← identity.oa）。"""
+    bindings = getattr(spec, "identity_bindings", None)
+    if bindings:
+        return [dict(b) for b in bindings if isinstance(b, dict)]
+    return [
+        {"param": f, "from": f"identity.{f}" if f == "oa" else f}
+        for f in (getattr(spec, "inject_identity_fields", None) or ())
+    ]
+
+
+def resolve_identity_binding(identity: Identity, source: str) -> str:
+    """从 Identity 解析 binding.from。M2：无 external_keys 时 oa 键回落 identity.oa。"""
+    src = (source or "").strip()
+    if src in ("identity.oa", "oa"):
+        return identity.oa
+    if src in ("principal_id", "identity.principal_id"):
+        return identity.principal_id
+    if src.startswith("principal.external_keys."):
+        key = src[len("principal.external_keys."):]
+        external = getattr(identity, "external_keys", None)
+        if isinstance(external, dict) and key in external and external[key] is not None:
+            return str(external[key])
+        if key == "oa":  # M2：Identity 尚无 external_keys 时与现网 oa 对齐
+            return identity.oa
+        return ""
+    if hasattr(identity, src):
+        return str(getattr(identity, src) or "")
+    return ""
 
 
 def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
     """返回 (清洗后的参数, 被丢弃的字段)。身份字段与未声明字段一律丢弃。"""
     clean: dict = {}
-    dropped = [k for k in args if k not in spec.model_params or k in spec.inject_identity_fields]
+    blocked = _bound_param_names(spec)
+    dropped = [k for k in args if k not in spec.model_params or k in blocked]
     for key, rule in spec.model_params.items():
+        if key in blocked:
+            continue
         value = args.get(key)
         if value is None or value == "":
             if rule.get("required"):
@@ -88,13 +158,20 @@ def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
 
 
 def build_request(spec: ToolSpec, args: dict, identity: Identity) -> dict:
+    bindings = _effective_identity_bindings(spec)
     if not spec.query_params_field:  # 没有 JSON 参数字段时全部作为普通查询参数
         params = dict(args)
+        for binding in bindings:
+            param = binding.get("param")
+            if param:
+                params[str(param)] = resolve_identity_binding(identity, str(binding.get("from") or ""))
     else:
         params = {k: args[k] for k in spec.top_level_fields if k in args}
         qp = {k: v for k, v in args.items() if k not in spec.top_level_fields}
-        for field in spec.inject_identity_fields:
-            qp[field] = getattr(identity, field)
+        for binding in bindings:
+            param = binding.get("param")
+            if param:
+                qp[str(param)] = resolve_identity_binding(identity, str(binding.get("from") or ""))
         params[spec.query_params_field] = json.dumps(qp, ensure_ascii=False, separators=(",", ":"))
     for name, field in spec.identity_params.items():  # 最后写入，覆盖任何同名参数
         params[name] = getattr(identity, field)
@@ -225,7 +302,7 @@ class ToolExecutor:
         if spec.kind == "builtin":
             return self._execute_builtin(spec, args, identity, rec, node_name)
         clean, dropped = validate_args(spec, args)
-        connector_id = spec.upstream or "office"
+        connector_id = spec.upstream or DEFAULT_UPSTREAM
         rec.tool_call_count += 1
         rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,
                   input_summary=clean,
@@ -235,19 +312,24 @@ class ToolExecutor:
         try:
             params = build_request(spec, clean, identity)
             connector = self.hub.get(spec.upstream) if self.hub is not None else None
+            client = None if connector is not None else self.clients.get(spec.upstream)
+            if connector is None and client is None:
+                raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 office-api 地址：{spec.upstream}")
+            # OA upstreams 目录 peer 共享 mint 员工票；其它 connector（如 raw_json demo）须显式凭证
+            share_office = client is not None or bool(
+                getattr(connector, "shares_employee_token", False)
+            )
+            auth = authorization_for(identity, connector_id, allow_office_fallback=share_office)
             if connector is not None:
                 resp = connector.invoke(
                     (spec.method or "GET").upper(),
                     spec.path,
                     params=params,
-                    authorization=identity.authorization,
+                    authorization=auth,
                     timeout=spec.timeout_seconds,
                 )
             else:
-                client = self.clients.get(spec.upstream)
-                if client is None:
-                    raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 office-api 地址：{spec.upstream}")
-                resp = client.get(spec.path, params, identity.authorization, timeout=spec.timeout_seconds)
+                resp = client.get(spec.path, params, auth, timeout=spec.timeout_seconds)
             result = compact(spec, resp.data, clean, self.remark_limit)
         except (OfficeApiError, ConnectorError, ToolError) as exc:
             rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version,

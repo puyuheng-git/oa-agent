@@ -13,12 +13,12 @@ import hmac
 import json
 import secrets
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from fastapi import Request
 
 from oa_agent.errors import AppError
-from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError
+from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, OfficeApiClient, OfficeApiError
 from oa_agent.kv import KV
 from oa_agent.ids import new_thread_id
 
@@ -53,10 +53,55 @@ class ChatSession:
     created_at: int
     channel: str = "oa_web"
     principal_id: str = ""
+    credentials: dict = field(default_factory=dict)  # connector_id -> {authorization, expires_at}
 
     def __post_init__(self) -> None:
         if not self.principal_id:
             self.principal_id = self.oa
+        if self.credentials is None:
+            self.credentials = {}
+        else:
+            self.credentials = dict(self.credentials)
+        if not self.credentials and self.office_token:
+            self.credentials[DEFAULT_UPSTREAM] = {
+                "authorization": self.office_token,
+                "expires_at": self.token_expires_at,
+            }
+        elif not self.office_token:
+            office = self.credentials.get(DEFAULT_UPSTREAM)
+            if isinstance(office, dict) and office.get("authorization"):
+                self.office_token = str(office["authorization"])
+                if office.get("expires_at") is not None:
+                    try:
+                        self.token_expires_at = int(office["expires_at"])
+                    except (TypeError, ValueError):
+                        pass
+
+    def get_authorization(self, connector_id: str) -> str | None:
+        """按 connector 取 Authorization；仅 office/DEFAULT_UPSTREAM 可回落 office_token。"""
+        cid = (connector_id or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+        entry = self.credentials.get(cid)
+        if isinstance(entry, dict):
+            auth = entry.get("authorization")
+            if auth:
+                return str(auth)
+        if cid == DEFAULT_UPSTREAM and self.office_token:
+            return self.office_token
+        return None
+
+
+def _sync_office_credentials(session: ChatSession) -> None:
+    """office_token 变更后写回 credentials，保证 asdict/KV 双写一致。"""
+    if session.office_token:
+        session.credentials[DEFAULT_UPSTREAM] = {
+            "authorization": session.office_token,
+            "expires_at": session.token_expires_at,
+        }
+
+
+def _session_payload(session: ChatSession) -> str:
+    _sync_office_credentials(session)
+    return json.dumps(asdict(session))
 
 
 def _b64decode(text: str) -> bytes:
@@ -140,14 +185,14 @@ def redeem_launch(kv: KV, code: str, policy: LaunchPolicy = DEFAULT_POLICY) -> t
                           thread_id=new_thread_id(), office_token=data["office_token"],
                           token_expires_at=int(data["token_expires_at"]), created_at=int(time.time()))
     ticket = secrets.token_urlsafe(32)
-    kv.set(_ticket_key(ticket), json.dumps(asdict(session)), _ttl_for(session, policy))
+    kv.set(_ticket_key(ticket), _session_payload(session), _ttl_for(session, policy))
     return ticket, session
 
 
 def store_session(kv: KV, ticket: str, session: ChatSession, policy: LaunchPolicy = DEFAULT_POLICY) -> int:
     """保存（续期）会话；ticket 只在服务端使用时（如企业微信渠道）由调用方随机生成且不外发。"""
     ttl = _ttl_for(session, policy)
-    kv.set(_ticket_key(ticket), json.dumps(asdict(session)), ttl)
+    kv.set(_ticket_key(ticket), _session_payload(session), ttl)
     return ttl
 
 
@@ -174,7 +219,7 @@ def refresh_session(kv: KV, ticket: str, session: ChatSession, client_factory, g
     if session.token_expires_at - int(time.time()) < policy.remint_before:
         session.office_token, session.token_expires_at = _mint(client_factory(), session.oa, gateway_secret)
     ttl = _ttl_for(session, policy)
-    kv.set(_ticket_key(ticket), json.dumps(asdict(session)), ttl)
+    kv.set(_ticket_key(ticket), _session_payload(session), ttl)
     return ttl
 
 

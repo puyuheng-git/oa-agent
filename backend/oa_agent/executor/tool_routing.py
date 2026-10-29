@@ -61,11 +61,19 @@ ROUTING_DEFAULTS: dict[str, Any] = {
     "routing_trace_enabled": True,
 }
 
-# 规则意图 → 行程报销 Tool（与 oa_assistant.RULE_TOOLS 对齐）
-RULE_TOOLS = {LIST: "query_my_travel_expense_list", DETAIL: "query_my_travel_expense_detail"}
-LIST_TOOL = RULE_TOOLS[LIST]
-DETAIL_TOOL = RULE_TOOLS[DETAIL]
+# 无 PackRegistry 时的回退映射（单测 / 未注入 registry 场景）
+FALLBACK_RULE_TOOLS = {
+    LIST: "query_my_travel_expense_list",
+    DETAIL: "query_my_travel_expense_detail",
+}
+RULE_TOOLS = FALLBACK_RULE_TOOLS  # 兼容旧引用
+LIST_TOOL = FALLBACK_RULE_TOOLS[LIST]
+DETAIL_TOOL = FALLBACK_RULE_TOOLS[DETAIL]
 _DETAIL_CHAIN = re.compile(r"最近一笔|最新一笔|最后一笔|第一条的详情|最近.*详情")
+
+
+def _resolve_rule_tool_map(rule_tool_map: dict[str, str] | None) -> dict[str, str]:
+    return dict(FALLBACK_RULE_TOOLS if rule_tool_map is None else rule_tool_map)
 
 LlmSelectFn = Callable[[str, dict, dict], dict | None]
 RulesSelectFn = Callable[[str, date, dict], dict]
@@ -166,11 +174,16 @@ def route(
     llm_select: LlmSelectFn | None = None,
     rules_select: RulesSelectFn | None = None,
     chat_enabled: bool = False,
+    rule_tool_map: dict[str, str] | None = None,
 ) -> dict:
-    """统一路由入口。返回与 _understand 兼容的 dict。"""
+    """统一路由入口。返回与 _understand 兼容的 dict。
+
+    ``rule_tool_map``：意图 key → Tool 名；为 None 时使用 FALLBACK_RULE_TOOLS（无 registry 的单测）。
+    """
     cfg = resolve_routing_config(config, runtime_defaults)
     mode = cfg["tool_routing_mode"]
     trace = bool(cfg.get("routing_trace_enabled", True))
+    resolved_map = _resolve_rule_tool_map(rule_tool_map)
     t0 = time.perf_counter()
     _emit(recorder, trace, "routing_start", metadata={
         "mode": mode,
@@ -192,6 +205,7 @@ def route(
         trace=trace,
         fallback_from=None,
         depth=0,
+        rule_tool_map=resolved_map,
     )
     duration_ms = int((time.perf_counter() - t0) * 1000)
     _emit(
@@ -231,6 +245,7 @@ def _dispatch(
     trace: bool,
     fallback_from: str | None,
     depth: int,
+    rule_tool_map: dict[str, str],
 ) -> RoutingDecision:
     if depth > 2:
         return _help_decision(mode, fallback_from, "routing_depth_exceeded")
@@ -238,42 +253,42 @@ def _dispatch(
     if mode == "legacy_prompt":
         return _legacy_prompt(
             message, tools, today, cfg, llm_select, rules_select, chat_enabled,
-            recorder, trace, fallback_from,
+            recorder, trace, fallback_from, rule_tool_map,
         )
     if mode == "skill_then_tool":
         return _skill_then_tool(
             message, tools, today, cfg, llm_select, rules_select, chat_enabled,
-            recorder, trace, fallback_from,
+            recorder, trace, fallback_from, rule_tool_map,
         )
     if mode == "retrieve_then_tool":
         return _retrieve_then_tool(
             message, tools, today, cfg, recent_tool_names, llm_select, rules_select,
-            chat_enabled, recorder, trace, fallback_from,
+            chat_enabled, recorder, trace, fallback_from, rule_tool_map,
         )
     if mode == "deterministic_first":
         return _deterministic_first(
             message, tools, today, cfg, recent_tool_names, llm_select, rules_select,
-            chat_enabled, recorder, trace, fallback_from, depth,
+            chat_enabled, recorder, trace, fallback_from, depth, rule_tool_map,
         )
     if mode == "meta_search":
         return _meta_search(
             message, tools, today, cfg, recent_tool_names, llm_select, rules_select,
-            chat_enabled, recorder, trace, fallback_from,
+            chat_enabled, recorder, trace, fallback_from, rule_tool_map,
         )
     if mode == "router_then_fill":
         return _router_then_fill(
             message, tools, today, cfg, llm_select, rules_select, chat_enabled,
-            recorder, trace, fallback_from,
+            recorder, trace, fallback_from, rule_tool_map,
         )
     return _legacy_prompt(
         message, tools, today, cfg, llm_select, rules_select, chat_enabled,
-        recorder, trace, fallback_from or "unknown_mode",
+        recorder, trace, fallback_from or "unknown_mode", rule_tool_map,
     )
 
 
 def _legacy_prompt(
     message, tools, today, cfg, llm_select, rules_select, chat_enabled,
-    recorder, trace, fallback_from,
+    recorder, trace, fallback_from, rule_tool_map,
 ) -> RoutingDecision:
     top_k = int(cfg.get("prompt_topk") or 8)
     narrowed = _topk_tools(message, tools, top_k)
@@ -282,7 +297,8 @@ def _legacy_prompt(
         "top_k": top_k, "visible": len(tools), "picked": len(names),
     })
     parsed = _run_llm_or_rules(
-        message, narrowed, tools, today, llm_select, rules_select, chat_enabled, full_tools=tools,
+        message, narrowed, tools, today, llm_select, rules_select, chat_enabled,
+        full_tools=tools, rule_tool_map=rule_tool_map,
     )
     return _decision_from_parsed(
         "legacy_prompt", parsed, names, fallback_from=fallback_from, tools=tools,
@@ -291,10 +307,12 @@ def _legacy_prompt(
 
 def _skill_then_tool(
     message, tools, today, cfg, llm_select, rules_select, chat_enabled,
-    recorder, trace, fallback_from,
+    recorder, trace, fallback_from, rule_tool_map,
 ) -> RoutingDecision:
     t0 = time.perf_counter()
-    skill_name, skill_tools, scores = _select_skill(message, tools, cfg.get("routing_skill_method") or "rules_then_llm")
+    skill_name, skill_tools, scores = _select_skill(
+        message, tools, cfg.get("routing_skill_method") or "rules_then_llm", rule_tool_map,
+    )
     _stage(recorder, trace, "skill_select", duration_ms=int((time.perf_counter() - t0) * 1000),
            candidates=list({s for s, _ in scores}), metadata={"scores": scores[:16], "chosen": skill_name})
     if not skill_tools:
@@ -309,7 +327,8 @@ def _skill_then_tool(
 
     narrowed = {n: tools[n] for n in skill_tools if n in tools}
     parsed = _run_llm_or_rules(
-        message, narrowed, tools, today, llm_select, rules_select, chat_enabled, full_tools=tools,
+        message, narrowed, tools, today, llm_select, rules_select, chat_enabled,
+        full_tools=tools, rule_tool_map=rule_tool_map,
     )
     dec = _decision_from_parsed(
         "skill_then_tool", parsed, list(narrowed.keys()), fallback_from=fallback_from, tools=tools,
@@ -321,7 +340,7 @@ def _skill_then_tool(
 
 def _retrieve_then_tool(
     message, tools, today, cfg, recent_tool_names, llm_select, rules_select,
-    chat_enabled, recorder, trace, fallback_from,
+    chat_enabled, recorder, trace, fallback_from, rule_tool_map,
 ) -> RoutingDecision:
     t0 = time.perf_counter()
     backend = cfg.get("retrieve_backend") or "keyword"
@@ -355,7 +374,8 @@ def _retrieve_then_tool(
            })
     narrowed = {n: tools[n] for n in picked if n in tools} or tools
     parsed = _run_llm_or_rules(
-        message, narrowed, tools, today, llm_select, rules_select, chat_enabled, full_tools=tools,
+        message, narrowed, tools, today, llm_select, rules_select, chat_enabled,
+        full_tools=tools, rule_tool_map=rule_tool_map,
     )
     return _decision_from_parsed(
         "retrieve_then_tool", parsed, list(narrowed.keys()),
@@ -366,10 +386,10 @@ def _retrieve_then_tool(
 
 def _deterministic_first(
     message, tools, today, cfg, recent_tool_names, llm_select, rules_select,
-    chat_enabled, recorder, trace, fallback_from, depth,
+    chat_enabled, recorder, trace, fallback_from, depth, rule_tool_map,
 ) -> RoutingDecision:
     t0 = time.perf_counter()
-    hit = _try_deterministic(message, today, tools)
+    hit = _try_deterministic(message, today, tools, rule_tool_map)
     _stage(recorder, trace, "deterministic", duration_ms=int((time.perf_counter() - t0) * 1000),
            candidates=[hit["tool"]] if hit and hit.get("tool") else [],
            metadata={"hit": bool(hit), "plan": "plan_list_then_detail" if hit and hit.get("steps") else "rules"})
@@ -402,6 +422,7 @@ def _deterministic_first(
         trace=trace,
         fallback_from="deterministic_first",
         depth=depth + 1,
+        rule_tool_map=rule_tool_map,
     )
 
 
@@ -433,6 +454,9 @@ def get_tool_schema(tool_name: str, tools: dict) -> dict | None:
     spec, skill = tools[tool_name]
     blocked = set(getattr(spec, "inject_identity_fields", ()) or ())
     blocked.update((getattr(spec, "identity_params", None) or {}).keys())
+    for binding in getattr(spec, "identity_bindings", ()) or ():
+        if isinstance(binding, dict) and binding.get("param"):
+            blocked.add(str(binding["param"]))
     params = {}
     for key, rule in (getattr(spec, "model_params", None) or {}).items():
         if key in blocked:
@@ -452,7 +476,7 @@ def get_tool_schema(tool_name: str, tools: dict) -> dict | None:
 
 def _meta_search(
     message, tools, today, cfg, recent_tool_names, llm_select, rules_select,
-    chat_enabled, recorder, trace, fallback_from,
+    chat_enabled, recorder, trace, fallback_from, rule_tool_map,
 ) -> RoutingDecision:
     """元工具渐进披露：search_capabilities / get_tool_schema，受 meta_max_rounds 限制后再填参。"""
     max_rounds = max(1, int(cfg.get("meta_max_rounds") or 3))
@@ -608,7 +632,8 @@ def _meta_search(
             return llm_select(message, narrowed_tools, clean)
 
     parsed = _run_llm_or_rules(
-        message, narrowed, tools, today, fill_select, rules_select, chat_enabled, full_tools=tools,
+        message, narrowed, tools, today, fill_select, rules_select, chat_enabled,
+        full_tools=tools, rule_tool_map=rule_tool_map,
     )
     return _decision_from_parsed(
         "meta_search", parsed, list(narrowed.keys()), fallback_from=fallback_from, tools=tools,
@@ -617,11 +642,13 @@ def _meta_search(
 
 def _router_then_fill(
     message, tools, today, cfg, llm_select, rules_select, chat_enabled,
-    recorder, trace, fallback_from,
+    recorder, trace, fallback_from, rule_tool_map,
 ) -> RoutingDecision:
     """小路由：优先 LLM stage=router（可走 router_model_id）定 1 个 tool；否则规则/关键词；再 stage=fill 填参。"""
     t0 = time.perf_counter()
-    skill_name, skill_tools, scores = _select_skill(message, tools, cfg.get("routing_skill_method") or "rules_then_llm")
+    skill_name, skill_tools, scores = _select_skill(
+        message, tools, cfg.get("routing_skill_method") or "rules_then_llm", rule_tool_map,
+    )
     picked_name = None
     router_source = "rules"
     pool_names = [n for n in (skill_tools or list(tools.keys())) if n in tools]
@@ -665,7 +692,7 @@ def _router_then_fill(
         picked_name = ranked[0] if ranked else pool_names[0]
         router_source = "keyword"
     if not picked_name:
-        rules = (rules_select or _default_rules)(message, today, tools)
+        rules = _invoke_rules(rules_select, message, today, tools, rule_tool_map)
         if rules.get("intent") == TOOL and rules.get("tool") in tools:
             picked_name = rules["tool"]
             router_source = "rules"
@@ -686,7 +713,7 @@ def _router_then_fill(
     narrowed = {picked_name: tools[picked_name]}
     _stage(recorder, trace, "fill_args", duration_ms=0, candidates=[picked_name], metadata={"schema_count": 1})
     # 规则已带参则直接用，避免多余模型调用
-    rules = (rules_select or _default_rules)(message, today, tools)
+    rules = _invoke_rules(rules_select, message, today, tools, rule_tool_map)
     if rules.get("intent") == TOOL and rules.get("tool") == picked_name and rules.get("params"):
         return RoutingDecision(
             mode="router_then_fill", action=TOOL, chosen_tool=picked_name,
@@ -695,7 +722,7 @@ def _router_then_fill(
         )
     parsed = _run_llm_or_rules(
         message, narrowed, tools, today, llm_select, rules_select, chat_enabled,
-        full_tools=tools, stage="fill",
+        full_tools=tools, stage="fill", rule_tool_map=rule_tool_map,
     )
     dec = _decision_from_parsed(
         "router_then_fill", parsed, [picked_name], fallback_from=fallback_from, tools=tools,
@@ -704,33 +731,45 @@ def _router_then_fill(
     return dec
 
 
-def _try_deterministic(message: str, today: date, tools: dict) -> dict | None:
+def _try_deterministic(
+    message: str, today: date, tools: dict, rule_tool_map: dict[str, str],
+) -> dict | None:
     """规则 + plan_list_then_detail 真正调用。命中则返回 understand 形态 dict。"""
     parsed = intent_rules.parse(message, today)
     intent = parsed.get("intent")
     params = parsed.get("params") or {}
+    list_tool = rule_tool_map.get(LIST)
+    detail_tool = rule_tool_map.get(DETAIL)
 
     # 「最近一笔详情」类：服务端串联 list→detail
-    if _DETAIL_CHAIN.search(message or "") and LIST_TOOL in tools and DETAIL_TOOL in tools:
-        plan = plan_list_then_detail(LIST_TOOL, DETAIL_TOOL, "id")
+    if (
+        _DETAIL_CHAIN.search(message or "")
+        and list_tool
+        and detail_tool
+        and list_tool in tools
+        and detail_tool in tools
+    ):
+        plan = plan_list_then_detail(list_tool, detail_tool, "id")
         list_args = {k: v for k, v in params.items() if k != "id"}
         if "limit" not in list_args:
             list_args = {**list_args}  # limit 由 understand 层补默认
         steps = [
-            {"tool": LIST_TOOL, "args": list_args},
-            {"tool": DETAIL_TOOL, "args": {"id": {"$ref": "step1.list[0].id"}}},
+            {"tool": list_tool, "args": list_args},
+            {"tool": detail_tool, "args": {"id": {"$ref": "step1.list[0].id"}}},
         ]
         # 校验 plan 已被调用（返回非空）
-        assert plan and plan[0]["tool"] == LIST_TOOL
-        return {"intent": TOOL, "tool": LIST_TOOL, "params": list_args, "steps": steps}
+        assert plan and plan[0]["tool"] == list_tool
+        return {"intent": TOOL, "tool": list_tool, "params": list_args, "steps": steps}
 
-    name = RULE_TOOLS.get(intent)
+    name = rule_tool_map.get(intent) if intent else None
     if name is None or name not in tools:
         return None
     return {"intent": TOOL, "tool": name, "params": params}
 
 
-def _select_skill(message: str, tools: dict, method: str) -> tuple[str | None, list[str], list[tuple[str, int]]]:
+def _select_skill(
+    message: str, tools: dict, method: str, rule_tool_map: dict[str, str],
+) -> tuple[str | None, list[str], list[tuple[str, int]]]:
     """按 Skill 聚合候选；返回 (chosen_skill, tool_names, scores)。"""
     buckets: dict[str, list[str]] = {}
     for name, (_, skill) in tools.items():
@@ -742,6 +781,7 @@ def _select_skill(message: str, tools: dict, method: str) -> tuple[str | None, l
         return (None if only == "_ungrouped" else only), tools_in, [(only or "_ungrouped", 1)]
 
     tokens = set(re.findall(r"[\w\u4e00-\u9fff]{2,}", (message or "").lower()))
+    mapped_tools = set(rule_tool_map.values())
     scores: list[tuple[str, int]] = []
     for skill_name, names in buckets.items():
         score = 0
@@ -755,8 +795,8 @@ def _select_skill(message: str, tools: dict, method: str) -> tuple[str | None, l
         for tok in tokens:
             if tok in blob:
                 score += 10
-        # 规则强命中行程报销
-        if skill_name != "_ungrouped" and any(n in RULE_TOOLS.values() for n in names):
+        # 规则强命中：Skill 工具落在当前 rule_tool_map
+        if skill_name != "_ungrouped" and any(n in mapped_tools for n in names):
             if intent_rules.parse(message, date.today()).get("intent") in (LIST, DETAIL):
                 score += 100
         scores.append((skill_name, score))
@@ -798,9 +838,22 @@ def _tools_as_candidates(tools: dict) -> list[dict]:
     return out
 
 
+def _invoke_rules(
+    rules_select: RulesSelectFn | None,
+    message: str,
+    today: date,
+    tools: dict,
+    rule_tool_map: dict[str, str],
+) -> dict:
+    if rules_select is not None:
+        return rules_select(message, today, tools)
+    return _default_rules(message, today, tools, rule_tool_map=rule_tool_map)
+
+
 def _run_llm_or_rules(
     message, narrowed, all_tools, today, llm_select, rules_select, chat_enabled, *, full_tools,
     stage: str = "fill",
+    rule_tool_map: dict[str, str] | None = None,
 ) -> dict:
     if llm_select is not None and (narrowed or chat_enabled):
         try:
@@ -813,12 +866,21 @@ def _run_llm_or_rules(
                 return parsed
         except Exception:  # noqa: BLE001 — 模型失败回退规则
             pass
-    return (rules_select or _default_rules)(message, today, all_tools)
+    return _invoke_rules(
+        rules_select, message, today, all_tools, _resolve_rule_tool_map(rule_tool_map),
+    )
 
 
-def _default_rules(message: str, today: date, tools: dict) -> dict:
+def _default_rules(
+    message: str,
+    today: date,
+    tools: dict,
+    *,
+    rule_tool_map: dict[str, str] | None = None,
+) -> dict:
+    mapping = _resolve_rule_tool_map(rule_tool_map)
     parsed = intent_rules.parse(message, today)
-    name = RULE_TOOLS.get(parsed.get("intent"))
+    name = mapping.get(parsed.get("intent"))
     if name is None or name not in tools:
         return {"intent": HELP, "tool": None, "params": {}}
     return {"intent": TOOL, "tool": name, "params": parsed.get("params") or {}, "intent_source": "rules"}

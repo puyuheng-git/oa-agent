@@ -83,14 +83,25 @@
 8. 不展示模型隐藏推理链。
 9. 管理员身份与员工身份是两套主体，互不代替：管理员不能代员工确认业务操作。
 
-### 3.1 Principal / Connector（平台抽象，M1）
+### 3.1 Principal / Connector（平台抽象，M1–M2）
 
 多系统平台路线图见 [`docs/superpowers/specs/2026-10-28-multi-system-platform-design.md`](../superpowers/specs/2026-10-28-multi-system-platform-design.md)。M1 在**不改变现网行程报销对话行为**的前提下引入：
 
 - **Principal**：平台认定的对话主体；`principal_id` 写入会话与执行 `Identity`，缺省等于现网 `oa`（双写兼容，模型/客户端仍不得自报身份）。
 - **Connector**：对业务上游 HTTP 调用的统一接口（`Connector` Protocol + `ConnectorResult` / `ConnectorError`）。现网 OA office 目录中的 peer 包装为 **`HttpJsonConnector`**，由 **`ConnectorHub`** 按 `connector_id`（与上游 `key` 同源，默认 `office`）注册；内部仍委托既有 `OfficeApiClient`。
 - 执行路径：**优先**经 hub `invoke`，无对应 connector 时回退原 `clients` 字典；`tool_call` 事件 metadata 带 `connector_id`。
-- M1 **不做**：envelope 可配、Domain Pack 加载、OIDC / IdP 插件化、管理端连接器 UI 重做。
+- **M2 增补**：Connector / Tool 可声明 **`envelope_profile`**（默认 `oa_office`；另有 `raw_json`）；Tool 侧 **`identity_bindings`**（兼容旧 `inject_identity_fields`）；会话 **`credentials`** 按 `connector_id` 存票（`office_token` 双写兼容）。OA「业务上游」目录 peer 共享 mint 员工票；独立 connector 禁止默认同票跨信任域。
+- M1–M2 **不做**：OIDC / IdP 插件化（M4）、管理端连接器 UI 重做（M5）。Domain Pack 见下节（M3 已交付）。
+
+#### Domain Pack（M3）
+
+业务能力（Skill / Tool / 意图规则 / 写 Workflow 元数据）以**本机目录 Pack** 下沉，平台核心只消费「已启用 Pack」的聚合结果：
+
+- 目录：`packs/<id>/pack.yaml`（可相对引用仓库既有 `skills/`、`openapi/`、`contracts/`）；启动扫描 → **`PackRegistry`**。
+- 启停：settings 组 `packs.disabled_ids`；管理 API `GET/POST /v1/admin/packs`（权限暂复用 `ops.tool.manage`）；禁用 ≠ 物理删 Tool 历史版本。
+- 内置 **`oa_travel`** 默认启用；禁用后员工侧行程规则 / Skill 候选 / 写 workflow 不可用，启用恢复。
+- 分发锁定：本机目录 + 后台启停；不上传 zip（见多系统规格）。
+- M3 **不做**：IdP/OIDC（M4）、连接器管理 UI 大改（M5）。
 
 ---
 

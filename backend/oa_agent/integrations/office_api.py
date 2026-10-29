@@ -93,26 +93,36 @@ class OfficeApiClient:
         return resp, int((time.perf_counter() - started) * 1000)
 
     def _unwrap(self, resp: httpx.Response) -> tuple[object, str]:
-        """返回 (data, 成功提示语)。"""
-        if resp.status_code in (401, 403):
-            raise OfficeApiError("OFFICE_TOKEN_EXPIRED", f"office-api 拒绝访问（HTTP {resp.status_code}）", resp.status_code)
+        """返回 (data, 成功提示语)。委托 oa_office envelope；ConnectorError → OfficeApiError。"""
+        from oa_agent.connectors.base import ConnectorError
+        from oa_agent.connectors.envelope import parse_envelope
+
         if resp.status_code >= 400:
-            # 4xx 的 msg 多为参数/业务校验提示，可给员工看；5xx 的内容可能是堆栈，不展示
-            hint = business_hint(_json_or_none(resp), self.hint_max) if resp.status_code < 500 else ""
-            raise OfficeApiError("UPSTREAM_HTTP_ERROR", f"office-api HTTP {resp.status_code} {hint}".strip(),
-                                 resp.status_code, user_message=hint)
+            body: object = _json_or_none(resp)
+            json_decode_ok = True
+        else:
+            try:
+                body = resp.json()
+                json_decode_ok = True
+            except ValueError:
+                body = None
+                json_decode_ok = False
         try:
-            body = resp.json()
-        except ValueError as exc:
-            raise OfficeApiError("UPSTREAM_BAD_RESPONSE", "office-api 返回非 JSON", resp.status_code) from exc
-        if not isinstance(body, dict):
-            return body, ""
-        code = next((body[k] for k in ("code", "errCode", "err_code") if k in body), None)
-        hint = business_hint(body, self.hint_max)
-        if code is not None and str(code) not in self.success_codes:
-            raise OfficeApiError("UPSTREAM_BIZ_ERROR", f"office-api 业务错误 code={code} {hint}".strip(),
-                                 resp.status_code, user_message=hint)
-        return (body.get("data", body) if code is not None or "data" in body else body), hint
+            return parse_envelope(
+                "oa_office",
+                resp.status_code,
+                body,
+                success_codes=self.success_codes,
+                hint_max=self.hint_max,
+                json_decode_ok=json_decode_ok,
+            )
+        except ConnectorError as exc:
+            raise OfficeApiError(
+                exc.code,
+                exc.message,
+                exc.http_status,
+                user_message=exc.user_message,
+            ) from exc
 
     def mint(self, oa: str, gateway_secret: str | None) -> MintResult:
         data = self._mint_request({"oa": oa}, gateway_secret)

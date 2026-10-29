@@ -79,9 +79,14 @@ def list_workflows(ctx: AdminCtx = Depends(admin_read(VIEW_ANY))):
                       "current_release": _release_view(current[0]) if current else None,
                       "draft_status": draft.status if draft else None})
     write_on = bool(ctx.runtime.settings_svc.effective(ctx.db, "runtime").get("write_workflows_enabled"))
+    from oa_agent.chat.service import get_pack_registry
+
     return {
         "items": items,
-        "catalog": workflow_catalog.list_entries(write_enabled=write_on),
+        "catalog": workflow_catalog.list_entries(
+            write_enabled=write_on,
+            pack_registry=get_pack_registry(ctx.runtime),
+        ),
     }
 
 

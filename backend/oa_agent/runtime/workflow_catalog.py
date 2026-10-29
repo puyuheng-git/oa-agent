@@ -55,11 +55,18 @@ def get(workflow_id: str) -> WorkflowEntry | None:
     return None
 
 
-def list_entries(*, write_enabled: bool) -> list[dict]:
-    """员工/管理端只读目录。写类在未开 flag 时仍列出，但 available=false。"""
+def list_entries(*, write_enabled: bool, pack_registry=None) -> list[dict]:
+    """员工/管理端只读目录。写类在未开 flag 时仍列出，但 available=false。
+
+    ``pack_registry`` 可选：归属 Domain Pack 且该包禁用时 available=false（原因 pack_disabled）。
+    """
     out = []
     for e in _ENTRIES:
         available = True if e.kind == "chat" else bool(write_enabled)
+        reason = None if available else "write_workflows_disabled"
+        if available and pack_registry is not None and not pack_registry.is_workflow_pack_enabled(e.workflow_id):
+            available = False
+            reason = "pack_disabled"
         out.append({
             "workflow_id": e.workflow_id,
             "name": e.name,
@@ -68,6 +75,6 @@ def list_entries(*, write_enabled: bool) -> list[dict]:
             "aliases": list(e.aliases),
             "start_params": list(e.start_params),
             "available": available,
-            "unavailable_reason": None if available else "write_workflows_disabled",
+            "unavailable_reason": reason,
         })
     return out

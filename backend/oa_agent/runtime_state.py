@@ -51,6 +51,7 @@ class AppRuntime:
         self.install_lock = threading.Lock()
         self.engine: AgentEngine | None = None
         self.wecom = None   # 企业微信长连接渠道（正常模式启动）
+        self.pack_registry = None  # PackRegistry | None；正常模式 boot 后挂载
         self.last_good_settings: dict[str, dict] = {}
         self.stats_cache: dict[tuple, tuple[float, dict]] = {}
 
@@ -75,10 +76,27 @@ class AppRuntime:
         self.engine = AgentEngine(self.settings, self.session, self.tenant_id, self._run_timeout,
                                   self._retention_days, self.setting)
         self.engine.start()
+        self._load_pack_registry()
         from oa_agent.channels.wecom import WeComChannel  # 依赖 chat.service，延迟导入避免循环
 
         self.wecom = WeComChannel(self)
         self.wecom.start()
+
+    def _load_pack_registry(self) -> None:
+        """扫描 packs 目录并挂载 PackRegistry；disabled_ids 来自 settings 组 packs。"""
+        from oa_agent.packs.registry import PackRegistry
+        from oa_agent.packs.state import load_disabled_ids
+
+        try:
+            disabled = load_disabled_ids(self.group_settings("packs"))
+        except Exception:  # noqa: BLE001 — 配置暂不可用时按全部默认启用
+            log.exception("读取 packs 启停配置失败，按默认启用加载 PackRegistry")
+            disabled = []
+        try:
+            self.pack_registry = PackRegistry.from_disk(disabled_ids=disabled)
+        except Exception:  # noqa: BLE001
+            log.exception("加载 PackRegistry 失败")
+            self.pack_registry = None
 
     def _ensure_migrated(self) -> None:
         """升级代码后直接启动 uvicorn（未走启动脚本）时补跑迁移；迁移只新增表/列。失败时 readyz 报告 migration_pending。"""

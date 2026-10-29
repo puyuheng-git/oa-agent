@@ -132,6 +132,28 @@ def test_http_json_connector_biz_error_maps_to_connector_error() -> None:
     assert "500" in err.message
 
 
+@respx.mock
+def test_http_json_connector_raw_json_returns_body_without_code_unwrap() -> None:
+    """raw_json：整段 JSON 即 data，不按 office {code,msg,data} 解包。"""
+    mock_base = "https://mock.example"
+    body = {"items": [{"id": 1}], "code": "500", "msg": "would-be-biz-error"}
+    route = respx.get(f"{mock_base}/api/items").mock(
+        return_value=httpx.Response(200, json=body),
+    )
+    conn = HttpJsonConnector(
+        "demo",
+        base_url=mock_base,
+        envelope_profile="raw_json",
+    )
+    result = conn.invoke("GET", "/api/items", authorization="Bearer tok")
+    assert isinstance(result, ConnectorResult)
+    assert result.http_status == 200
+    assert result.data == body
+    assert result.message == ""
+    assert route.called
+    assert route.calls.last.request.headers["Authorization"] == "Bearer tok"
+
+
 def test_connector_hub_from_legacy_office_base_url() -> None:
     hub = ConnectorHub.from_office_settings({"office_api_base_url": OFFICE_BASE})
     assert "office" in hub

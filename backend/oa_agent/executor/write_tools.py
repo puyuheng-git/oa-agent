@@ -11,7 +11,15 @@ from pathlib import Path
 
 import yaml
 
-from oa_agent.executor.executor import Identity, ToolError, ToolSpec, validate_args, _pick, REMARK_LIMIT
+from oa_agent.executor.executor import (
+    Identity,
+    ToolError,
+    ToolSpec,
+    authorization_for,
+    validate_args,
+    _pick,
+    REMARK_LIMIT,
+)
 from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, OfficeApiClient, OfficeApiError
 from oa_agent.observability.events import RunRecorder
 from oa_agent.settings import REPO_ROOT
@@ -130,7 +138,9 @@ class WriteToolExecutor:
             client = self.clients.get(spec.upstream)
             if client is None:
                 raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 office-api 地址：{spec.upstream}")
-            resp = client.post(spec.path, clean, identity.authorization, timeout=spec.timeout_seconds,
+            # write clients 均来自 OA upstreams 信任域，可回落 office 员工票
+            auth = authorization_for(identity, spec.upstream, allow_office_fallback=True)
+            resp = client.post(spec.path, clean, auth, timeout=spec.timeout_seconds,
                                idempotency_key=idempotency_key if spec.idempotent else None)
             data = resp.data if isinstance(resp.data, dict) else {}
             picked = _pick(data, spec.result_fields, REMARK_LIMIT)
