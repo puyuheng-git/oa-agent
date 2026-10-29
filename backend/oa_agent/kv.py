@@ -14,8 +14,25 @@ from typing import Protocol
 import redis
 
 from oa_agent.observability.redact import redact
+from oa_agent.settings import AppSettings
 
 log = logging.getLogger(__name__)
+
+
+class ProductionKVError(RuntimeError):
+    """生产环境未使用 Redis KV。"""
+
+
+def assert_production_kv(kv: KV, settings: AppSettings | None = None) -> None:
+    """require_redis 为真时，当前后端不得为 memory。"""
+    require = settings.require_redis if settings is not None else AppSettings().require_redis
+    if not require:
+        return
+    backend = getattr(kv, "backend", None)
+    if backend == "memory":
+        raise ProductionKVError(
+            "OA_AGENT_REQUIRE_REDIS 已启用，但当前 KV 仍为进程内 MemoryKV；请在管理后台配置 Redis"
+        )
 
 
 class KV(Protocol):

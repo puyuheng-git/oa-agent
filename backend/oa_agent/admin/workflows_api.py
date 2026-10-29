@@ -15,6 +15,8 @@ from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
 from oa_agent.db.models import AgentDefinition, ConfigRelease, LlmModel, Skill, WorkflowVersion
 from oa_agent.errors import AppError
 from oa_agent.runtime.graphs import travel_query
+from oa_agent.runtime.graphs.travel_query import resolve_workflow_id
+from oa_agent.runtime import workflow_catalog
 from oa_agent.runtime.releases import FIELDS, GROUPS, PUBLISHED, ReleaseError, ReleaseService, diff_content
 
 router = APIRouter(prefix="/v1/admin/workflows", tags=["admin-workflows"])
@@ -39,7 +41,7 @@ class RollbackIn(BaseModel):
 
 def _svc(ctx: AdminCtx, workflow_id: str) -> ReleaseService:
     svc: ReleaseService = ctx.runtime.engine.release_provider
-    if workflow_id != svc.workflow_id:
+    if resolve_workflow_id(workflow_id) != svc.workflow_id:
         raise AppError(404, "NOT_FOUND", "Workflow 不存在")
     return svc
 
@@ -76,7 +78,16 @@ def list_workflows(ctx: AdminCtx = Depends(admin_read(VIEW_ANY))):
         items.append({"agent_id": d.agent_id, "name": d.name, "workflow_id": d.workflow_id,
                       "current_release": _release_view(current[0]) if current else None,
                       "draft_status": draft.status if draft else None})
-    return {"items": items}
+    write_on = bool(ctx.runtime.settings_svc.effective(ctx.db, "runtime").get("write_workflows_enabled"))
+    from oa_agent.chat.service import get_pack_registry
+
+    return {
+        "items": items,
+        "catalog": workflow_catalog.list_entries(
+            write_enabled=write_on,
+            pack_registry=get_pack_registry(ctx.runtime),
+        ),
+    }
 
 
 @router.get("/{workflow_id}")

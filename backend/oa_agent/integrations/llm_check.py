@@ -19,7 +19,7 @@ def _fail(exc_or_resp) -> dict:
     return {"ok": False, "error": redact(f"{type(exc_or_resp).__name__}: {exc_or_resp}")}
 
 
-def check_provider(base_url: str, api_key: str | None, timeout: float) -> dict:
+def check_provider(base_url: str, api_key: str | None, timeout: float, *, limit: int = 50) -> dict:
     started = time.perf_counter()
     try:
         resp = httpx.get(f"{base_url.rstrip('/')}/models", headers=_headers(api_key), timeout=timeout)
@@ -28,11 +28,16 @@ def check_provider(base_url: str, api_key: str | None, timeout: float) -> dict:
     if resp.status_code != 200:
         return _fail(resp)
     try:
-        models = [m.get("id") for m in resp.json().get("data", []) if isinstance(m, dict)]
+        models = [m.get("id") for m in resp.json().get("data", []) if isinstance(m, dict) and m.get("id")]
     except ValueError:
         models = []
-    return {"ok": True, "latency_ms": int((time.perf_counter() - started) * 1000),
-            "model_count": len(models), "models": models[:50]}
+    return {
+        "ok": True,
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+        "model_count": len(models),
+        "truncated": len(models) > limit,
+        "models": models[:limit],
+    }
 
 
 def check_model(base_url: str, api_key: str | None, timeout: float, model: str) -> dict:

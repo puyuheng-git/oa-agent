@@ -5,14 +5,18 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
-from oa_agent.integrations.office_api import OfficeApiClient, OfficeApiError
+from oa_agent.connectors.base import ConnectorError
+from oa_agent.connectors.hub import ConnectorHub
+from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, OfficeApiClient, OfficeApiError
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.events import RunRecorder
 
 REMARK_LIMIT = 100
+MCP_DROPPED_ARGS = frozenset({"oa", "authorization", "token", "office_token"})  # 身份只由服务端持有，不外传
+MSG_NOT_AVAILABLE = "该功能未对你开放。"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -38,13 +42,88 @@ class Identity:
 
     oa: str
     authorization: str
+    principal_id: str = ""
+    credentials: dict = field(default_factory=dict)  # connector_id -> {authorization, expires_at}
+
+    def __post_init__(self) -> None:
+        if not self.principal_id:
+            self.principal_id = self.oa
+        if self.credentials is None:
+            self.credentials = {}
+
+
+def authorization_for(
+    identity: Identity,
+    connector_id: str | None,
+    *,
+    allow_office_fallback: bool = False,
+) -> str:
+    """按 connector 取 Authorization。
+
+    默认禁止跨 connector 默认同票。``allow_office_fallback=True`` 仅用于 OA
+    upstreams 信任域（认同同一员工 token 的 peer），可回落 office 凭证。
+    """
+    cid = (connector_id or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+    entry = (identity.credentials or {}).get(cid)
+    if isinstance(entry, dict) and entry.get("authorization"):
+        return str(entry["authorization"])
+    if cid == DEFAULT_UPSTREAM or allow_office_fallback:
+        if identity.authorization:
+            return identity.authorization
+        office = (identity.credentials or {}).get(DEFAULT_UPSTREAM)
+        if isinstance(office, dict) and office.get("authorization"):
+            return str(office["authorization"])
+    raise ToolError("CONNECTOR_CREDENTIAL_MISSING", f"会话缺少连接器凭证：{cid}")
+
+
+def _bound_param_names(spec: ToolSpec) -> set[str]:
+    """身份绑定目标参数名：模型不得写入。"""
+    names = set(getattr(spec, "inject_identity_fields", None) or ())
+    for binding in getattr(spec, "identity_bindings", None) or ():
+        if isinstance(binding, dict) and binding.get("param"):
+            names.add(str(binding["param"]))
+    return names
+
+
+def _effective_identity_bindings(spec: ToolSpec) -> list[dict]:
+    """显式 bindings 优先；否则由 inject_identity_fields 合成（现网 oa ← identity.oa）。"""
+    bindings = getattr(spec, "identity_bindings", None)
+    if bindings:
+        return [dict(b) for b in bindings if isinstance(b, dict)]
+    return [
+        {"param": f, "from": f"identity.{f}" if f == "oa" else f}
+        for f in (getattr(spec, "inject_identity_fields", None) or ())
+    ]
+
+
+def resolve_identity_binding(identity: Identity, source: str) -> str:
+    """从 Identity 解析 binding.from。M2：无 external_keys 时 oa 键回落 identity.oa。"""
+    src = (source or "").strip()
+    if src in ("identity.oa", "oa"):
+        return identity.oa
+    if src in ("principal_id", "identity.principal_id"):
+        return identity.principal_id
+    if src.startswith("principal.external_keys."):
+        key = src[len("principal.external_keys."):]
+        external = getattr(identity, "external_keys", None)
+        if isinstance(external, dict) and key in external and external[key] is not None:
+            return str(external[key])
+        if key == "oa":  # M2：Identity 尚无 external_keys 时与现网 oa 对齐
+            return identity.oa
+        return ""
+    if hasattr(identity, src):
+        return str(getattr(identity, src) or "")
+    return ""
 
 
 def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
     """返回 (清洗后的参数, 被丢弃的字段)。身份字段与未声明字段一律丢弃。"""
     clean: dict = {}
-    dropped = [k for k in args if k not in spec.model_params or k in spec.inject_identity_fields]
+    blocked = _bound_param_names(spec)
+    dropped = [k for k in args if k not in spec.model_params or k in blocked]
     for key, rule in spec.model_params.items():
+        if key in blocked:
+            continue
         value = args.get(key)
         if value is None or value == "":
             if rule.get("required"):
@@ -79,13 +158,20 @@ def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
 
 
 def build_request(spec: ToolSpec, args: dict, identity: Identity) -> dict:
+    bindings = _effective_identity_bindings(spec)
     if not spec.query_params_field:  # 没有 JSON 参数字段时全部作为普通查询参数
         params = dict(args)
+        for binding in bindings:
+            param = binding.get("param")
+            if param:
+                params[str(param)] = resolve_identity_binding(identity, str(binding.get("from") or ""))
     else:
         params = {k: args[k] for k in spec.top_level_fields if k in args}
         qp = {k: v for k, v in args.items() if k not in spec.top_level_fields}
-        for field in spec.inject_identity_fields:
-            qp[field] = getattr(identity, field)
+        for binding in bindings:
+            param = binding.get("param")
+            if param:
+                qp[str(param)] = resolve_identity_binding(identity, str(binding.get("from") or ""))
         params[spec.query_params_field] = json.dumps(qp, ensure_ascii=False, separators=(",", ":"))
     for name, field in spec.identity_params.items():  # 最后写入，覆盖任何同名参数
         params[name] = getattr(identity, field)
@@ -127,40 +213,134 @@ def _extract_list(data: object) -> tuple[list, int]:
 
 
 class ToolExecutor:
-    def __init__(self, registry: ToolRegistry, clients: dict[str, OfficeApiClient], remark_limit: int = REMARK_LIMIT):
-        """clients：地址标识 → office-api 客户端（见 office_api.upstream_clients）。"""
+    def __init__(self, registry: ToolRegistry, clients: dict[str, OfficeApiClient], remark_limit: int = REMARK_LIMIT,
+                 *, mcp_client: object | None = None, builtin_runtime: object | None = None,
+                 hub: ConnectorHub | None = None):
+        """clients：地址标识 → office-api 客户端（见 office_api.upstream_clients）；mcp_client：出站 MCP 客户端；
+        builtin_runtime：内置 Tool 运行时（None → 仅 time/calc 可用，export/memory 需注入带存储的运行时）；
+        hub：可选 ConnectorHub；有对应 connector 时优先 invoke，否则回退 clients。"""
         self.registry = registry
         self.clients = clients
         self.remark_limit = remark_limit
+        self.mcp_client = mcp_client  # None → 未配置出站连接器（调用即「未对你开放」）
+        self.builtin_runtime = builtin_runtime
+        self.hub = hub
+
+    def _execute_builtin(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder,
+                         node_name: str) -> dict:
+        """kind=builtin：由 BuiltinRuntime 执行；结果一律作为不可信数据围栏后回图（结构化结果不直接进模型）。"""
+        from oa_agent.executor.builtin_runtime import BuiltinRuntime
+        from oa_agent.security.prompt_guard import scan_flags, wrap_untrusted
+
+        name = spec.name
+        clean = {k: v for k, v in (args or {}).items() if k not in MCP_DROPPED_ARGS}
+        rec.tool_call_count += 1
+        rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,
+                  input_summary={"arg_names": sorted(clean)},
+                  metadata={"kind": "builtin", "builtin_id": spec.builtin_id})
+        started = time.perf_counter()
+        try:
+            runtime = self.builtin_runtime or BuiltinRuntime()
+            raw = runtime.call(spec, clean, identity=identity)
+        except ToolError as exc:
+            rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version,
+                      status="error", duration_ms=int((time.perf_counter() - started) * 1000),
+                      error_code=exc.code, error_summary=exc.message,
+                      metadata={"kind": "builtin", "builtin_id": spec.builtin_id})
+            raise
+        raw = dict(raw)
+        flags = {str(f) for f in (raw.pop("guard_flags", None) or [])}  # 运行时清洗阶段的标志；不回给模型
+        body = json.dumps(raw, ensure_ascii=False, default=str)
+        flags |= scan_flags(body)
+        text = wrap_untrusted(body, source="builtin", name=name)
+        rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
+                  duration_ms=int((time.perf_counter() - started) * 1000), output_summary={"result_count": 1},
+                  metadata={"kind": "builtin", "builtin_id": spec.builtin_id,
+                            **({"guard_flags": sorted(flags)} if flags else {})})
+        return {"ok": True, "capability": name, "data": {"text": text}, "message": ""}
+
+    def _execute_mcp(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
+        """kind=mcp：默认由 MCP 服务端校验参数，这里丢弃身份字段；spec.model_params 非空时先本地校验；结果一律作为不可信数据围栏后回图。"""
+        from oa_agent.executor.outbound import MAX_RESULT_BYTES, NoopOutboundMcpClient
+        from oa_agent.security.prompt_guard import scan_flags, wrap_untrusted
+
+        name = spec.name
+        clean = {k: v for k, v in (args or {}).items() if k not in MCP_DROPPED_ARGS}
+        rec.tool_call_count += 1
+        rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,
+                  input_summary={"arg_names": sorted(clean)}, metadata={"kind": "mcp"})
+        started = time.perf_counter()
+        try:
+            if not spec.mcp_server_id or not spec.mcp_tool_name:
+                raise ToolError("TOOL_NOT_AVAILABLE", f"MCP 工具未绑定连接：{name}", user_message=MSG_NOT_AVAILABLE)
+            if spec.model_params:  # 仅声明了 model_params 才本地校验；同步来的 MCP Tool 为空（远端 input_schema 未映射）
+                clean, _ = validate_args(spec, clean)
+            client = self.mcp_client or NoopOutboundMcpClient()
+            raw = client.call_tool(spec.mcp_tool_name, clean, identity=identity, server_id=spec.mcp_server_id)
+        except ToolError as exc:
+            rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version,
+                      status="error", duration_ms=int((time.perf_counter() - started) * 1000),
+                      error_code=exc.code, error_summary=exc.message, metadata={"kind": "mcp"})
+            raise
+        raw_text = str(raw.get("text") or "")
+        flags = scan_flags(raw_text)
+        text = wrap_untrusted(raw_text, source="mcp", name=name, max_chars=MAX_RESULT_BYTES)
+        rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
+                  duration_ms=int((time.perf_counter() - started) * 1000),
+                  output_summary={"result_count": 1, "truncated": bool(raw.get("truncated"))},
+                  metadata={"kind": "mcp", **({"guard_flags": sorted(flags)} if flags else {})})
+        # structured 不回图：它不经围栏，直接进模型会绕过不可信数据边界
+        return {"ok": True, "capability": name, "data": {"text": text, "truncated": bool(raw.get("truncated"))},
+                "message": ""}
 
     def execute(self, name: str, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
         spec = self.registry.get(name)
         if spec is None:
             raise ToolError("TOOL_NOT_AVAILABLE", f"Tool 未注册或未启用：{name}")
+        if spec.kind == "mcp":
+            return self._execute_mcp(spec, args, identity, rec, node_name)
+        if spec.kind == "builtin":
+            return self._execute_builtin(spec, args, identity, rec, node_name)
         clean, dropped = validate_args(spec, args)
+        connector_id = spec.upstream or DEFAULT_UPSTREAM
         rec.tool_call_count += 1
         rec.event("tool_call_start", node_name=node_name, tool_name=name, tool_version=spec.version,
                   input_summary=clean,
-                  metadata={"path": spec.path, "upstream": spec.upstream,
+                  metadata={"path": spec.path, "upstream": spec.upstream, "connector_id": connector_id,
                             **({"dropped_fields": dropped} if dropped else {})})
         started = time.perf_counter()
         try:
-            client = self.clients.get(spec.upstream)
-            if client is None:
+            params = build_request(spec, clean, identity)
+            connector = self.hub.get(spec.upstream) if self.hub is not None else None
+            client = None if connector is not None else self.clients.get(spec.upstream)
+            if connector is None and client is None:
                 raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 office-api 地址：{spec.upstream}")
-            resp = client.get(spec.path, build_request(spec, clean, identity), identity.authorization,
-                              timeout=spec.timeout_seconds)
+            # OA upstreams 目录 peer 共享 mint 员工票；其它 connector（如 raw_json demo）须显式凭证
+            share_office = client is not None or bool(
+                getattr(connector, "shares_employee_token", False)
+            )
+            auth = authorization_for(identity, connector_id, allow_office_fallback=share_office)
+            if connector is not None:
+                resp = connector.invoke(
+                    (spec.method or "GET").upper(),
+                    spec.path,
+                    params=params,
+                    authorization=auth,
+                    timeout=spec.timeout_seconds,
+                )
+            else:
+                resp = client.get(spec.path, params, auth, timeout=spec.timeout_seconds)
             result = compact(spec, resp.data, clean, self.remark_limit)
-        except (OfficeApiError, ToolError) as exc:
+        except (OfficeApiError, ConnectorError, ToolError) as exc:
             rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version,
                       status="error", duration_ms=int((time.perf_counter() - started) * 1000),
                       error_code=exc.code, error_summary=exc.message,
-                      metadata={"http_status": getattr(exc, "http_status", None)})
+                      metadata={"http_status": getattr(exc, "http_status", None), "connector_id": connector_id})
             raise ToolError(exc.code, exc.message, getattr(exc, "http_status", None),
                             getattr(exc, "user_message", "")) from exc
         count = len(result.get("list", [])) if spec.result_kind == "list" else (1 if result else 0)
         summary = {"result_count": count, "total": result.get("total")}
         rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
                   duration_ms=resp.duration_ms, output_summary={**summary, "message": resp.message} if resp.message
-                  else summary, metadata={"http_status": resp.http_status})
+                  else summary, metadata={"http_status": resp.http_status, "connector_id": connector_id})
         return {"ok": True, "capability": name, "data": result, "message": resp.message}

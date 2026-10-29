@@ -35,10 +35,12 @@ export const menuGroups: MenuGroup[] = [
 
 export const menu: MenuItem[] = [
   { path: '/runs', title: '运行记录', code: 'RUNS', perm: 'ops.run.view', group: 'monitor', icon: List, component: () => import('./views/RunsView.vue') },
+  { path: '/routing', title: '调用过程', code: 'ROUTING', perm: 'ops.run.view', group: 'monitor', icon: Share, component: () => import('./views/RoutingView.vue') },
   { path: '/conversations', title: '对话记录', code: 'DIALOGS', perm: 'ops.run.view_sensitive', group: 'monitor', icon: ChatDotRound, component: () => import('./views/ConversationsView.vue') },
   { path: '/employees', title: '员工治理', code: 'EMPLOYEES', perm: 'ops.employee.view', group: 'monitor', icon: User, component: () => import('./views/EmployeesView.vue') },
   { path: '/interventions', title: '介入中心', code: 'HANDOFF', perm: 'ops.intervention.handle', group: 'handoff', icon: Aim, component: () => import('./views/InterventionsView.vue') },
   { path: '/tools', title: 'Tool 管理', code: 'TOOLS', perm: 'ops.tool.manage', group: 'ability', icon: Tools, component: () => import('./views/ToolsView.vue') },
+  { path: '/mcp-servers', title: 'MCP 连接', code: 'MCP', perm: 'ops.mcp.manage', group: 'ability', icon: Connection, component: () => import('./views/McpServersView.vue') },
   { path: '/skills', title: 'Skill 管理', code: 'SKILLS', perm: 'ops.skill.manage', group: 'ability', icon: MagicStick, component: () => import('./views/SkillsView.vue') },
   { path: '/workflows', title: '流程配置', code: 'FLOWS', perm: 'ops.config.edit', group: 'ability', icon: Share, component: () => import('./views/WorkflowsView.vue') },
   { path: '/settings', title: '连接配置', code: 'LINKS', perm: 'sys.setting.view', group: 'access', icon: Link, component: () => import('./views/SettingsView.vue') },

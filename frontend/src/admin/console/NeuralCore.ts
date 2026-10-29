@@ -20,20 +20,23 @@ interface ModeState {
   scale: number
   rings: number
 }
+/** 各模式同尺寸、同机位，只调亮度/转速，登录与主页不会因缩放产生割裂 */
 const MODES: Record<CoreMode, ModeState> = {
-  dormant: { intensity: 0.45, spin: 0.3, camZ: CAMERA.distance + 3, scale: 0.85, rings: 0.15 },
+  dormant: { intensity: 0.5, spin: 0.35, camZ: CAMERA.distance, scale: 1, rings: 0.35 },
   active: { intensity: 1, spin: 1, camZ: CAMERA.distance, scale: 1, rings: 1 },
-  focus: { intensity: 0.55, spin: 0.5, camZ: CAMERA.distance - 5, scale: 1.05, rings: 0.25 },
-  awaken: { intensity: 2.2, spin: 3, camZ: CAMERA.distance - 2, scale: 1.35, rings: 1 },
+  focus: { intensity: 0.55, spin: 0.5, camZ: CAMERA.distance, scale: 1, rings: 0.25 },
+  awaken: { intensity: 1.15, spin: 1.15, camZ: CAMERA.distance, scale: 1, rings: 1 },
 }
 
-const PARTICLES = 14000
-const LINK_SAMPLE = 700
-const MAX_PULSES = 90
-const TRAIL = 4
+const PARTICLES = 8000
+const LINK_SAMPLE = 500
+const MAX_PULSES = 36
+const TRAIL = 3
 const FLASHES = 4
-const FLOW_PER_RING = 56
+const FLOW_PER_RING = 24
 const BRAIN_SCALE = 1.3
+/** 主页常态帧间隔；面板打开暂停渲染后不占用 GPU */
+const FRAME_MS = 1000 / 30
 
 /** 脑电波方向（前→后略带斜向）与放电闪烁，粒子与连线共用。 */
 const thinkingGlsl = /* glsl */ `
@@ -170,6 +173,7 @@ export class NeuralCore {
   private scanners: THREE.Line[] = []
   private ringMats: THREE.LineBasicMaterial[] = []
   private flows: { orbit: OrbitId; geo: THREE.BufferGeometry; mat: THREE.PointsMaterial }[] = []
+  private orbitRig = new THREE.Group()
   private stars: THREE.Points
 
   private mood: Mood = 'unknown'
@@ -183,21 +187,31 @@ export class NeuralCore {
   private pointer = new THREE.Vector2()
   private tmp = new THREE.Vector3()
   private rand = mulberry32(20261014)
+  private paused = false
+  private lastFrame = 0
+  private frameN = 0
+  private useBloom = true
+  private lerpRate = 2.5
 
   constructor(
     canvas: HTMLCanvasElement,
     private onFrame?: (dt: number) => void,
+    initialMode: CoreMode = 'active',
   ) {
+    this.mode = initialMode
+    this.cur = { ...MODES[initialMode] }
+    this.useBloom = initialMode === 'active' || initialMode === 'awaken'
     const w = canvas.clientWidth || window.innerWidth
     const h = canvas.clientHeight || window.innerHeight
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' })
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' })
+    // 核显上 dpr=2 + Bloom 代价很高；限制到 1.25
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25))
     this.renderer.setSize(w, h, false)
     // 纯黑清屏 + 画布 mix-blend-mode: screen，背景由页面 CSS 提供，只叠加发光部分
     this.renderer.setClearColor(0x000000, 1)
 
     this.camera = new THREE.PerspectiveCamera(CAMERA.fov, w / h, 0.1, 200)
-    this.camera.position.set(0, 0, CAMERA.distance)
+    this.camera.position.set(0, 0, this.cur.camZ)
     const ratio = this.renderer.getPixelRatio()
 
     const geo = generateBrain(PARTICLES, mulberry32(7))
@@ -286,13 +300,14 @@ export class NeuralCore {
       this.scene.add(line)
     }
     this.scene.add(this.brain)
+    this.scene.add(this.orbitRig)
 
     for (const id of ORBIT_ORDER) {
       const orbit = ORBITS[id]
       const pts = Array.from({ length: 257 }, (_, i) => new THREE.Vector3(...orbitPoint(orbit, (i / 256) * Math.PI * 2)))
       const mat = new THREE.LineBasicMaterial({ color: RING_COLOR[id], transparent: true, opacity: 0.32, blending: THREE.AdditiveBlending })
       this.ringMats.push(mat)
-      this.scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat))
+      this.orbitRig.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat))
 
       const fgeo = new THREE.BufferGeometry()
       fgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(FLOW_PER_RING * 3), 3))
@@ -305,7 +320,7 @@ export class NeuralCore {
         depthWrite: false,
       })
       this.flows.push({ orbit: id, geo: fgeo, mat: fmat })
-      this.scene.add(new THREE.Points(fgeo, fmat))
+      this.orbitRig.add(new THREE.Points(fgeo, fmat))
     }
 
     const starPos = new Float32Array(2000 * 3)
@@ -323,7 +338,7 @@ export class NeuralCore {
 
     this.composer = new EffectComposer(this.renderer)
     this.composer.addPass(new RenderPass(this.scene, this.camera))
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 1.0, 0.55, 0.08)
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.85, 0.5, 0.12)
     this.composer.addPass(this.bloom)
     this.composer.addPass(new OutputPass())
     this.composer.setSize(w, h)
@@ -338,6 +353,8 @@ export class NeuralCore {
 
   setMode(mode: CoreMode) {
     this.mode = mode
+    // focus / dormant 用直接渲染，跳过 Bloom 后处理
+    this.useBloom = mode === 'active' || mode === 'awaken'
   }
 
   /** 0..1，来自真实进行中运行数 */
@@ -345,8 +362,23 @@ export class NeuralCore {
     this.activity = Math.max(0, Math.min(1, level))
   }
 
+  /** 面板打开或二级菜单展开时暂停 RAF 内重活，避免滚动/点击卡顿 */
+  setPaused(paused: boolean) {
+    if (this.paused === paused) return
+    this.paused = paused
+    if (!paused) {
+      this.clock.getDelta()
+      this.lastFrame = 0
+    }
+  }
+
+  setLerpRate(rate: number) {
+    this.lerpRate = Math.max(0.2, rate)
+  }
+
   /** nx、ny ∈ [-1, 1] */
   setPointer(nx: number, ny: number) {
+    if (this.paused) return
     this.pointer.set(nx, ny)
   }
 
@@ -444,12 +476,15 @@ export class NeuralCore {
     }
   }
 
-  private tick = () => {
+  private tick = (now = performance.now()) => {
     this.raf = requestAnimationFrame(this.tick)
+    if (document.hidden || this.paused) return
+    if (now - this.lastFrame < FRAME_MS) return
     const dt = Math.min(this.clock.getDelta(), 0.05)
-    if (document.hidden) return
+    this.lastFrame = now
+    this.frameN++
     this.t += dt
-    const k = 1 - Math.exp(-dt * 2.5)
+    const k = 1 - Math.exp(-dt * this.lerpRate)
     const target = MODES[this.mode]
     for (const key of Object.keys(target) as (keyof ModeState)[]) this.cur[key] += (target[key] - this.cur[key]) * k
     this.color.lerp(this.targetColor, k)
@@ -479,19 +514,22 @@ export class NeuralCore {
     })
 
     this.ringMats.forEach((m) => (m.opacity = 0.32 * c.rings))
-    for (const f of this.flows) {
-      const orbit = ORBITS[f.orbit]
-      const arr = f.geo.attributes.position.array as Float32Array
-      for (let i = 0; i < FLOW_PER_RING; i++) {
-        const a = (i / FLOW_PER_RING) * Math.PI * 2 + this.t * orbit.speed * 4 + Math.sin(i * 12.9898) * 0.08
-        arr.set(orbitPoint(orbit, a), i * 3)
+    if (this.frameN % 2 === 0) {
+      for (const f of this.flows) {
+        const orbit = ORBITS[f.orbit]
+        const arr = f.geo.attributes.position.array as Float32Array
+        for (let i = 0; i < FLOW_PER_RING; i++) {
+          const a = (i / FLOW_PER_RING) * Math.PI * 2 + this.t * orbit.speed * 4 + Math.sin(i * 12.9898) * 0.08
+          arr.set(orbitPoint(orbit, a), i * 3)
+        }
+        f.geo.attributes.position.needsUpdate = true
+        f.mat.opacity = 0.9 * c.rings
+        f.mat.size = 0.09
       }
-      f.geo.attributes.position.needsUpdate = true
-      f.mat.opacity = 0.9 * c.rings
     }
 
     this.stars.rotation.y += dt * 0.006
-    this.bloom.strength = 0.45 + 0.35 * Math.min(1.5, c.intensity)
+    this.bloom.strength = 0.4 + 0.3 * Math.min(1.5, c.intensity)
 
     this.camera.position.x += (this.pointer.x * 1.4 - this.camera.position.x) * k
     this.camera.position.y += (this.pointer.y * 0.9 - this.camera.position.y) * k
@@ -499,6 +537,7 @@ export class NeuralCore {
     this.camera.lookAt(0, 0, 0)
 
     this.onFrame?.(dt)
-    this.composer.render()
+    if (this.useBloom) this.composer.render()
+    else this.renderer.render(this.scene, this.camera)
   }
 }

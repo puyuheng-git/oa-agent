@@ -20,8 +20,8 @@ from oa_agent.auth import chat_launch
 from oa_agent.auth.chat_launch import ChatSession
 from oa_agent.auth.rbac import request_meta
 from oa_agent.chat.service import (
-    chat_available, guard_message, handle_message, launch_policy, load_reply, load_settings, office_client,
-    setting, skill_menu, user_reply_for,
+    chat_available, confirm_write, guard_message, handle_message, launch_policy, load_reply, load_settings,
+    office_client, setting, skill_menu, start_workflow, user_reply_for, workflow_menu,
 )
 from oa_agent.chat import memory_store
 from oa_agent.chat.threads import (
@@ -67,6 +67,15 @@ class SwitchIn(BaseModel):
 
 class MemoryClearIn(BaseModel):
     confirm: Literal[True]
+
+
+class ConfirmationIn(BaseModel):
+    token: str = Field(min_length=10, max_length=128)
+
+
+class WorkflowStartIn(BaseModel):
+    client_msg_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    expense_id: int | None = Field(default=None, ge=1)
 
 
 class ChatAuth:
@@ -155,10 +164,32 @@ def _message_item(m: ConversationMessage) -> dict:
 
 def _session_extras(rt, *, oa: str, office_token: str = "") -> dict:
     """员工页面需要的能力与参数：可用功能、能否聊天、消息长度上限、转人工结果轮询参数。"""
-    return {"skills": skill_menu(rt, oa=oa, office_token=office_token), "chat": chat_available(rt),
+    return {"skills": skill_menu(rt, oa=oa, office_token=office_token),
+            "workflows": workflow_menu(rt),
+            "chat": chat_available(rt),
             "message_max_chars": int(setting(rt, "chat", "message_max_chars")),
             "poll_interval_seconds": int(setting(rt, "chat", "result_poll_seconds")),
             "poll_max_minutes": int(setting(rt, "runtime", "intervention_expire_minutes")) + 5}
+
+
+@router.get("/workflows")
+def list_chat_workflows(request: Request, auth: ChatAuth = Depends(chat_auth)):
+    """固定 Workflow 目录（写类未开 flag 时 available=false）。"""
+    return {"items": workflow_menu(get_runtime(request))}
+
+
+@router.post("/workflows/{workflow_id}/start")
+def start_chat_workflow(workflow_id: str, body: WorkflowStartIn, request: Request,
+                        auth: ChatAuth = Depends(chat_auth)):
+    """员工显式启动写类固定 Workflow（按钮入口）；对话类请走 /messages。"""
+    rt = get_runtime(request)
+    params = {}
+    if body.expense_id is not None:
+        params["expense_id"] = body.expense_id
+    return start_workflow(
+        rt, auth.session, workflow_id, params, getattr(request.state, "request_id", "") or body.client_msg_id,
+        session_key=chat_launch.session_key(auth.ticket),
+    )
 
 
 @router.get("/threads")
@@ -406,6 +437,13 @@ def delete_memory(
     if not ok:
         raise AppError(404, "MEMORY_NOT_FOUND", "记忆不存在")
     return {"ok": True}
+
+
+@router.post("/confirmations/{task_id}")
+def confirm_workflow(task_id: str, body: ConfirmationIn, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    """员工确认写操作：校验令牌后恢复固定 Workflow（管理员不能代确认）。"""
+    rt = get_runtime(request)
+    return confirm_write(rt, auth.session, task_id, body.token.strip(), request.state.request_id)
 
 
 @router.get("/runs/{run_id}")

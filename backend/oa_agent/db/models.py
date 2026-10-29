@@ -388,7 +388,39 @@ class Tool(Base):
     last_sync_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     last_sync_result: Mapped[str | None] = mapped_column(sa.String(16), nullable=True)
     last_sync_error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    kind: Mapped[str] = mapped_column(sa.String(16), default="office", server_default="office")
+    builtin_id: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    mcp_server_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    mcp_tool_name: Mapped[str | None] = mapped_column(sa.String(128), nullable=True)
+    sandbox_policy_json: Mapped[Any] = mapped_column(sa.JSON, nullable=True)
     updated_by: Mapped[str] = mapped_column(sa.String(64), default="")
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+
+class McpServer(Base):
+    """MCP 出站连接配置。env/headers 密钥经 SecretVault，API 只返掩码。"""
+
+    __tablename__ = "agent_mcp_server"
+    __table_args__ = (sa.UniqueConstraint("tenant_id", "name", name="uk_mcp_server_name"),)
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(sa.String(32), default=DEFAULT_TENANT)
+    name: Mapped[str] = mapped_column(sa.String(64))
+    display_name: Mapped[str] = mapped_column(sa.String(128), default="")
+    enabled: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    transport: Mapped[str] = mapped_column(sa.String(16))  # stdio | sse | http
+    command: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+    args_json: Mapped[Any] = mapped_column(sa.JSON, nullable=True)
+    env_json: Mapped[Any] = mapped_column(sa.JSON, nullable=True)
+    url: Mapped[str | None] = mapped_column(sa.String(512), nullable=True)
+    headers_secret_ref: Mapped[str | None] = mapped_column(sa.String(128), nullable=True)
+    timeout_seconds: Mapped[int] = mapped_column(sa.Integer, default=30, server_default="30")
+    tool_prefix: Mapped[str] = mapped_column(sa.String(32), default="", server_default="")
+    last_sync_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    last_sync_result: Mapped[str | None] = mapped_column(sa.String(16), nullable=True)
+    last_sync_error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(sa.String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
 

@@ -1,0 +1,13 @@
+id: oa_travel
+display_name: 行程报销
+version: "1"
+connectors: [office]
+default_enabled: true
+skills: ["../../skills/travel_expense_query.yaml"]
+tools_openapi: ["../../openapi/travel_expense.yaml"]
+write_contracts: ["../../contracts/travel_expense_write.yaml"]
+rules: rules/intent.yaml
+workflows:
+  - id: travel_reimburse_submit
+    kind: write
+    graph: oa_agent.runtime.graphs.travel_reimburse_submit

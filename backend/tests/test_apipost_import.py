@@ -131,7 +131,7 @@ def test_missing_required_params_asks_instead_of_help():
     ctx = SimpleNamespace(tools=lambda: tools, config={}, skills=[skill], delta=lambda: None, streamed=False,
                           num=lambda key: tq.DEFAULT_CONFIG[key])
     reply = tq.respond(parsed, ctx)["reply"]
-    assert "未接收合同查" in reply["content"] and "合同编号、流水号" in reply["content"]
+    assert "未接收合同" in reply["content"] and "合同编号" in reply["content"] and "流水" in reply["content"]
 
     full = tq._normalize_llm({"tool": spec.name, "args": {"ht_bh": "HT1", "run_id": "R1"}}, tools)
     assert full == {"intent": tq.TOOL, "tool": spec.name, "params": {"ht_bh": "HT1", "run_id": "R1"}}

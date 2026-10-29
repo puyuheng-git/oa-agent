@@ -1,0 +1,2 @@
+# demo_http：无确定性意图规则（仅保证 Pack 可发现与聚合）
+rule_tools: {}

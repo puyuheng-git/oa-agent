@@ -83,7 +83,8 @@ def test_model_call_logged_without_reasoning(admin, chat, office, monkeypatch):
     call = d["model_calls"][0]
     assert call["model"] == "fake-model" and call["status"] == "ok" and call["run_id"] == run.run_id
     assert [m["role"] for m in call["messages"]] == ["system", "human"]
-    assert call["messages"][1]["content"] == "查九月的行程报销"
+    assert "查九月的行程报销" in call["messages"][1]["content"]
+    assert call["messages"][1]["content"].startswith("<<<UNTRUSTED_DATA source=user")
     assert call["parsed"]["tool"] == "query_my_travel_expense_list" and call["usage"]["prompt_tokens"] == 5
     assert "行程报销查询" in call["messages"][0]["content"], "提示词包含 Skill 说明"
     assert "隐藏推理内容" not in json.dumps(d, ensure_ascii=False)

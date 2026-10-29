@@ -48,8 +48,11 @@ export const TASK_KIND: Record<string, string> = {
 
 // ---------------- Tool / Skill ----------------
 
+export type ToolKind = 'office' | 'builtin' | 'mcp'
+
 export interface ToolItem {
   name: string
+  kind?: ToolKind
   summary: string
   method: string | null
   path: string | null
@@ -59,6 +62,10 @@ export interface ToolItem {
   spec_enabled: boolean
   risk_level: string
   requires_confirmation: boolean
+  builtin_id?: string | null
+  mcp_server_id?: number | null
+  mcp_tool_name?: string | null
+  sandbox_policy?: Record<string, unknown> | null
   registered: boolean
   unregistered_reasons: string[]
   current_version_no: number | null
@@ -82,9 +89,40 @@ export interface ToolVersion {
   is_pending: boolean
 }
 
+export interface ToolGuide {
+  kind: ToolKind | string
+  summary?: string
+  how?: string
+  constraints?: string[]
+  runtime?: string
+  edit_hint?: string
+  builtin_id?: string
+  risk_level?: string
+  default_enabled?: boolean
+  needs_sandbox?: boolean
+  default_sandbox_policy?: Record<string, unknown>
+  sandbox_policy?: Record<string, unknown> | null
+  model_params?: Record<string, { type?: string; label?: string; description?: string; required?: boolean; enum?: string[] }>
+  identity_params?: Record<string, unknown>
+  result?: Record<string, unknown>
+  http?: { method?: string | null; path?: string | null; upstream?: string; timeout_seconds?: number }
+  mcp_server?: {
+    id?: number
+    name?: string | null
+    display_name?: string | null
+    transport?: string | null
+    enabled?: boolean
+    missing?: boolean
+  } | null
+  mcp_tool_name?: string | null
+  description?: string | null
+  input_schema?: Record<string, unknown> | null
+}
+
 export interface ToolDetail extends ToolItem {
   versions: ToolVersion[]
   current_schema: Record<string, any> | null
+  guide?: ToolGuide | null
 }
 
 export interface DiffChange {

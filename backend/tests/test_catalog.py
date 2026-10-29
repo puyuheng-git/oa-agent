@@ -11,7 +11,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from oa_agent.executor.catalog import BREAKING, COMPATIBLE, SpecError, compare, parse_openapi
-from oa_agent.runtime.graphs import travel_query
+from oa_agent.runtime.graphs import travel_query, oa_assistant
 from oa_agent.settings import REPO_ROOT
 from tests.conftest import audit_rows, login
 from tests.test_accounts_rbac import VIEWER_PASS, _role, _user
@@ -45,7 +45,8 @@ def list_op(doc: dict) -> dict:
 
 
 def tools_by_name(admin) -> dict:
-    r = admin.get("/v1/admin/tools")
+    """OpenAPI（office）Tool；启动时 upsert 的 builtin.* 内置工具不在此列。"""
+    r = admin.get("/v1/admin/tools?kind=office")
     assert r.status_code == 200, r.text
     return {t["name"]: t for t in r.json()["items"]}
 
@@ -57,6 +58,28 @@ def test_boot_sync_registers_tools_and_skill(admin):
     skills = admin.get("/v1/admin/skills").json()["items"]
     assert skills[0]["name"] == "travel_expense_query" and skills[0]["validation_status"] == "valid"
     assert runtime(admin.client).engine.registry.get(LIST_TOOL).version == "1.0.0#v1"
+
+
+def test_list_tools_serializes_kind_and_filters(admin):
+    from oa_agent.db.models import Tool
+
+    rt = runtime(admin.client)
+    with rt.session() as db, db.begin():
+        db.add(Tool(tenant_id=rt.tenant_id, name="_kind_builtin", kind="builtin", builtin_id="calc",
+                    summary="内置", enabled=True))
+    all_items = admin.get("/v1/admin/tools").json()["items"]
+    assert all("kind" in t for t in all_items)
+    assert {t["kind"] for t in all_items} >= {"office", "builtin"}
+
+    office_items = admin.get("/v1/admin/tools?kind=office").json()["items"]
+    assert office_items and {t["kind"] for t in office_items} == {"office"}
+    assert {t["name"] for t in office_items} == {LIST_TOOL, DETAIL_TOOL}
+
+    builtin_items = admin.get("/v1/admin/tools?kind=builtin").json()["items"]
+    names = {t["name"] for t in builtin_items}
+    assert "_kind_builtin" in names and "builtin.time" in names  # 启动 upsert 的内置工具也在列
+    assert admin.get("/v1/admin/tools?kind=mcp").json()["items"] == []
+    assert admin.get("/v1/admin/tools?kind=bogus").status_code == 422
 
 
 def test_spec_validation_rejects_identity_params(tmp_path):
@@ -159,14 +182,14 @@ def test_tool_disabled_mid_run_is_refused(chat, office, admin, monkeypatch):
     """运行已开始（已选定 Tool）后 Tool 被停用：执行器按最新注册表拒绝调用"""
     rt = runtime(chat)
     route = office.get(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": []}}))
-    original = travel_query._rules
+    original = oa_assistant._rules
 
     def rules_then_disable(*args):
         out = original(*args)
         rt.engine.registry = type(rt.engine.registry)({})
         return out
 
-    monkeypatch.setattr(travel_query, "_rules", rules_then_disable)
+    monkeypatch.setattr(oa_assistant, "_rules", rules_then_disable)
     body = send(chat, open_chat(chat), "查上周的行程报销").json()
     assert body["reply"]["error_code"] == "TOOL_NOT_AVAILABLE" and route.call_count == 0
 

@@ -40,7 +40,7 @@ const TOOLTIP = {
   backgroundColor: 'rgba(10, 18, 34, 0.95)',
   borderColor: 'rgba(34, 211, 238, 0.4)',
   textStyle: { color: '#e2e8f0', fontSize: 12 },
-  extraCssText: 'box-shadow: 0 0 16px rgba(34,211,238,0.25); backdrop-filter: blur(6px);',
+  extraCssText: 'box-shadow: 0 0 16px rgba(34,211,238,0.25);',
 }
 
 const linear = (from: string, to: string) => ({

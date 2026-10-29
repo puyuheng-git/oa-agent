@@ -20,6 +20,8 @@ class AppSettings(BaseSettings):
     tenant_id: str = "dscpa"
     allow_sqlite: bool = False
     """仅测试使用：允许安装向导以 SQLite 代替 MySQL。"""
+    require_redis: bool = False
+    """生产多实例须为 True；为 True 时进程内 MemoryKV 会在启动校验中被拒绝。"""
 
     @property
     def bootstrap_path(self) -> Path:

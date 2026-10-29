@@ -74,3 +74,82 @@ def test_readyz_reports_llm_configured_not_checked(admin):
     admin.post("/v1/admin/llm/models", json={"provider_id": p["id"], "model_name": "x"})
     llm = admin.get("/readyz").json()["llm"]
     assert llm["status"] == "已配置（未检测）"
+
+
+@respx.mock
+def test_remote_models_lists_from_provider(admin):
+    p = _create_provider(admin)
+    respx.get("https://llm.example.com/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}))
+    r = admin.get(f"/v1/admin/llm/providers/{p['id']}/remote-models")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["models"] == ["a", "b", "c"]
+    assert body["model_count"] == 3
+    assert body["truncated"] is False
+    assert "latency_ms" in body
+    assert API_KEY not in r.text
+
+
+@respx.mock
+def test_remote_models_truncated_at_200(admin):
+    p = _create_provider(admin)
+    data = [{"id": f"m{i}"} for i in range(250)]
+    respx.get("https://llm.example.com/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": data}))
+    body = admin.get(f"/v1/admin/llm/providers/{p['id']}/remote-models").json()
+    assert body["ok"] is True
+    assert body["model_count"] == 250
+    assert body["truncated"] is True
+    assert len(body["models"]) == 200
+    assert body["models"][0] == "m0"
+    assert body["models"][-1] == "m199"
+
+
+@respx.mock
+def test_provider_test_still_limits_to_50(admin):
+    p = _create_provider(admin)
+    data = [{"id": f"m{i}"} for i in range(60)]
+    respx.get("https://llm.example.com/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": data}))
+    body = admin.post(f"/v1/admin/llm/providers/{p['id']}/test").json()
+    assert body["ok"] is True
+    assert body["model_count"] == 60
+    assert body["truncated"] is True
+    assert len(body["models"]) == 50
+
+
+def test_remote_models_without_api_key(admin):
+    p = _create_provider(admin)
+    admin.put(f"/v1/admin/llm/providers/{p['id']}", json={
+        "name": "deepseek", "base_url": "https://llm.example.com/v1", "clear_api_key": True})
+    body = admin.get(f"/v1/admin/llm/providers/{p['id']}/remote-models").json()
+    assert body["ok"] is False
+    assert "API Key" in body["error"] or "api key" in body["error"].lower() or "密钥" in body["error"]
+
+
+@respx.mock
+def test_remote_models_failure_redacts_key(admin):
+    p = _create_provider(admin)
+    respx.get("https://llm.example.com/v1/models").mock(
+        return_value=httpx.Response(401, text=f"invalid api key {API_KEY}"))
+    body = admin.get(f"/v1/admin/llm/providers/{p['id']}/remote-models").json()
+    assert body["ok"] is False and "401" in body["error"]
+    assert API_KEY not in body["error"]
+
+
+def test_remote_models_provider_not_found(admin):
+    assert admin.get("/v1/admin/llm/providers/99999/remote-models").status_code == 404
+
+
+def test_remote_models_forbidden_without_view(admin, installed):
+    from fastapi.testclient import TestClient
+    from tests.conftest import login
+
+    role = admin.post("/v1/admin/roles", json={"code": "no_setting", "name": "no_setting", "perm_codes": []}).json()
+    admin.post("/v1/admin/accounts", json={
+        "username": "nolmview", "password": "Reader!Passw0rd1", "role_ids": [role["id"]]})
+    other = login(TestClient(installed.app), "nolmview", "Reader!Passw0rd1")
+    p = _create_provider(admin)
+    assert other.get(f"/v1/admin/llm/providers/{p['id']}/remote-models").status_code == 403

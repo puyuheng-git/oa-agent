@@ -123,7 +123,7 @@ onMounted(load)
             长连接状态：{{ wecomStatus.status || '未知' }}{{ wecomStatus.error ? '：' + wecomStatus.error : '' }}
             <el-button link type="primary" style="margin-left: 8px" @click="refreshWecom">刷新</el-button>
           </template>
-          <div>只支持单聊；员工身份由 OA 按企业微信绑定关系解析（office-api mint 接口需支持 wework_user_id）。同一机器人只能有一个连接，请勿多实例部署。</div>
+          <div>只支持单聊；员工身份由 OA 按企业微信绑定关系解析（签发入口 mint 需支持 wework_user_id）。同一机器人只能有一个连接，请勿多实例部署。</div>
         </el-alert>
         <el-form v-if="forms[g.group]" label-width="260px" style="max-width: 900px" :disabled="!editable">
           <el-form-item v-for="f in g.fields" :key="f.key" :label="f.label">
@@ -148,16 +148,16 @@ onMounted(load)
                 @click="forms[g.group][f.key] = f.default">恢复默认</el-button>
             </div>
             <div v-else-if="f.kind === 'upstreams'" style="width: 100%">
-              <el-table :data="forms[g.group][f.key]" size="small" border empty-text="未配置（Tool 只能走主地址）">
+              <el-table :data="forms[g.group][f.key]" size="small" border empty-text="未配置（请至少添加一个业务上游）">
                 <el-table-column label="标识" width="150">
-                  <template #default="{ row }"><el-input v-model="row.key" size="small" placeholder="如 hr" /></template>
+                  <template #default="{ row }"><el-input v-model="row.key" size="small" placeholder="如 office" /></template>
                 </el-table-column>
                 <el-table-column label="名称" width="150">
-                  <template #default="{ row }"><el-input v-model="row.label" size="small" placeholder="如 人事网关" /></template>
+                  <template #default="{ row }"><el-input v-model="row.label" size="small" placeholder="如 办公接口" /></template>
                 </el-table-column>
                 <el-table-column label="地址" min-width="220">
                   <template #default="{ row }">
-                    <el-input v-model="row.base_url" size="small" placeholder="https://hr-api.example.com/api" />
+                    <el-input v-model="row.base_url" size="small" placeholder="https://api.example.com" />
                   </template>
                 </el-table-column>
                 <el-table-column label="" width="60">

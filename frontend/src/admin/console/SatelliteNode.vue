@@ -133,7 +133,8 @@ const BANDS = [-30, -22, -12, 12, 20, 30]
   height: 64px;
   display: grid;
   place-items: center;
-  transition: transform 0.3s cubic-bezier(0.2, 0.9, 0.3, 1.4);
+  /* 无过冲：过冲缩放容易在悬停时看起来像链条在抖 */
+  transition: transform 0.25s ease, filter 0.25s ease;
   filter: drop-shadow(0 0 5px color-mix(in srgb, var(--c) 70%, transparent));
 }
 .halo {
@@ -314,7 +315,7 @@ const BANDS = [-30, -22, -12, 12, 20, 30]
 }
 .sat:hover .glyph,
 .sat:focus-visible .glyph {
-  transform: scale(1.18);
+  transform: scale(1.1);
   filter: drop-shadow(0 0 10px var(--c));
 }
 .sat:hover .label,

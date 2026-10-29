@@ -20,7 +20,9 @@ def test_list_groups_masks_secrets(admin):
 
 def test_oa_secrets_write_only_and_audited(admin):
     r = admin.put("/v1/admin/settings/oa", json={"values": {
-        "office_api_base_url": "https://office.example.com/api/",
+        "mint_base_url": "https://office.example.com/api/",
+        "upstreams": [{"key": "office", "label": "office-api", "base_url": "https://office.example.com/api/"}],
+        "default_upstream_key": "office",
         "gateway_secret": GW_SECRET,
         "assertion_hmac_secret": HMAC_SECRET,
         "allowed_frame_origins": "https://oa.example.com, https://oa2.example.com",
@@ -29,7 +31,8 @@ def test_oa_secrets_write_only_and_audited(admin):
     assert GW_SECRET not in r.text and HMAC_SECRET not in r.text
     vals = r.json()["group"]["values"]
     assert vals["gateway_secret"]["display"] == "已设置 · ****1234"
-    assert vals["office_api_base_url"] == "https://office.example.com/api"
+    assert vals["mint_base_url"] == "https://office.example.com/api"
+    assert vals["upstreams"][0]["base_url"] == "https://office.example.com/api"
     assert vals["allowed_frame_origins"] == ["https://oa.example.com", "https://oa2.example.com"]
 
     got = admin.get("/v1/admin/settings/oa").text
@@ -51,9 +54,9 @@ def test_oa_secrets_write_only_and_audited(admin):
 
 
 def test_untouched_defaults_not_reported_as_changed(admin):
-    r = admin.put("/v1/admin/settings/oa", json={"values": {"office_api_base_url": "https://o.example.com",
+    r = admin.put("/v1/admin/settings/oa", json={"values": {"mint_base_url": "https://o.example.com",
                                                             "allowed_frame_origins": ""}})
-    assert r.json()["changed"] == ["office_api_base_url"]
+    assert r.json()["changed"] == ["mint_base_url"]
 
 
 def test_frame_origins_normalized_and_validated(admin):

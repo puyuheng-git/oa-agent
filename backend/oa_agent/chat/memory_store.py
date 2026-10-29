@@ -278,6 +278,9 @@ def forget_by_match(
 
 
 def format_injection(rows: list[EmployeeMemory], *, char_limit: int = 800) -> str:
+    from oa_agent.chat.memory_guard import filter_injection_rows
+
+    rows = filter_injection_rows(rows)
     if not rows:
         return ""
     lines = [INJECTION_HEAD, ""]

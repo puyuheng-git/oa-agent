@@ -4,8 +4,20 @@
 > 你确认关键决断后，再拆成多个独立 spec → 详细 implementation plan → 分阶段实现。  
 > **权威设计冲突时以** `docs/design/2026-10-09-oa-langgraph-design.md` **为准。**
 
+> **覆盖说明（2026-10-26）：** 与 [`2026-10-26 remediation`](../specs/2026-10-26-remediation-o1-o6-design.md) 冲突时以纠偏规格为准；本路线图仍描述 E→C→A→D→B 总序，具体 workflow 命名、写闭环门禁与 O1–O6 里程碑以纠偏文档为准。
+
 **日期：** 2026-10-23  
 **状态：** 关键决断已锁定（2026-10-23）；其余决断待各子系统开工前补齐  
+**进度快照（2026-10-28）：** 详见 [`docs/STATUS.md`](../../STATUS.md)
+
+| 子系统 | 状态 |
+|--------|------|
+| **E** 历史会话 | ✅ 已交付 |
+| **C** Skill 可见性（后台规则一期） | ✅ 已交付；OA 标签 TagProvider 待接 |
+| **A** 长期记忆 | ✅ 已交付；Profile 未做 |
+| **D** 固定 Workflow | ✅ 注册表 + 员工 start API（2026-10-28）；写闭环仍 flag + OA MVP-3 |
+| **B** 多 Agent | ✅ O5 L1 已挂主引擎（默认 general；可配 finance） |
+| 横切 | Tool 路由六模式 ✅；出站 MCP 一期 ✅；LLM 远端模型列表 ✅ |
 
 ### 已锁定决断
 
@@ -22,7 +34,7 @@
 | **D7** | **B** | 模型选不可见 Tool → 明确告知未开放 |
 | **D16** | **B** | C 一期无 OA 标签联调：后台规则 + TagProvider 预留 |
 | **D17** | **A** | 可见性只挂 Skill |
-| **D18** | **A** | 出站 MCP 仅接口 + 安全边界 + Noop |
+| **D18** | **A** → **D18′（2026-10-27 修订）** | 出站 MCP 原为仅接口 + 安全边界 + Noop；现演进为可配置真实出站 Client（Noop 仅作未配置回退），见 [`specs/2026-10-27-mcp-builtin-tool-guard-design.md`](../specs/2026-10-27-mcp-builtin-tool-guard-design.md) |
 | **D19** | **C** | 无可见性规则 = 不启裁剪（同现网） |
 | **D8** | **C** | A 一期不做 Profile，只做长期记忆 |
 | **D9** | **A** | 长期记忆仅显式「请记住」写入 |

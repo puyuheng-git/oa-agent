@@ -296,7 +296,8 @@ def test_reopen_thread_keeps_checkpoint_history(chat, office, monkeypatch):
     assert "第一轮回复" in history[1][1]
     assert history[2][1] == "第二条消息"
     assert "第二轮回复" in history[3][1]
-    assert third[-1] == ("human", "第三条消息")
+    assert third[-1][0] == "human" and third[-1][1].startswith("<<<UNTRUSTED_DATA source=user")
+    assert "第三条消息" in third[-1][1]
 
 
 def test_list_create_switch_messages_delete(chat, office):

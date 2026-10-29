@@ -53,11 +53,13 @@ def _decode(row: dict, columns: set[str]) -> dict:
 
 class EventSink:
     def __init__(self, session_factory: Callable[[], Session], spool_dir: Path, maxsize: int = 10_000,
-                 batch_size: int = 200):
+                 batch_size: int = 200, *, sync_write: bool = False):
+        """sync_write=True 时 emit 直写数据库（单测/排障）；默认 False 走有界队列 + 后台批量写。"""
         self._session_factory = session_factory
         self._spool_dir = spool_dir
         self._queue: queue.Queue[dict] = queue.Queue(maxsize=maxsize)
         self._batch_size = batch_size
+        self.sync_write = sync_write
         self._stop = threading.Event()
         self._idle = threading.Event()
         self._idle.set()
@@ -91,6 +93,9 @@ class EventSink:
 
     # ---- producer side ----
     def emit(self, event: dict) -> None:
+        if self.sync_write:
+            self._write_batch([event])
+            return
         try:
             self._queue.put_nowait(event)
         except queue.Full:

@@ -26,6 +26,9 @@ from sqlalchemy.orm import Session
 from oa_agent.db.models import Skill, SkillVersion, Tool, ToolVersion
 from oa_agent.db.types import utcnow
 from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, UPSTREAM_KEY_RE
+from oa_agent.executor.builtin_catalog import (
+    TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_model_params, ensure_builtin_tools,
+)
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.redact import redact
 from oa_agent.settings import REPO_ROOT
@@ -40,9 +43,68 @@ RESULT_KINDS = {"list", "object"}
 RISK_LEVELS = {"low", "medium", "high"}
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+# identity_bindings.from：现网 oa / principal_id / principal.external_keys.*
+_BINDING_FROM_SIMPLE = frozenset({"oa", "identity.oa", "principal_id", "identity.principal_id"})
+_EXTERNAL_KEY_FROM_RE = re.compile(r"^principal\.external_keys\.([A-Za-z_][A-Za-z0-9_]{0,63})$")
 ADMIN_SOURCE = "admin"
 MAX_TEXT = 2000
 MAX_EXAMPLES = 10
+
+
+def _validate_binding_from(source: str) -> bool:
+    if source in _BINDING_FROM_SIMPLE:
+        return True
+    return _EXTERNAL_KEY_FROM_RE.fullmatch(source) is not None
+
+
+def synthesize_identity_bindings(inject: list[str] | tuple[str, ...]) -> list[dict]:
+    """旧 inject_identity_fields → bindings；现网 oa ← identity.oa。"""
+    out: list[dict] = []
+    for field in inject:
+        source = f"identity.{field}" if field in IDENTITY_FIELDS else field
+        out.append({"param": field, "from": source})
+    return out
+
+
+def _normalize_identity_bindings(
+    name: str, xa: dict, inject: list[str], params: dict, errors: list[str],
+) -> tuple[list[dict], bool]:
+    """显式 identity_bindings 优先；否则由 inject 合成。返回 (bindings, explicit_in_schema)。
+
+    由 inject 合成时不写入规范化 schema（避免现网 OpenAPI 哈希漂移）；运行时 to_tool_spec 再合成。
+    """
+    raw = xa.get("identity_bindings")
+    bindings: list[dict] = []
+    explicit = False
+    if raw is not None:
+        explicit = True
+        if not isinstance(raw, list):
+            errors.append(f"{name}.identity_bindings 必须是数组")
+            return [], True
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                errors.append(f"{name}.identity_bindings[{i}] 必须是对象")
+                continue
+            param = str(item.get("param") or "").strip()
+            source = str(item.get("from") or "").strip()
+            if not param or not FIELD_RE.match(param):
+                errors.append(f"{name}.identity_bindings[{i}].param 无效")
+                continue
+            if not source or not _validate_binding_from(source):
+                errors.append(
+                    f"{name}.identity_bindings[{i}].from 只允许 "
+                    f"identity.oa / oa / principal_id / principal.external_keys.<key>"
+                )
+                continue
+            bindings.append({"param": param, "from": source})
+    elif inject:
+        bindings = synthesize_identity_bindings(inject)
+
+    bound_params = {b["param"] for b in bindings}
+    leaked = set(params) & bound_params
+    if leaked:
+        errors.append(f"{name}.model_params 不得包含身份绑定参数 {sorted(leaked)}（身份只能由服务端注入）")
+    return bindings, explicit
 
 UNCHANGED, COMPATIBLE, BREAKING, INITIAL = "unchanged", "compatible", "breaking", "initial"
 
@@ -103,6 +165,7 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
     leaked = set(params) & IDENTITY_FIELDS
     if leaked:
         errors.append(f"{name}.model_params 不得包含身份字段 {sorted(leaked)}（身份只能由服务端注入）")
+    bindings, bindings_explicit = _normalize_identity_bindings(name, xa, inject, params, errors)
     result = xa.get("result") or {}
     kind = result.get("kind", "object")
     if kind not in RESULT_KINDS:
@@ -119,7 +182,8 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
     if not set(columns) <= set(fields):
         errors.append(f"{name}.result.list_columns 只能从返回字段中选择")
     query_field = xa.get("query_params_field")
-    if inject and not query_field:
+    needs_qp = bool(inject) or bool(bindings)
+    if needs_qp and not query_field:
         errors.append(f"{name} 需要注入身份字段但未声明 query_params_field")
     identity_params = xa.get("identity_params") or {}
     if not isinstance(identity_params, dict):
@@ -161,6 +225,9 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
         "result": {"kind": kind, "fields": fields, "labels": labels,
                    "list_columns": [c for c in columns if c in fields]},
     }
+    if bindings_explicit:
+        # 仅显式声明写入 schema（哈希）；inject 合成留给 to_tool_spec
+        spec["identity_bindings"] = bindings
     if upstream != DEFAULT_UPSTREAM:  # 默认值不写入，已有版本的哈希保持不变
         spec["upstream"] = upstream
     return spec, errors
@@ -198,6 +265,8 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
                        "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or []},
         },
     }
+    if form.get("identity_bindings") is not None:
+        op["x-agent"]["identity_bindings"] = form.get("identity_bindings") or []
     if not str(op["summary"]).strip():
         errors.append("请填写 Tool 名称说明（summary）")
     for key in [*(op["x-agent"]["model_params"] or {}), *(op["x-agent"]["result"]["fields"] or []),
@@ -267,6 +336,8 @@ def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
             add(key, "changed", old.get(key), new.get(key), True)
     if (old.get("identity_params") or {}) != (new.get("identity_params") or {}):
         add("identity_params", "changed", old.get("identity_params"), new.get("identity_params"), True)
+    if (old.get("identity_bindings") or []) != (new.get("identity_bindings") or []):
+        add("identity_bindings", "changed", old.get("identity_bindings"), new.get("identity_bindings"), True)
     for key in ("summary", "description", "timeout_seconds"):
         if old.get(key) != new.get(key):
             add(key, "changed", old.get(key), new.get(key))
@@ -360,9 +431,23 @@ def parse_skill(path: Path) -> tuple[str, dict]:
 
 # ---------------- 运行时视图 ----------------
 
-def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: str) -> ToolSpec:
+def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: str, *, kind: str = "office",
+                 builtin_id: str | None = None, mcp_server_id: int | None = None,
+                 mcp_tool_name: str | None = None, sandbox_policy: dict | None = None) -> ToolSpec:
     result = schema["result"]
+    text_result = (kind or "office") != "office"  # mcp / builtin：结果统一为围栏文本 {"text": ...}
+    inject = tuple(schema.get("inject_identity_fields") or ())
+    raw_bindings = schema.get("identity_bindings")
+    if raw_bindings:
+        bindings = tuple(dict(b) for b in raw_bindings if isinstance(b, dict))
+    else:
+        bindings = tuple(synthesize_identity_bindings(inject))
     return ToolSpec(
+        kind=kind or "office",
+        builtin_id=builtin_id,
+        mcp_server_id=mcp_server_id,
+        mcp_tool_name=mcp_tool_name,
+        sandbox_policy=dict(sandbox_policy or {}),
         summary=schema.get("summary") or "",
         description=schema.get("description") or "",
         result_labels=dict(result.get("labels") or {}),
@@ -375,18 +460,49 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
         risk_level=schema["risk_level"],
         requires_confirmation=schema["requires_confirmation"],
         timeout_seconds=float(schema["timeout_seconds"]),
-        inject_identity_fields=tuple(schema["inject_identity_fields"]),
+        inject_identity_fields=inject,
         top_level_fields=tuple(schema["top_level_fields"]),
         query_params_field=schema.get("query_params_field"),
         identity_params=dict(schema.get("identity_params") or {}),
         upstream=schema.get("upstream") or DEFAULT_UPSTREAM,
         model_params=dict(schema["model_params"]),
-        result_kind=schema["result"]["kind"],
-        result_fields=tuple(schema["result"]["fields"]),
+        result_kind=TEXT_RESULT_KIND if text_result else schema["result"]["kind"],
+        result_fields=TEXT_RESULT_FIELDS if text_result else tuple(schema["result"]["fields"]),
+        identity_bindings=bindings,
     )
 
 
+TOOL_KINDS = ("office", "builtin", "mcp")
+
+
+def _extension_tool_spec(tool: Tool) -> ToolSpec:
+    """builtin / mcp Tool 没有 OpenAPI 版本：由 Tool 行直接生成运行时视图（调用面由 Executor 按 kind 分派）。"""
+    return ToolSpec(
+        name=tool.name, method="", path="", version=tool.kind, schema_hash="",
+        risk_level=tool.risk_level or "low", requires_confirmation=bool(tool.requires_confirmation),
+        timeout_seconds=10.0, inject_identity_fields=(), top_level_fields=(), query_params_field=None,
+        model_params=builtin_model_params(tool.builtin_id) if tool.kind == "builtin" else {},
+        result_kind=TEXT_RESULT_KIND, result_fields=TEXT_RESULT_FIELDS, summary=tool.summary or "",
+        kind=tool.kind, builtin_id=tool.builtin_id, mcp_server_id=tool.mcp_server_id,
+        mcp_tool_name=tool.mcp_tool_name, sandbox_policy=dict(tool.sandbox_policy_json or {}))
+
+
 def registration_blockers(tool: Tool, has_version: bool, method: str | None = None) -> list[str]:
+    kind = getattr(tool, "kind", None) or "office"
+    if kind not in TOOL_KINDS:
+        return [f"未知 Tool 类型：{kind}"]
+    if kind != "office":
+        reasons = []
+        if not tool.enabled:
+            reasons.append("管理员已停用")
+        if kind == "builtin" and not tool.builtin_id:
+            reasons.append("内置工具缺少 builtin_id")
+        if kind == "mcp":
+            if not tool.mcp_server_id:
+                reasons.append("MCP 工具未绑定 MCP Server")
+            if not tool.mcp_tool_name:
+                reasons.append("MCP 工具缺少远端工具名")
+        return reasons
     reasons = []
     if not tool.enabled:
         reasons.append("管理员已停用")
@@ -454,6 +570,7 @@ class Catalog:
                     tool.spec_enabled = False
                     tool.last_sync_at, tool.last_sync_result, tool.last_sync_error = now, "removed", None
                     report["tools"].append({"name": name, "result": "removed"})
+        ensure_builtin_tools(db, self.tenant)  # 刷新时补齐缺失的内置工具（不覆盖管理员改动）
         return report
 
     def _sync_tool(self, db: Session, source: str, spec_version: str, spec: dict, operator: str, now) -> dict:
@@ -598,7 +715,7 @@ class Catalog:
         for tool in db.scalars(sa.select(Tool).where(Tool.tenant_id == self.tenant).order_by(Tool.name)):
             for vid in {tool.current_version_id, tool.pending_version_id} - {None}:
                 upstream = (db.get(ToolVersion, vid).schema_json or {}).get("upstream", DEFAULT_UPSTREAM)
-                if upstream not in keep | {DEFAULT_UPSTREAM}:
+                if upstream not in keep:
                     used.append(f"{tool.name}（{upstream}）")
         return list(dict.fromkeys(used))
 
@@ -606,13 +723,22 @@ class Catalog:
     def load_registry(self, db: Session) -> ToolRegistry:
         tools: dict[str, ToolSpec] = {}
         rows = db.execute(
-            sa.select(Tool, ToolVersion).join(ToolVersion, ToolVersion.id == Tool.current_version_id)
+            sa.select(Tool, ToolVersion).outerjoin(ToolVersion, ToolVersion.id == Tool.current_version_id)
             .where(Tool.tenant_id == self.tenant)).all()
         for tool, version in rows:
-            if registration_blockers(tool, True, version.schema_json.get("method")):
+            kind = tool.kind or "office"
+            if kind == "office":
+                if version is None or registration_blockers(tool, True, version.schema_json.get("method")):
+                    continue
+            elif registration_blockers(tool, version is not None):
                 continue
-            tools[tool.name] = to_tool_spec(version.schema_json, version.spec_version, version.version_no,
-                                            version.schema_hash)
+            if version is None:  # builtin / mcp 无 OpenAPI 版本
+                tools[tool.name] = _extension_tool_spec(tool)
+                continue
+            tools[tool.name] = to_tool_spec(
+                version.schema_json, version.spec_version, version.version_no, version.schema_hash,
+                kind=kind, builtin_id=tool.builtin_id, mcp_server_id=tool.mcp_server_id,
+                mcp_tool_name=tool.mcp_tool_name, sandbox_policy=tool.sandbox_policy_json)
         return ToolRegistry(tools)
 
     def skill_states(self, db: Session) -> dict[str, SkillState]:
@@ -645,3 +771,4 @@ class Catalog:
                 log.info("首次同步 Tool：%s", [t["name"] for t in report["tools"]])
             if db.scalar(sa.select(sa.func.count()).select_from(Skill).where(Skill.tenant_id == self.tenant)) == 0:
                 self.sync_skills(db, "system")
+            ensure_builtin_tools(db, self.tenant)

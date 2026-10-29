@@ -54,7 +54,10 @@ def office():
 @pytest.fixture
 def chat(admin, office):
     r = admin.put("/v1/admin/settings/oa", json={"values": {
-        "office_api_base_url": OFFICE, "gateway_secret": GATEWAY, "assertion_hmac_secret": HMAC_SECRET,
+        "mint_base_url": OFFICE,
+        "upstreams": [{"key": "office", "label": "office-api", "base_url": OFFICE}],
+        "default_upstream_key": "office",
+        "gateway_secret": GATEWAY, "assertion_hmac_secret": HMAC_SECRET,
         "allowed_frame_origins": ["https://oa.example.com"]}})
     assert r.status_code == 200, r.text
     return admin.client
@@ -173,7 +176,7 @@ def test_query_last_week_returns_own_data_and_full_run_record(chat, office):
 
     run, events = run_and_events(chat, body["run_id"])
     assert run.run_status == "succeeded" and run.oa == "zhangsan" and run.tool_call_count == 1
-    assert run.workflow_id == "travel_query" and run.ended_at is not None and run.duration_ms is not None
+    assert run.workflow_id == "oa_assistant" and run.ended_at is not None and run.duration_ms is not None
     types = [e.event_type for e in events]
     assert types[0] == "run_start" and types[-1] == "run_end"
     for t in ("node_start", "node_end", "tool_call_start", "tool_call_end", "checkpoint_saved"):
@@ -226,7 +229,8 @@ def test_forged_oa_from_model_is_dropped(chat, office, monkeypatch):
     assert "lisi" not in json.dumps(start.input_summary, ensure_ascii=False)
     model = next(e for e in events if e.event_type == "model_call")
     assert [m["role"] for m in json.loads(model.input_summary)["messages"]] == ["system", "human"]
-    assert json.loads(model.input_summary)["messages"][1]["content"] == "查九月的行程报销"
+    human = json.loads(model.input_summary)["messages"][1]["content"]
+    assert human.startswith("<<<UNTRUSTED_DATA source=user") and "查九月的行程报销" in human  # 用户原话经围栏
     assert "lisi" not in str(route.calls.last.request.url)
 
 

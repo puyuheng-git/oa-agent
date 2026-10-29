@@ -93,26 +93,36 @@ class OfficeApiClient:
         return resp, int((time.perf_counter() - started) * 1000)
 
     def _unwrap(self, resp: httpx.Response) -> tuple[object, str]:
-        """返回 (data, 成功提示语)。"""
-        if resp.status_code in (401, 403):
-            raise OfficeApiError("OFFICE_TOKEN_EXPIRED", f"office-api 拒绝访问（HTTP {resp.status_code}）", resp.status_code)
+        """返回 (data, 成功提示语)。委托 oa_office envelope；ConnectorError → OfficeApiError。"""
+        from oa_agent.connectors.base import ConnectorError
+        from oa_agent.connectors.envelope import parse_envelope
+
         if resp.status_code >= 400:
-            # 4xx 的 msg 多为参数/业务校验提示，可给员工看；5xx 的内容可能是堆栈，不展示
-            hint = business_hint(_json_or_none(resp), self.hint_max) if resp.status_code < 500 else ""
-            raise OfficeApiError("UPSTREAM_HTTP_ERROR", f"office-api HTTP {resp.status_code} {hint}".strip(),
-                                 resp.status_code, user_message=hint)
+            body: object = _json_or_none(resp)
+            json_decode_ok = True
+        else:
+            try:
+                body = resp.json()
+                json_decode_ok = True
+            except ValueError:
+                body = None
+                json_decode_ok = False
         try:
-            body = resp.json()
-        except ValueError as exc:
-            raise OfficeApiError("UPSTREAM_BAD_RESPONSE", "office-api 返回非 JSON", resp.status_code) from exc
-        if not isinstance(body, dict):
-            return body, ""
-        code = next((body[k] for k in ("code", "errCode", "err_code") if k in body), None)
-        hint = business_hint(body, self.hint_max)
-        if code is not None and str(code) not in self.success_codes:
-            raise OfficeApiError("UPSTREAM_BIZ_ERROR", f"office-api 业务错误 code={code} {hint}".strip(),
-                                 resp.status_code, user_message=hint)
-        return (body.get("data", body) if code is not None or "data" in body else body), hint
+            return parse_envelope(
+                "oa_office",
+                resp.status_code,
+                body,
+                success_codes=self.success_codes,
+                hint_max=self.hint_max,
+                json_decode_ok=json_decode_ok,
+            )
+        except ConnectorError as exc:
+            raise OfficeApiError(
+                exc.code,
+                exc.message,
+                exc.http_status,
+                user_message=exc.user_message,
+            ) from exc
 
     def mint(self, oa: str, gateway_secret: str | None) -> MintResult:
         data = self._mint_request({"oa": oa}, gateway_secret)
@@ -154,15 +164,52 @@ class OfficeApiClient:
         data, hint = self._unwrap(resp)
         return OfficeResponse(data, resp.status_code, ms, hint)
 
+    def post(self, path: str, body: dict, authorization: str, *, timeout: float | None = None,
+             idempotency_key: str | None = None) -> OfficeResponse:
+        headers = {"Authorization": authorization}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        resp, ms = self._send("POST", path, json=body, headers=headers, timeout=timeout)
+        data, hint = self._unwrap(resp)
+        return OfficeResponse(data, resp.status_code, ms, hint)
+
+
+def mint_base_url(oa_settings: dict) -> str | None:
+    """签发入口基址；已由 SettingsService.apply_oa_compat 做过旧字段映射。"""
+    url = oa_settings.get("mint_base_url") or oa_settings.get("office_api_base_url")
+    return str(url).rstrip("/") if url else None
+
 
 def upstream_clients(oa_settings: dict) -> dict[str, OfficeApiClient]:
-    """Tool 可用的 office-api 地址：主地址（`office`）+ 其他地址；都以员工 token 调用。主地址未配置时抛错。"""
+    """业务上游客户端：来自 upstreams 目录（peer）；都以员工 Authorization 调用。
+
+    兼容旧配置：无 upstreams 时用 office_api_base_url 作为 office + extra_upstreams。
+    目录为空时仍尝试构建默认 office 客户端，未配置则抛 OFFICE_API_NOT_CONFIGURED。
+    """
     codes = oa_settings.get("success_codes")
     hint_max = int(oa_settings.get("business_hint_max_chars") or MAX_HINT)
-    clients = {DEFAULT_UPSTREAM: OfficeApiClient(oa_settings.get("office_api_base_url"), codes, hint_max=hint_max)}
-    for item in oa_settings.get("extra_upstreams") or []:
-        clients[item["key"]] = OfficeApiClient(item["base_url"], codes, hint_max=hint_max)
+    items = list(oa_settings.get("upstreams") or [])
+    if not items:
+        base = oa_settings.get("office_api_base_url") or oa_settings.get("mint_base_url")
+        if base:
+            items = [{"key": DEFAULT_UPSTREAM, "label": "office-api", "base_url": base}]
+        for extra in oa_settings.get("extra_upstreams") or []:
+            items.append(extra)
+    if not items:
+        # 保持与旧行为一致：访问默认上游时给出未配置错误
+        return {DEFAULT_UPSTREAM: OfficeApiClient(None, codes, hint_max=hint_max)}
+    clients: dict[str, OfficeApiClient] = {}
+    for item in items:
+        key = item["key"]
+        clients[key] = OfficeApiClient(item.get("base_url"), codes, hint_max=hint_max)
     return clients
+
+
+def upstream_connectors(oa_settings: dict):
+    """业务上游 Connector 目录；与 upstream_clients 同源，包装为 HttpJsonConnector。"""
+    from oa_agent.connectors.hub import ConnectorHub
+
+    return ConnectorHub.from_office_settings(oa_settings)
 
 
 def _json_or_none(resp: httpx.Response) -> object:

@@ -38,10 +38,11 @@ def _run_test(group: str, cfg: dict) -> dict:
     raise AppError(400, "NOT_TESTABLE", "该配置组暂不支持测试连接")
 
 
-def _guard_upstreams_in_use(ctx: AdminCtx, value) -> None:
+def _guard_upstreams_in_use(ctx: AdminCtx, values: dict) -> None:
+    """用完整提交值合并（须含 default_upstream_key，否则会误报默认上游不在列表中）。"""
     try:
-        candidate = ctx.runtime.settings_svc.merged_candidate(ctx.db, "oa", {"extra_upstreams": value})
-        keep = {u["key"] for u in candidate["extra_upstreams"]}
+        candidate = ctx.runtime.settings_svc.merged_candidate(ctx.db, "oa", values)
+        keep = {u["key"] for u in (candidate.get("upstreams") or [])}
         catalog = getattr(ctx.runtime.engine, "catalog", None)
         used = catalog.tools_using_upstreams(ctx.db, keep) if catalog else []
     finally:
@@ -121,8 +122,8 @@ def update_group(group: str, body: GroupUpdateIn, ctx: AdminCtx = Depends(admin_
             if not result["ok"]:
                 raise AppError(400, "CONNECTION_TEST_FAILED", f"测试连接失败，未保存：{result['error']}")
         ctx.db.rollback()
-    if group == "oa" and "extra_upstreams" in body.values:
-        _guard_upstreams_in_use(ctx, body.values["extra_upstreams"])
+    if group == "oa" and "upstreams" in body.values:
+        _guard_upstreams_in_use(ctx, body.values)
     with ctx.db.begin():
         before = svc.summary(ctx.db, group)
         changed = svc.update(ctx.db, group, body.values, body.clear_secrets, ctx.user.username)

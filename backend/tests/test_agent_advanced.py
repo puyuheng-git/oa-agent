@@ -243,7 +243,9 @@ def test_compression_off_drops_old_turns(chat, office, admin, monkeypatch):
                           {"history_turns": 1, "history_compress": False}, admin)
     system = model.calls[2][0][1]
     assert "更早对话的记忆" not in system
-    assert [m for _, m in model.calls[2][1:]] == ["二", "好", "三"]
+    msgs = [m for _, m in model.calls[2][1:]]
+    assert msgs[:2] == ["二", "好"] and len(msgs) == 3 and "三" in msgs[2]
+    assert msgs[2].startswith("<<<UNTRUSTED_DATA source=user")
 
 
 def test_truncate_compression_cuts_each_line(chat, office, admin, monkeypatch):

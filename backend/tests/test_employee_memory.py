@@ -264,7 +264,7 @@ def test_non_explicit_message_does_not_write_memory(chat, office, rt, monkeypatc
 
 
 def test_memory_write_action_persists_and_injects(chat, office, rt, monkeypatch):
-    from oa_agent.runtime.graphs import travel_query as tq
+    from oa_agent.runtime.graphs import oa_assistant as tq
     from tests.test_agent_chat import use_model
     from tests.test_chat import open_chat, send
 
@@ -301,7 +301,7 @@ def test_memory_write_action_persists_and_injects(chat, office, rt, monkeypatch)
 
 
 def test_sensitive_write_rejected_in_graph(chat, office, rt, monkeypatch):
-    from oa_agent.runtime.graphs import travel_query as tq
+    from oa_agent.runtime.graphs import oa_assistant as tq
     from tests.test_chat import open_chat, send
 
     from oa_agent.chat import memory_store as ms

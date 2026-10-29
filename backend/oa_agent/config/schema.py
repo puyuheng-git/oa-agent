@@ -78,25 +78,31 @@ GROUPS: dict[str, GroupDef] = {
             "OA 对接",
             "热生效",
             (
-                FieldDef("office_api_base_url", "office-api 地址（主）", "url",
-                         help="签发员工 token（mint）与默认 Tool 调用都走这里"),
-                FieldDef("extra_upstreams", "其他 office-api 地址", "upstreams", [],
-                         "必须认同主地址签发的员工 token（同一信任域）；Tool 可选择走这些地址"),
+                FieldDef("mint_base_url", "员工 token 签发地址", "url",
+                         help="OA 宿主页 / 企微入口换员工 Authorization 的 HTTP 基址（调用 /agent/token/mint）。"
+                              "与业务上游分离；未配置时兼容读取旧「office-api 主地址」。"),
+                FieldDef("upstreams", "业务上游地址", "upstreams", [],
+                         "认同同一员工 Authorization 的业务 HTTP 面（名称自定，勿写死域名）。"
+                         "每项标识 + 名称 + 基址；Tool 只引用标识与相对路径。"
+                         "入口建权后可带 token 调用目录内上游上已声明的接口；各接口仍须 OA 侧业务授权。"),
+                FieldDef("default_upstream_key", "新建 Tool 默认上游", "str", "office",
+                         help="仅影响新建 Tool 的默认上游标识，无协议特权；须存在于上方列表中（有列表时）。"),
                 FieldDef("gateway_secret", "AGENT_GATEWAY_SECRET（mint 用）", "secret",
-                         help="向 office-api 签发员工 token 时使用的网关密钥，须与 OA 侧配置一致。只写不读。"),
+                         help="向签发入口换员工 token 时使用的网关密钥，须与 OA 侧配置一致。只写不读。"),
                 FieldDef("assertion_hmac_secret", "OA assertion HMAC 密钥", "secret",
                          help="校验 OA 宿主页签发的员工身份断言（assertion）的密钥，须与 OA 侧配置一致。只写不读。"),
                 FieldDef("allowed_frame_origins", "允许嵌入的 OA 域名", "list", [], "如 https://oa.example.com"),
-                FieldDef("success_codes", "office-api 成功码", "list", ["0", "200"], "响应 code 字段视为成功的取值"),
+                FieldDef("success_codes", "业务上游成功码", "list", ["0", "200"], "响应 code 字段视为成功的取值"),
                 FieldDef("business_hint_max_chars", "业务提示语最大长度", "int", 200,
-                         "office-api 返回的 msg/message 提示语（如「该单据不存在」）展示给员工前的截断长度。"
+                         "业务上游返回的 msg/message 提示语（如「该单据不存在」）展示给员工前的截断长度。"
                          "过长的提示语多为接口异常堆栈，截断可避免泄露内部信息。", min=50, max=1000, unit="字"),
                 FieldDef("tool_remark_max_chars", "备注字段最大长度", "int", 100,
                          "Tool 返回结果中 remark（备注）字段的截断长度，超出部分以「…」结尾。"
                          "备注通常是员工自由填写的长文本，截断可以让表格保持可读。", min=20, max=2000, unit="字"),
             ),
-            description="助手与 OA 之间只走 HTTP：员工身份由 OA 宿主页签发的 assertion 证明，"
-                        "业务数据只来自 office-api 以该员工 token 返回的结果。",
+            description="助手与 OA 只走 HTTP：入口（宿主页 assertion / 企微）完成身份与 token 签发；"
+                        "业务数据只来自已配置上游以该员工 Authorization 返回的结果，且仅限已声明的 Tool/写契约。"
+                        "旧字段 office_api_base_url / extra_upstreams 读取时自动映射，保存请用新字段。",
         ),
         GroupDef(
             "chat",
@@ -273,8 +279,98 @@ GROUPS: dict[str, GroupDef] = {
                 FieldDef("export_max_days", "对话导出最大时间跨度", "int", 92,
                          "导出对话记录时开始与结束时间的最大间隔，防止一次导出过多数据拖慢数据库。",
                          min=1, max=366, unit="天"),
+                FieldDef("write_workflows_enabled", "启用固定写 Workflow", "bool", False,
+                         "开启后允许运行行程报销等固定写闭环（查→草稿→员工确认→提交）。"
+                         "office-api 写接口未就绪或探针失败时应保持关闭；默认关闭。"),
+                FieldDef("http_allow_hosts", "内置 HTTP 全局白名单", "list", [],
+                         "内置工具 sys.http 的默认允许主机（如 api.example.com 或 *.example.com）；"
+                         "单个 Tool 的沙箱策略里配置了 http_allow_hosts 时以 Tool 为准。"
+                         "留空且 Tool 也未配置时，sys.http 一律拒绝（SANDBOX_REQUIRED）。高风险工具默认关闭。"),
+                FieldDef("tool_routing_mode", "工具路由模式（全局默认）", "enum", "legacy_prompt",
+                         "决定助手「听到员工一句话后，怎么从众多查询能力里挑出该调哪个接口」。"
+                         "这里是全局默认：新对话若所属工作流发布里没单独写路由模式，就用本项；"
+                         "若流程配置已发布并写了路由模式，以那次发布为准（跑着的旧对话也不变）。"
+                         "行程报销等「固定写流程」不走这里，仍按白名单写 Workflow。"
+                         "各模式白话说明——"
+                         "提示词海选：把可见查询能力的说明书塞给模型一次选；Tool 不多时最简单，默认兼容。"
+                         "先选 Skill 再选 Tool：先判断属于哪类业务（如行程报销），再只在该类里选接口，减少跨业务误选。"
+                         "检索召回再精选：先按关键词从能力库里捞一批候选，再让模型精选填参；Tool 变多时更合适。"
+                         "元工具渐进披露：首轮不塞业务说明书；模型（或服务端）先 search_capabilities 再 get_tool_schema，"
+                         "受「元工具往返上限」约束后再填参，避免一次塞入全部 Tool。"
+                         "确定性优先：能靠固定说法/规则（含「先列表再详情」串联）直接定下就不问模型；定不下再走下面的回退模式。"
+                         "小路由大填参：先便宜地定「用哪一个 Tool」，再用主模型只带这一份参数说明去填参，省 Token。",
+                         options=(
+                             ("legacy_prompt", "提示词海选（兼容）"),
+                             ("skill_then_tool", "先选 Skill 再选 Tool"),
+                             ("retrieve_then_tool", "检索召回再精选"),
+                             ("meta_search", "元工具渐进披露"),
+                             ("deterministic_first", "确定性优先"),
+                             ("router_then_fill", "小路由大填参"),
+                         )),
+                FieldDef("prompt_topk", "提示词候选 Tool 上限", "int", 8,
+                         "在「提示词海选」或「检索后再精选」时，最多把多少个查询能力的说明书放进模型提示词。"
+                         "员工当前可见的 Tool 总数不超过该值时，相当于全部放进去，不会截断。"
+                         "Tool 很多时调小可省 Token、减轻选错；调太小可能漏掉真正相关的能力。默认 8。",
+                         min=1, max=64, unit="个"),
+                FieldDef("routing_skill_method", "Skill 选择方式", "enum", "rules_then_llm",
+                         "只在「先选 Skill 再选 Tool」「小路由大填参」里生效：系统如何判断员工问的是哪一类业务。"
+                         "规则优先，失败再用模型：先用关键词/内置规则猜；猜不准再交给模型（推荐，稳且省）。"
+                         "仅规则：完全不调模型选类，只认固定说法，省费用但覆盖面窄。"
+                         "仅模型：主要靠模型分类；本期若未单独配置路由模型，实际仍按相关度打分，不保证独立小模型。",
+                         options=(
+                             ("rules_then_llm", "规则优先，失败再用模型"),
+                             ("rules", "仅规则"),
+                             ("llm", "仅模型"),
+                         )),
+                FieldDef("retrieve_topk", "检索召回条数", "int", 8,
+                         "「检索召回再精选」与「元工具渐进披露」的 search_capabilities 共用："
+                         "先从全部可见 Tool 里捞出最相关的前 N 个。"
+                         "N 越大越不易漏检，但后续说明书更长、费用更高；N 太小可能捞不到正确能力。默认 8。",
+                         min=1, max=64, unit="个"),
+                FieldDef("retrieve_backend", "检索后端", "enum", "keyword",
+                         "「检索召回再精选」用什么方式找候选。"
+                         "关键词：按员工原话与 Tool 名称/说明的用词匹配（本期默认，无需额外服务）。"
+                         "向量：语义相似度召回；向量服务尚未接通时系统会强制改用关键词，并在调用过程事件里标明降级，不会静默假装向量已通。",
+                         options=(("keyword", "关键词"), ("embedding", "向量（未就绪则降级）"))),
+                FieldDef("retrieve_must_include_recent", "必留最近用过 Tool 数", "int", 2,
+                         "检索召回时，强制把本会话线程里「最近成功用过」的若干个 Tool 留在候选里"
+                         "（方便员工接着问「那上个月的呢」「再看详情」）。"
+                         "设为 0 表示不强行保留，完全按相关度捞。默认 2。",
+                         min=0, max=16, unit="个"),
+                FieldDef("meta_max_rounds", "元工具往返上限", "int", 3,
+                         "仅「元工具渐进披露」：search_capabilities / get_tool_schema 最多往返几次，防止无限追问说明书。"
+                         "用尽仍未选中业务 Tool 时会向员工澄清（若开启低置信澄清）。默认 3。",
+                         min=1, max=10, unit="次"),
+                FieldDef("deterministic_fallback_mode", "确定性未命中回退模式", "enum", "skill_then_tool",
+                         "仅在「确定性优先」下使用：当固定规则认不出员工意图时，改走哪一种选 Tool 方式。"
+                         "不能再选「确定性优先」本身，否则会自己套自己。"
+                         "建议保持「先选 Skill 再选 Tool」或「提示词海选」；Tool 很多时可用「检索召回再精选」。",
+                         options=(
+                             ("legacy_prompt", "提示词海选"),
+                             ("skill_then_tool", "先选 Skill 再选 Tool"),
+                             ("retrieve_then_tool", "检索召回再精选"),
+                             ("router_then_fill", "小路由大填参"),
+                         )),
+                FieldDef("router_model_id", "路由用模型 ID", "str", None,
+                         "「小路由大填参」等模式在 stage=router 选 Tool 时使用的模型。"
+                         "请填「LLM 配置」里模型的数字 ID（主键），不要填密钥或接口地址。"
+                         "留空则与工作流默认对话模型相同；填参（stage=fill）始终用默认对话模型。"
+                         "适合把分类交给更便宜的小模型，主模型只负责填参。",
+                         max=64),
+                FieldDef("routing_clarify_on_low_confidence", "低置信时向员工澄清", "bool", True,
+                         "系统拿不准该用哪个查询能力时怎么处理。"
+                         "开启（推荐）：直接问员工「你想查哪一类？」等，不瞎猜接口，避免查错单据。"
+                         "关闭：按各模式自己的兜底继续往下选（可能选错或落到帮助回复）。"
+                         "主要影响「先选 Skill」「小路由大填参」等在候选不清时的行为。"),
+                FieldDef("routing_trace_enabled", "写入路由过程事件", "bool", True,
+                         "是否把「怎么选出这个 Tool」的过程记进运行事件，供「调用过程」页查看与统计。"
+                         "开启（推荐）：写入开始路由、各阶段候选、最终决定、向员工澄清等事件；"
+                         "事件里只留能力名称、分数、耗时，不含员工全文密钥或业务明细。"
+                         "关闭：仍会记真实的 Tool 调用起止，但统计页上的模式占比、澄清率等会变少或显示能力降级说明。"
+                         "排障、验收路由策略时请保持开启。"),
             ),
-            description="运行监控、超时判定、人工介入、数据保留与导出相关的参数。",
+            description="运行监控、超时判定、人工介入、数据保留与导出，以及「如何从员工原话落到查询接口」的工具路由参数。"
+                        "路由只影响候选可见范围，真正查数仍走员工 token 与业务上游授权；不代替权限判定。",
         ),
         GroupDef(
             "import",
@@ -293,6 +389,61 @@ GROUPS: dict[str, GroupDef] = {
             ),
             description="在「Tool 管理」中从 Apipost 分享链接生成 Tool 草稿时的限制。"
                         "出于安全考虑只允许访问 docs.apipost.net，地址不可配置。",
+        ),
+        GroupDef(
+            "mcp",
+            "MCP 连接",
+            "热生效（只影响之后新建/修改的 MCP 连接）",
+            (
+                FieldDef("allowed_origins", "远程 MCP 地址白名单", "list", [],
+                         "sse / http 类型的 MCP 连接地址必须命中此名单（协议+域名，可带端口，"
+                         "如 https://mcp.example.com）。未配置时拒绝所有远程地址，请先在这里配置。"),
+            ),
+            description="出站 MCP 连接的全局安全边界。MCP 连接本身在「MCP 连接」页配置，密钥只写不读。",
+        ),
+        GroupDef(
+            "packs",
+            "领域包",
+            "热生效",
+            (
+                FieldDef(
+                    "disabled_ids",
+                    "已禁用领域包",
+                    "list",
+                    [],
+                    "写入包 id 后该包对员工侧不可见（规则/Skill/Workflow 聚合会排除）。"
+                    "未列入的包仍按各自默认启用状态生效；默认空列表表示不额外禁用。",
+                ),
+            ),
+            description="Domain Pack 启停覆盖。默认启用的包（如 oa_travel）无需列出；"
+                        "只需把要关闭的包 id 写入 disabled_ids。",
+        ),
+        GroupDef(
+            "idp",
+            "身份提供者",
+            "热生效",
+            (
+                FieldDef(
+                    "demo_idp_enabled",
+                    "启用 Demo IdP",
+                    "bool",
+                    False,
+                    "开启后允许用共享口令建立本地 demo 会话（无 OA/office）。"
+                    "仅供本地开发与自动化测试；生产环境务必保持关闭。",
+                ),
+                FieldDef(
+                    "demo_shared_secret",
+                    "Demo 共享口令",
+                    "str",
+                    "",
+                    "Demo IdP 校验用的本地共享口令（明文存配置，仅限本机）。"
+                    "与入站 payload.secret 一致才签发主体；生产勿开启 Demo。",
+                    max=256,
+                ),
+            ),
+            description="身份提供者（IdP）开关与本地 demo 参数。"
+                        "Demo 默认关闭；开启后仍须正确共享口令才能建会话。"
+                        "渠道→IdP 映射（channel_idp_map）待 FieldDef 支持 dict 后配置化。",
         ),
     )
 }

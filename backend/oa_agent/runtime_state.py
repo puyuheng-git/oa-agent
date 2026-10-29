@@ -23,7 +23,7 @@ from oa_agent.config.service import SettingsService
 from oa_agent.config.vault import SecretVault
 from oa_agent.db.engine import make_engine, make_sessionmaker
 from oa_agent.db.migrate import revision_status, upgrade_head
-from oa_agent.kv import KVManager
+from oa_agent.kv import KVManager, assert_production_kv
 from oa_agent.observability.audit import AuditService
 from oa_agent.observability.redact import redact
 from oa_agent.runtime.engine import AgentEngine
@@ -51,6 +51,7 @@ class AppRuntime:
         self.install_lock = threading.Lock()
         self.engine: AgentEngine | None = None
         self.wecom = None   # 企业微信长连接渠道（正常模式启动）
+        self.pack_registry = None  # PackRegistry | None；正常模式 boot 后挂载
         self.last_good_settings: dict[str, dict] = {}
         self.stats_cache: dict[tuple, tuple[float, dict]] = {}
 
@@ -71,13 +72,31 @@ class AppRuntime:
         self.mode = NORMAL
         self._ensure_migrated()
         self.reload_redis()
+        assert_production_kv(self.kv.current, self.settings)
         self.engine = AgentEngine(self.settings, self.session, self.tenant_id, self._run_timeout,
                                   self._retention_days, self.setting)
         self.engine.start()
+        self._load_pack_registry()
         from oa_agent.channels.wecom import WeComChannel  # 依赖 chat.service，延迟导入避免循环
 
         self.wecom = WeComChannel(self)
         self.wecom.start()
+
+    def _load_pack_registry(self) -> None:
+        """扫描 packs 目录并挂载 PackRegistry；disabled_ids 来自 settings 组 packs。"""
+        from oa_agent.packs.registry import PackRegistry
+        from oa_agent.packs.state import load_disabled_ids
+
+        try:
+            disabled = load_disabled_ids(self.group_settings("packs"))
+        except Exception:  # noqa: BLE001 — 配置暂不可用时按全部默认启用
+            log.exception("读取 packs 启停配置失败，按默认启用加载 PackRegistry")
+            disabled = []
+        try:
+            self.pack_registry = PackRegistry.from_disk(disabled_ids=disabled)
+        except Exception:  # noqa: BLE001
+            log.exception("加载 PackRegistry 失败")
+            self.pack_registry = None
 
     def _ensure_migrated(self) -> None:
         """升级代码后直接启动 uvicorn（未走启动脚本）时补跑迁移；迁移只新增表/列。失败时 readyz 报告 migration_pending。"""
@@ -131,6 +150,12 @@ class AppRuntime:
         return self._sessionmaker()
 
     def shutdown(self) -> None:
+        mcp_client = getattr(self, "mcp_client", None)  # 出站 MCP 会话池（惰性创建，见 executor.mcp_runtime）
+        if mcp_client is not None and hasattr(mcp_client, "close"):
+            try:
+                mcp_client.close()
+            except Exception:  # noqa: BLE001 — 关闭尽力而为
+                log.warning("关闭出站 MCP 会话池失败", exc_info=True)
         if self.wecom is not None:
             self.wecom.stop()
         if self.engine is not None:

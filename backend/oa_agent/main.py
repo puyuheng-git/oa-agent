@@ -15,8 +15,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from oa_agent.admin import (
-    accounts_api, audit_api, catalog_api, conversations_api, employees_api, interventions_api, llm_api, runs_api,
-    settings_api, workflows_api,
+    accounts_api, audit_api, catalog_api, conversations_api, employees_api, interventions_api, llm_api, routing_api,
+    runs_api, settings_api, workflows_api, mcp_servers_api, packs_api,
 )
 from oa_agent.auth import admin as admin_auth
 from oa_agent.bootstrap import setup_api
@@ -94,9 +94,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     for router in (setup_api.router, admin_auth.router, settings_api.router, llm_api.router,
                    accounts_api.router, audit_api.router, employees_api.router, runs_api.router,
-                   interventions_api.router,
+                   routing_api.router, interventions_api.router,
                    catalog_api.tools_router, catalog_api.skills_router, catalog_api.visibility_router,
-                   workflows_api.router,
+                   workflows_api.router, mcp_servers_api.router, packs_api.router,
                    conversations_api.router, chat_router.router):
         app.include_router(router)
 

@@ -5,6 +5,7 @@ import { errorMessage, http } from '@/shared/http'
 import { formatTime } from '@/shared/format'
 import { syncTag, type SkillItem, type ToolItem } from '../ops'
 import { emptySkillForm, skillPayload, type SkillForm } from '../catalogForm'
+import AbilityHelpBanner from '../components/AbilityHelpBanner.vue'
 
 const items = ref<SkillItem[]>([])
 const loading = ref(false)
@@ -125,6 +126,7 @@ onMounted(load)
 
 <template>
   <div>
+    <AbilityHelpBanner focus="skill" />
     <el-alert
       type="info"
       :closable="false"
