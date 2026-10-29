@@ -13,7 +13,9 @@ def test_list_groups_masks_secrets(admin):
     r = admin.get("/v1/admin/settings")
     assert r.status_code == 200
     groups = {g["group"]: g for g in r.json()["groups"]}
-    assert set(groups) >= {"redis", "oa", "wecom", "runtime"}
+    assert set(groups) >= {"redis", "oa", "idp", "wecom", "runtime"}
+    assert groups["oa"]["label"] == "业务上游 / 连接器（兼容原 OA 对接）"
+    assert groups["idp"]["label"] == "身份提供者"
     assert groups["oa"]["values"]["gateway_secret"] == {"is_set": False, "display": "未设置"}
     assert groups["runtime"]["values"]["event_retention_days"] == 180
 

@@ -2,6 +2,7 @@ import type { Component } from 'vue'
 import { createRouter, createWebHashHistory } from 'vue-router'
 import {
   Aim,
+  Box,
   ChatDotRound,
   Connection,
   Cpu,
@@ -40,6 +41,7 @@ export const menu: MenuItem[] = [
   { path: '/employees', title: '员工治理', code: 'EMPLOYEES', perm: 'ops.employee.view', group: 'monitor', icon: User, component: () => import('./views/EmployeesView.vue') },
   { path: '/interventions', title: '介入中心', code: 'HANDOFF', perm: 'ops.intervention.handle', group: 'handoff', icon: Aim, component: () => import('./views/InterventionsView.vue') },
   { path: '/tools', title: 'Tool 管理', code: 'TOOLS', perm: 'ops.tool.manage', group: 'ability', icon: Tools, component: () => import('./views/ToolsView.vue') },
+  { path: '/packs', title: '领域包', code: 'PACKS', perm: 'ops.tool.manage', group: 'ability', icon: Box, component: () => import('./views/PacksView.vue') },
   { path: '/mcp-servers', title: 'MCP 连接', code: 'MCP', perm: 'ops.mcp.manage', group: 'ability', icon: Connection, component: () => import('./views/McpServersView.vue') },
   { path: '/skills', title: 'Skill 管理', code: 'SKILLS', perm: 'ops.skill.manage', group: 'ability', icon: MagicStick, component: () => import('./views/SkillsView.vue') },
   { path: '/workflows', title: '流程配置', code: 'FLOWS', perm: 'ops.config.edit', group: 'ability', icon: Share, component: () => import('./views/WorkflowsView.vue') },

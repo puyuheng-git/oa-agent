@@ -26,7 +26,7 @@ export interface ToolForm {
   name: string
   summary: string
   description: string
-  /** 业务上游标识（「OA 对接」目录中的 key；默认常为 office） */
+  /** 业务上游标识（连接配置 → 业务上游 / 连接器中的 key；默认常为 office） */
   upstream: string
   path: string
   timeout_seconds: number

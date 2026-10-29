@@ -75,7 +75,7 @@ GROUPS: dict[str, GroupDef] = {
         ),
         GroupDef(
             "oa",
-            "OA 对接",
+            "业务上游 / 连接器（兼容原 OA 对接）",
             "热生效",
             (
                 FieldDef("mint_base_url", "员工 token 签发地址", "url",
@@ -100,7 +100,8 @@ GROUPS: dict[str, GroupDef] = {
                          "Tool 返回结果中 remark（备注）字段的截断长度，超出部分以「…」结尾。"
                          "备注通常是员工自由填写的长文本，截断可以让表格保持可读。", min=20, max=2000, unit="字"),
             ),
-            description="助手与 OA 只走 HTTP：入口（宿主页 assertion / 企微）完成身份与 token 签发；"
+            description="业务连接器（兼容原「OA 对接」配置组 key=oa）：与业务系统只走 HTTP。"
+                        "入口（宿主页 assertion / 企微 / IdP）完成身份与 token 签发；"
                         "业务数据只来自已配置上游以该员工 Authorization 返回的结果，且仅限已声明的 Tool/写契约。"
                         "旧字段 office_api_base_url / extra_upstreams 读取时自动映射，保存请用新字段。",
         ),
@@ -414,9 +415,17 @@ GROUPS: dict[str, GroupDef] = {
                     "写入包 id 后该包对员工侧不可见（规则/Skill/Workflow 聚合会排除）。"
                     "未列入的包仍按各自默认启用状态生效；默认空列表表示不额外禁用。",
                 ),
+                FieldDef(
+                    "enabled_ids",
+                    "已显式启用领域包",
+                    "list",
+                    [],
+                    "写入默认关闭的包 id 后可显式启用；若同一 id 也在 disabled_ids，禁用优先。"
+                    "默认启用的包无需列入。",
+                ),
             ),
             description="Domain Pack 启停覆盖。默认启用的包（如 oa_travel）无需列出；"
-                        "只需把要关闭的包 id 写入 disabled_ids。",
+                        "要关闭的包写入 disabled_ids，默认关闭但需开启的包写入 enabled_ids。",
         ),
         GroupDef(
             "idp",
@@ -440,10 +449,21 @@ GROUPS: dict[str, GroupDef] = {
                     "与入站 payload.secret 一致才签发主体；生产勿开启 Demo。",
                     max=256,
                 ),
+                FieldDef(
+                    "channel_idp_map_json",
+                    "渠道到 IdP 映射",
+                    "text",
+                    '{"oa_web":"oa_assertion","wecom":"wecom","demo":"demo"}',
+                    "JSON 对象，键为渠道 ID、值为 IdP ID；非法 JSON 或非对象会回落默认映射，"
+                    "缺少的默认渠道也会逐项回落。"
+                    "预留：运行时入口尚未统一走 verify_channel；改映射暂不影响现网 OA/企微 launch。",
+                    max=4000,
+                ),
             ),
-            description="身份提供者（IdP）开关与本地 demo 参数。"
+            description="身份提供者（IdP）与本地 Demo 入口。"
+                        "生产环境通常使用 OA 宿主页 assertion 或企微；本地开发可启用 Demo IdP（无 office 上游）。"
                         "Demo 默认关闭；开启后仍须正确共享口令才能建会话。"
-                        "渠道→IdP 映射（channel_idp_map）待 FieldDef 支持 dict 后配置化。",
+                        "channel_idp_map_json 当前为预留配置，待运行时入口统一接入 verify_channel 后生效。",
         ),
     )
 }

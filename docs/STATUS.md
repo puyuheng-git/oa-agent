@@ -16,7 +16,7 @@
 | 出站 MCP + Builtin | **已交付（一期）** | 真 Client + 沙箱高风险默认关；真实 MCP/搜索联调未执行 |
 | Tool 路由模式 + 调用过程 | **已交付** | 六模式可配置；管理端「调用过程」；embedding / 独立路由模型仍为扩展 |
 | LLM 远端模型列表 | **已交付** | 提供方 `/models` 拉取 + 可搜索下拉；见规格 |
-| 多系统可插拔平台 | **M4 已交付；下一刀 M5** | 规格 [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md)；M1–M4 交付见下表 |
+| 多系统可插拔平台 | **M0–M5 产品化完成** | 规格 [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md)；M1–M5 交付见下表，平台主线收官 |
 
 ---
 
@@ -39,6 +39,7 @@
 | 多系统 M2 envelope/bindings | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M2；计划 [`multi-system-m2-envelope`](superpowers/plans/2026-10-28-multi-system-m2-envelope.md) | [`multi-system-m2-delivery`](delivery/2026-10-28-multi-system-m2-delivery.md) | ✅ |
 | 多系统 M3 Domain Pack | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M3；计划 [`multi-system-m3-packs`](superpowers/plans/2026-10-28-multi-system-m3-packs.md) | [`multi-system-m3-delivery`](delivery/2026-10-28-multi-system-m3-delivery.md) | ✅ |
 | 多系统 M4 IdP | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M4；计划 [`multi-system-m4-idp`](superpowers/plans/2026-10-29-multi-system-m4-idp.md) | [`multi-system-m4-delivery`](delivery/2026-10-29-multi-system-m4-delivery.md) | ✅（OIDC 仅骨架；渠道路由 map 待 schema） |
+| 多系统 M5 产品化 | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M5；计划 [`multi-system-m5-productize`](superpowers/plans/2026-10-29-multi-system-m5-productize.md) | [`multi-system-m5-delivery`](delivery/2026-10-29-multi-system-m5-delivery.md) | ✅（OIDC 真联调、HTTP 入口接 `verify_channel` 后置） |
 
 **清理（2026-10-28）：** 已删除 `scripts/` 下一批一次性修补/反编译临时脚本（`_*`），仅保留 `start.ps1` / `start.sh`。
 
@@ -86,11 +87,11 @@
 
 ## 4. 建议下一刀
 
-X1 / X4 / X5 / X6 与 **多系统 M1–M4** 已完成（见 [`x4-x6-delivery`](delivery/2026-10-28-x4-x6-delivery.md)、[`multi-system-m1-delivery`](delivery/2026-10-28-multi-system-m1-delivery.md)、[`multi-system-m2-delivery`](delivery/2026-10-28-multi-system-m2-delivery.md)、[`multi-system-m3-delivery`](delivery/2026-10-28-multi-system-m3-delivery.md)、[`multi-system-m4-delivery`](delivery/2026-10-29-multi-system-m4-delivery.md)）。建议继续：
+X1 / X4 / X5 / X6 与**多系统 M0–M5 产品化主线均已完成**（M5 见 [`multi-system-m5-delivery`](delivery/2026-10-29-multi-system-m5-delivery.md)）。平台主线至此收官，下一刀不再是 M5；建议继续：
 
-1. **多系统 M5**（管理端连接器/包产品化、命名去 OA 中心化）— 规格 §9  
-2. **X2** embedding（需额外设计密钥与索引落点）  
-3. **X3** 管理端「调用过程」手工验收 + Chat 写 Workflow 快捷按钮  
-4. **X7–X9** TagProvider / Profile / Checkpointer 多实例  
+1. **X2** embedding（需额外设计密钥与索引落点）
+2. **X3** 管理端「调用过程」手工验收 + Chat 写 Workflow 快捷按钮
+3. **OIDC 真联调 / HTTP 入口接 `verify_channel`**（需外部 IdP 与入口迁移安排）
+4. **X7–X9** TagProvider / Profile / Checkpointer 多实例
 
 本文随交付更新；新交付报告须回写本表状态列。

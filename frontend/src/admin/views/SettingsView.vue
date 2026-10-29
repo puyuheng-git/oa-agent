@@ -14,8 +14,14 @@ interface Group {
   group: string; label: string; apply_mode: string; testable: boolean; description?: string
   fields: FieldDef[]; values: Record<string, any>
 }
+interface Connector {
+  id: string; kind: 'http' | 'mcp' | 'builtin'; label: string
+  envelope_profile?: string | null; health: 'configured' | 'missing'
+}
 
 const groups = ref<Group[]>([])
+const connectors = ref<Connector[]>([])
+const connectorsError = ref<string | null>(null)
 const redisStatus = ref<Record<string, any>>({})
 const wecomStatus = ref<Record<string, any>>({})
 
@@ -47,6 +53,17 @@ function fillForm(g: Group) {
   )
 }
 
+async function loadConnectors() {
+  connectorsError.value = null
+  try {
+    const connectorData = await http.get<{ items: Connector[] }>('/v1/admin/connectors')
+    connectors.value = connectorData.items
+  } catch (e) {
+    connectors.value = []
+    connectorsError.value = errorMessage(e)
+  }
+}
+
 async function load() {
   try {
     const data = await http.get<{ groups: Group[]; redis_status: any; wecom_status: any }>('/v1/admin/settings')
@@ -60,6 +77,7 @@ async function load() {
   } catch (e) {
     ElMessage.error(errorMessage(e))
   }
+  await loadConnectors()
 }
 
 function payload(g: Group, clear: string[] = []) {
@@ -108,6 +126,28 @@ onMounted(load)
 </script>
 
 <template>
+  <el-card style="margin-bottom: 16px">
+    <template #header>连接器总览</template>
+    <el-alert v-if="connectorsError" :closable="false" type="error" :title="connectorsError" style="margin-bottom: 12px" />
+    <el-table :data="connectors" size="small" empty-text="暂无数据">
+      <el-table-column prop="label" label="名称" min-width="180" />
+      <el-table-column prop="id" label="标识" min-width="160" />
+      <el-table-column label="类型" width="100">
+        <template #default="{ row }">{{ row.kind.toUpperCase() }}</template>
+      </el-table-column>
+      <el-table-column prop="envelope_profile" label="信封协议" min-width="140">
+        <template #default="{ row }">{{ row.envelope_profile || '—' }}</template>
+      </el-table-column>
+      <el-table-column label="配置状态" width="120">
+        <template #default="{ row }">
+          <el-tag :type="row.health === 'configured' ? 'success' : 'info'">
+            {{ row.health === 'configured' ? '已配置' : '未配置' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+    </el-table>
+  </el-card>
+
   <el-card>
     <el-tabs v-model="active">
       <el-tab-pane v-for="g in groups" :key="g.group" :label="g.label" :name="g.group">

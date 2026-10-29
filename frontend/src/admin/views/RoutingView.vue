@@ -9,6 +9,7 @@ import {
   formatMs,
   formatRate,
   rangeParams,
+  routingEventMetadataDisplay,
   type RoutingEvent,
   type RoutingRunItem,
   type RoutingStats,
@@ -318,21 +319,46 @@ onMounted(() => {
 
           <h4>执行时间线（Tool）</h4>
           <el-empty v-if="!detail.tool_call_events.length" :description="NO_DATA" />
-          <el-timeline v-else>
-            <el-timeline-item
-              v-for="e in detail.tool_call_events"
-              :key="e.event_id"
-              :timestamp="formatTime(e.occurred_at)"
-              :type="e.status === 'ok' ? 'success' : e.status === 'error' ? 'danger' : undefined"
-            >
-              {{ e.event_type }} · {{ e.tool_name || '—' }} · {{ e.status || '—' }}
-              <span v-if="e.duration_ms != null"> · {{ formatMs(e.duration_ms) }}</span>
-            </el-timeline-item>
-          </el-timeline>
+          <el-table v-else :data="detail.tool_call_events" size="small" :empty-text="NO_DATA">
+            <el-table-column label="时间" width="150">
+              <template #default="{ row }">{{ formatTime(row.occurred_at) }}</template>
+            </el-table-column>
+            <el-table-column prop="event_type" label="类型" width="120" />
+            <el-table-column label="Tool" min-width="140">
+              <template #default="{ row }">{{ row.tool_name || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="connector_id" width="100">
+              <template #default="{ row }">{{ routingEventMetadataDisplay(row.metadata).connectorId }}</template>
+            </el-table-column>
+            <el-table-column label="pack_id" width="100">
+              <template #default="{ row }">{{ routingEventMetadataDisplay(row.metadata).packId }}</template>
+            </el-table-column>
+            <el-table-column label="状态" width="72">
+              <template #default="{ row }">{{ row.status || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="耗时" width="88">
+              <template #default="{ row }">{{ formatMs(row.duration_ms) }}</template>
+            </el-table-column>
+          </el-table>
 
           <h4>出站连接器</h4>
           <p class="muted">{{ detail.connector_status }}</p>
-          <el-empty v-if="!detail.connector_events.length" description="未使用 / 未配置" />
+          <el-table
+            v-if="detail.connector_events.length"
+            :data="detail.connector_events"
+            size="small"
+            :empty-text="NO_DATA"
+            style="margin-top: 8px"
+          >
+            <el-table-column prop="event_type" label="类型" />
+            <el-table-column label="connector_id" width="120">
+              <template #default="{ row }">{{ routingEventMetadataDisplay(row.metadata).connectorId }}</template>
+            </el-table-column>
+            <el-table-column label="pack_id" width="100">
+              <template #default="{ row }">{{ routingEventMetadataDisplay(row.metadata).packId }}</template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-else description="未使用 / 未配置" />
         </template>
       </div>
     </el-drawer>

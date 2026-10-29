@@ -2,6 +2,8 @@
 
 面向管理员、值班人员和 OA 对接人员。部署与运维见 [部署与运维手册](deployment.md)。
 
+**平台扩展：** 将已有 HTTP JSON 业务系统接到 Agent（上游、Tool/Skill 或 Pack、IdP、领域包启停）见 **[新系统接入手册](integrate-external-system.md)**。无 OA 本地演示见 [Demo IdP](demo-idp.md) 与仓库 [`packs/demo_http/README.md`](../../packs/demo_http/README.md)。
+
 ## 1. 入口一览
 
 | 入口 | 地址 | 使用者 |
@@ -37,6 +39,7 @@
 | 介入中心 | `ops.intervention.handle` | 处理“转人工”任务：恢复执行或终止 |
 | Tool 管理 | `ops.tool.manage` | 新建/编辑 Tool（office-api 只读接口）、从文件导入、启停、版本对比、激活版本 |
 | Skill 管理 | `ops.skill.manage` | 新建/编辑 Skill（说明、填参指引、示例问题、可用 Tool）、从文件导入、启停 |
+| 领域包 | `ops.tool.manage` | 本机 `packs/` 目录包的列表、启用/禁用（见 [新系统接入手册 §④](integrate-external-system.md#④-在管理后台启停领域包)） |
 | 流程配置 | `ops.config.edit`（发布需 `ops.config.publish`，回滚需 `ops.config.rollback`） | 草稿 → 校验 → 发布 / 回滚 |
 | 连接配置 | 查看 `sys.setting.view`，修改 `sys.setting.edit` | Redis、OA 对接、企业微信、运行参数 |
 | LLM 配置 | 同上 | 提供方、模型、测试连接 |

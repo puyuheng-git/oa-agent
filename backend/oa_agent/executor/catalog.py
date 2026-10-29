@@ -244,7 +244,7 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
         errors.append("一期只支持 GET 只读查询接口（写操作需要员工确认流程）")
     path = str(form.get("path") or "").strip()
     if not path.startswith("/") or path.startswith("//") or " " in path or "://" in path:
-        errors.append("接口路径必须是以 / 开头的相对路径（地址在「OA 对接」中配置，Tool 里只选地址）")
+        errors.append("接口路径必须是以 / 开头的相对路径（地址在「连接配置 → 业务上游 / 连接器」中配置，Tool 里只选地址）")
     result = form.get("result") or {}
     op = {
         "operationId": name,

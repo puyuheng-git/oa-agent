@@ -83,17 +83,23 @@ class AppRuntime:
         self.wecom.start()
 
     def _load_pack_registry(self) -> None:
-        """扫描 packs 目录并挂载 PackRegistry；disabled_ids 来自 settings 组 packs。"""
+        """扫描 packs 目录并挂载 PackRegistry；启停覆盖来自 settings.packs。"""
         from oa_agent.packs.registry import PackRegistry
-        from oa_agent.packs.state import load_disabled_ids
+        from oa_agent.packs.state import load_disabled_ids, load_enabled_ids
 
         try:
-            disabled = load_disabled_ids(self.group_settings("packs"))
+            packs_settings = self.group_settings("packs")
+            disabled = load_disabled_ids(packs_settings)
+            enabled = load_enabled_ids(packs_settings)
         except Exception:  # noqa: BLE001 — 配置暂不可用时按全部默认启用
             log.exception("读取 packs 启停配置失败，按默认启用加载 PackRegistry")
             disabled = []
+            enabled = []
         try:
-            self.pack_registry = PackRegistry.from_disk(disabled_ids=disabled)
+            self.pack_registry = PackRegistry.from_disk(
+                disabled_ids=disabled,
+                enabled_ids=enabled,
+            )
         except Exception:  # noqa: BLE001
             log.exception("加载 PackRegistry 失败")
             self.pack_registry = None

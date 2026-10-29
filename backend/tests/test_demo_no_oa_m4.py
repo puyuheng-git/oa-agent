@@ -1,4 +1,7 @@
-"""M4 Task 5：Demo IdP + demo_http pack，无 office_api_base_url 可建会话并调 raw_json Tool。"""
+"""M4 Task 5：Demo IdP + demo_http pack，无 office_api_base_url 可建会话并调 raw_json Tool。
+
+接入手册与 demo 运行说明：docs/ops/integrate-external-system.md、packs/demo_http/README.md。
+"""
 
 from __future__ import annotations
 

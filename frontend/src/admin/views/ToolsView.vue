@@ -427,7 +427,7 @@ onMounted(load)
             <el-option v-if="!upstreams.some((u) => u.key === form.upstream)" :value="form.upstream"
               :label="`${form.upstream}（未配置）`" />
           </el-select>
-          <span class="hint">上游在「系统设置 → OA 对接 → 业务上游地址」中维护；改上游属于不兼容变更。</span>
+          <span class="hint">上游在「连接配置 → 业务上游 / 连接器」的「业务上游地址」中维护；改上游属于不兼容变更。</span>
         </el-form-item>
         <el-form-item label="接口路径" required>
           <el-input v-model="form.path" placeholder="所选地址下的相对路径，如 /hr/leave/index">

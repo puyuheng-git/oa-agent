@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -24,6 +25,33 @@ from oa_agent.integrations.office_api import DEFAULT_UPSTREAM
 
 if TYPE_CHECKING:
     from oa_agent.kv import KV
+
+
+DEFAULT_CHANNEL_IDP_MAP = {
+    "oa_web": "oa_assertion",
+    "wecom": "wecom",
+    "demo": "demo",
+}
+DEFAULT_CHANNEL_IDP_MAP_JSON = '{"oa_web":"oa_assertion","wecom":"wecom","demo":"demo"}'
+
+
+def parse_channel_idp_map(raw: str | None) -> dict[str, str]:
+    """解析渠道映射；整体非法或单项无效时回落到对应默认值。"""
+    try:
+        parsed = json.loads(raw or DEFAULT_CHANNEL_IDP_MAP_JSON)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return dict(DEFAULT_CHANNEL_IDP_MAP)
+    if not isinstance(parsed, dict):
+        return dict(DEFAULT_CHANNEL_IDP_MAP)
+
+    result = dict(DEFAULT_CHANNEL_IDP_MAP)
+    result.update({
+        str(channel): idp_id.strip()
+        for channel, idp_id in parsed.items()
+        if isinstance(channel, str) and channel.strip()
+        and isinstance(idp_id, str) and idp_id.strip()
+    })
+    return result
 
 
 def register_default_idps() -> dict[str, IdP]:
@@ -73,6 +101,20 @@ class IdentityBroker:
         if idp is None:
             raise AppError(400, "IDP_UNKNOWN", f"未知身份提供者: {idp_id}")
         return idp.verify(payload, ctx=ctx)
+
+    def verify_channel(
+        self,
+        channel: str,
+        payload: dict,
+        *,
+        ctx: IdPContext,
+        channel_idp_map_json: str | None = None,
+    ) -> PrincipalClaims:
+        """按配置将渠道解析为 IdP，再执行校验。"""
+        idp_id = parse_channel_idp_map(channel_idp_map_json).get(channel)
+        if idp_id is None:
+            raise AppError(400, "CHANNEL_UNKNOWN", f"未知身份渠道: {channel}")
+        return self.verify(idp_id, payload, ctx=ctx)
 
     def session_from_claims(
         self,

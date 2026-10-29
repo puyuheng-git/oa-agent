@@ -132,5 +132,21 @@ def admin_read(*perms: str):
     return _guard(perms, write=False)
 
 
+def admin_read_any(*perms: str):
+    """只读接口拥有任一权限即可访问。"""
+    def dependency(request: Request):
+        ctx = authenticate(request)
+        if perms and ctx.perms.isdisjoint(perms):
+            _deny(ctx, request, [" 或 ".join(perms)])
+        db = ctx.runtime.session()
+        ctx.db = db
+        try:
+            yield ctx
+        finally:
+            db.close()
+
+    return dependency
+
+
 def admin_write(*perms: str):
     return _guard(perms, write=True)
