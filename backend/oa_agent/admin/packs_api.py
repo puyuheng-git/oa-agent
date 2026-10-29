@@ -2,7 +2,7 @@
 
 M3 权限复用 ``ops.tool.manage``（避免新增 ``ops.pack.manage`` 迁移噪音）；
 写操作走 CSRF + Idempotency-Key + 审计（``pack.enable`` / ``pack.disable``）。
-启停持久化到 settings 组 ``packs.disabled_ids``，并刷新 ``rt.pack_registry``。
+启停持久化到 settings 组 ``packs.disabled_ids`` / ``enabled_ids``，并刷新 Registry。
 """
 
 from __future__ import annotations
@@ -15,7 +15,13 @@ from oa_agent.chat.service import get_pack_registry
 from oa_agent.errors import AppError
 from oa_agent.packs.loader import validate_pack_files
 from oa_agent.packs.registry import PackRegistry
-from oa_agent.packs.state import PACKS_GROUP, load_disabled_ids, save_disabled_ids
+from oa_agent.packs.state import (
+    PACKS_GROUP,
+    load_disabled_ids,
+    load_enabled_ids,
+    save_disabled_ids,
+    save_enabled_ids,
+)
 
 router = APIRouter(prefix="/v1/admin/packs", tags=["admin-packs"])
 
@@ -56,14 +62,20 @@ def _toggle(ctx: AdminCtx, pack_id: str, *, enabled: bool, reason: str | None) -
 
     svc = ctx.runtime.settings_svc
     with ctx.db.begin():
-        current = load_disabled_ids(db=ctx.db, settings_service=svc)
+        disabled = load_disabled_ids(db=ctx.db, settings_service=svc)
+        explicit_enabled = load_enabled_ids(db=ctx.db, settings_service=svc)
         before_enabled = registry.is_enabled(pack_id)
+        manifest = next(m for m in registry.all_manifests() if m.id == pack_id)
 
-        disabled = list(current)
         if enabled:
             disabled = [x for x in disabled if x != pack_id]
-        elif pack_id not in disabled:
-            disabled.append(pack_id)
+            explicit_enabled = [x for x in explicit_enabled if x != pack_id]
+            if not manifest.default_enabled:
+                explicit_enabled.append(pack_id)
+        else:
+            if pack_id not in disabled:
+                disabled.append(pack_id)
+            explicit_enabled = [x for x in explicit_enabled if x != pack_id]
 
         save_disabled_ids(
             disabled,
@@ -71,8 +83,15 @@ def _toggle(ctx: AdminCtx, pack_id: str, *, enabled: bool, reason: str | None) -
             settings_service=svc,
             actor=ctx.user.username,
         )
-        # 事务内先按目标 disabled 列表更新内存，便于审计 after 与返回值一致
+        save_enabled_ids(
+            explicit_enabled,
+            db=ctx.db,
+            settings_service=svc,
+            actor=ctx.user.username,
+        )
+        # 事务内先按目标覆盖列表更新内存，便于审计 after 与返回值一致
         registry.set_disabled_ids(disabled)
+        registry.set_enabled_ids(explicit_enabled)
         after_enabled = registry.is_enabled(pack_id)
         ctx.audit(
             "pack.enable" if enabled else "pack.disable",

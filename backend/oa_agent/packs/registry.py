@@ -11,7 +11,12 @@ import yaml
 from oa_agent.packs.loader import discover_pack_entries
 from oa_agent.packs.rules_load import load_intent_rules
 from oa_agent.packs.schema import PackManifest
-from oa_agent.packs.state import load_disabled_ids, normalize_disabled_ids
+from oa_agent.packs.state import (
+    load_disabled_ids,
+    load_enabled_ids,
+    normalize_disabled_ids,
+    normalize_enabled_ids,
+)
 from oa_agent.settings import REPO_ROOT
 
 log = logging.getLogger(__name__)
@@ -72,7 +77,7 @@ def _operation_ids_from_openapi(path: Path) -> set[str]:
 class PackRegistry:
     """内存中的 Pack 启停注册表。
 
-    ``is_enabled(pack_id)``：若在 disabled_ids 中则为 False，否则取 manifest.default_enabled。
+    ``is_enabled(pack_id)``：disabled_ids 优先，其次 enabled_ids，最后取 manifest.default_enabled。
     未知 pack_id 视为未启用。
     """
 
@@ -80,38 +85,52 @@ class PackRegistry:
         self,
         manifests: list[PackManifest] | tuple[PackManifest, ...] | None = None,
         disabled_ids: list[str] | tuple[str, ...] | None = None,
+        enabled_ids: list[str] | tuple[str, ...] | None = None,
         *,
         pack_dirs: dict[str, Path] | None = None,
     ) -> None:
         self._manifests: dict[str, PackManifest] = {}
         self._pack_dirs: dict[str, Path] = {}
         self._disabled_ids: list[str] = []
-        self.reload(manifests=manifests, disabled_ids=disabled_ids, pack_dirs=pack_dirs)
+        self._enabled_ids: list[str] = []
+        self.reload(
+            manifests=manifests,
+            disabled_ids=disabled_ids,
+            enabled_ids=enabled_ids,
+            pack_dirs=pack_dirs,
+        )
 
     @classmethod
     def from_disk(
         cls,
         root: Path | None = None,
         disabled_ids: list[str] | tuple[str, ...] | None = None,
+        enabled_ids: list[str] | tuple[str, ...] | None = None,
     ) -> PackRegistry:
         """扫描磁盘 packs 根目录，保留 id → (manifest, pack_dir)。"""
         packs_root = root if root is not None else _DEFAULT_PACKS_ROOT
         entries = discover_pack_entries(packs_root)
         manifests = [m for m, _ in entries]
         pack_dirs = {m.id: d for m, d in entries}
-        return cls(manifests=manifests, disabled_ids=disabled_ids or [], pack_dirs=pack_dirs)
+        return cls(
+            manifests=manifests,
+            disabled_ids=disabled_ids or [],
+            enabled_ids=enabled_ids or [],
+            pack_dirs=pack_dirs,
+        )
 
     def reload(
         self,
         *,
         manifests: list[PackManifest] | tuple[PackManifest, ...] | None = None,
         disabled_ids: list[str] | tuple[str, ...] | None = None,
+        enabled_ids: list[str] | tuple[str, ...] | None = None,
         settings: dict | None = None,
         pack_dirs: dict[str, Path] | None = None,
     ) -> None:
-        """刷新 manifests 与/或 disabled_ids。
+        """刷新 manifests 与/或启停覆盖列表。
 
-        ``settings`` 为 packs 组值字典时，从中读取 disabled_ids（覆盖显式参数）。
+        ``settings`` 为 packs 组值字典时，从中读取两份覆盖列表（覆盖显式参数）。
         """
         if manifests is not None:
             self._manifests = {m.id: m for m in manifests}
@@ -124,12 +143,19 @@ class PackRegistry:
             self._pack_dirs = {pid: Path(path) for pid, path in pack_dirs.items()}
         if settings is not None:
             self._disabled_ids = load_disabled_ids(settings)
+            self._enabled_ids = load_enabled_ids(settings)
         elif disabled_ids is not None:
             self._disabled_ids = normalize_disabled_ids(disabled_ids)
+        if settings is None and enabled_ids is not None:
+            self._enabled_ids = normalize_enabled_ids(enabled_ids)
 
     @property
     def disabled_ids(self) -> list[str]:
         return list(self._disabled_ids)
+
+    @property
+    def enabled_ids(self) -> list[str]:
+        return list(self._enabled_ids)
 
     def pack_dir(self, pack_id: str) -> Path | None:
         return self._pack_dirs.get(pack_id)
@@ -138,19 +164,29 @@ class PackRegistry:
         """内存更新禁用列表（持久化由调用方 / state.save_disabled_ids 负责）。"""
         self._disabled_ids = normalize_disabled_ids(disabled_ids)
 
+    def set_enabled_ids(self, enabled_ids: list[str] | tuple[str, ...]) -> None:
+        """内存更新显式启用列表（持久化由调用方负责）。"""
+        self._enabled_ids = normalize_enabled_ids(enabled_ids)
+
     def set_disabled(self, pack_id: str, disabled: bool = True) -> None:
         """启用或禁用单个 pack（仅改内存）。"""
-        current = set(self._disabled_ids)
         if disabled:
-            current.add(pack_id)
+            self.set_enabled(pack_id, False)
         else:
-            current.discard(pack_id)
-        # 保序：原列表顺序 + 新加的排在末尾
-        ordered = [x for x in self._disabled_ids if x in current]
-        for pid in current:
-            if pid not in ordered:
-                ordered.append(pid)
-        self._disabled_ids = ordered
+            self.set_enabled(pack_id, True)
+
+    def set_enabled(self, pack_id: str, enabled: bool = True) -> None:
+        """按 manifest 默认值维护互斥的显式启用/禁用覆盖。"""
+        disabled = [pid for pid in self._disabled_ids if pid != pack_id]
+        explicit_enabled = [pid for pid in self._enabled_ids if pid != pack_id]
+        manifest = self._manifests.get(pack_id)
+        if enabled:
+            if manifest is not None and not manifest.default_enabled:
+                explicit_enabled.append(pack_id)
+        else:
+            disabled.append(pack_id)
+        self._disabled_ids = disabled
+        self._enabled_ids = explicit_enabled
 
     def is_enabled(self, pack_id: str) -> bool:
         manifest = self._manifests.get(pack_id)
@@ -158,6 +194,8 @@ class PackRegistry:
             return False
         if pack_id in self._disabled_ids:
             return False
+        if pack_id in self._enabled_ids:
+            return True
         return bool(manifest.default_enabled)
 
     def enabled_manifests(self) -> list[PackManifest]:

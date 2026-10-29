@@ -7,8 +7,15 @@ import pytest
 from oa_agent.config.schema import GROUPS, default
 from oa_agent.packs.loader import discover_packs, validate_pack_files
 from oa_agent.packs.registry import PackRegistry
-from oa_agent.packs.schema import load_manifest
-from oa_agent.packs.state import load_disabled_ids, normalize_disabled_ids, save_disabled_ids
+from oa_agent.packs.schema import PackManifest, load_manifest
+from oa_agent.packs.state import (
+    load_disabled_ids,
+    load_enabled_ids,
+    normalize_disabled_ids,
+    normalize_enabled_ids,
+    save_disabled_ids,
+    save_enabled_ids,
+)
 from oa_agent.settings import REPO_ROOT
 
 OA_TRAVEL_MANIFEST = REPO_ROOT / "packs" / "oa_travel" / "pack.yaml"
@@ -74,9 +81,10 @@ def test_validate_pack_files_broken_refs(tmp_path: Path):
     assert any("skills" in e for e in errors)
 
 
-def test_packs_setting_schema_has_disabled_ids():
+def test_packs_setting_schema_has_override_lists():
     assert "packs" in GROUPS
     assert default("packs", "disabled_ids") == []
+    assert default("packs", "enabled_ids") == []
 
 
 def test_normalize_and_load_disabled_ids_from_override():
@@ -90,6 +98,34 @@ def test_save_disabled_ids_updates_override_dict():
     store: dict = {}
     save_disabled_ids(["oa_travel"], store)
     assert store["disabled_ids"] == ["oa_travel"]
+
+
+def test_normalize_load_and_save_enabled_ids():
+    assert normalize_enabled_ids(["opt_in", "opt_in", "", 1]) == ["opt_in"]
+    assert load_enabled_ids({"enabled_ids": ["opt_in"]}) == ["opt_in"]
+    store: dict = {}
+    save_enabled_ids(["opt_in"], store)
+    assert store["enabled_ids"] == ["opt_in"]
+
+
+def test_pack_registry_enabled_ids_overrides_default_false_but_disabled_wins():
+    manifest = PackManifest(
+        id="opt_in",
+        display_name="Opt in",
+        version="1",
+        connectors=(),
+        skills=(),
+        tools_openapi=(),
+        write_contracts=(),
+        rules=None,
+        workflows=(),
+        default_enabled=False,
+    )
+    registry = PackRegistry([manifest], enabled_ids=["opt_in"])
+    assert registry.is_enabled("opt_in") is True
+
+    registry.set_disabled("opt_in")
+    assert registry.is_enabled("opt_in") is False
 
 
 def test_pack_registry_default_enables_oa_travel():

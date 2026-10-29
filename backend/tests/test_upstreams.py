@@ -60,7 +60,7 @@ def test_upstreams_validated_and_normalized(admin):
 
 def test_tool_on_other_upstream_uses_employee_token(admin, chat, office, monkeypatch):
     r = admin.post("/v1/admin/tools", json=HR_TOOL)
-    assert r.status_code == 422 and "未在「OA 对接」中配置" in r.json()["error"]["message"]
+    assert r.status_code == 422 and "未在「连接配置 → 业务上游 / 连接器」中配置" in r.json()["error"]["message"]
 
     assert set_upstreams(admin, [OFFICE_UPSTREAM, HR_UPSTREAM], default="office").status_code == 200
     listing = admin.get("/v1/admin/tools").json()

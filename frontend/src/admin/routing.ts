@@ -62,4 +62,32 @@ export function formatMs(v: number | null | undefined, fallbackLabel?: string | 
   return `${(v / 1000).toFixed(2)} s`
 }
 
+/** 从事件 metadata 取单个字符串展示字段；缺失或非标量则「暂无数据」。 */
+export function metadataDisplayField(
+  metadata: Record<string, unknown> | null | undefined,
+  key: string,
+): string {
+  if (!metadata) return NO_DATA
+  const v = metadata[key]
+  if (v == null || v === '') return NO_DATA
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  return NO_DATA
+}
+
+export interface RoutingEventMetadataDisplay {
+  connectorId: string
+  packId: string
+}
+
+/** 调用过程页：connector_id / pack_id（仅读 metadata，不编造）。 */
+export function routingEventMetadataDisplay(
+  metadata: Record<string, unknown> | null | undefined,
+): RoutingEventMetadataDisplay {
+  return {
+    connectorId: metadataDisplayField(metadata, 'connector_id'),
+    packId: metadataDisplayField(metadata, 'pack_id'),
+  }
+}
+
 export { rangeParams }

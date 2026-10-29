@@ -244,7 +244,7 @@ def _tool_view(ctx: AdminCtx, tool: Tool) -> dict:
 
 
 def _upstreams(ctx: AdminCtx) -> list[dict]:
-    """Tool 可选的业务上游（只读视图，供表单下拉；配置在「OA 对接」）"""
+    """Tool 可选的业务上游（只读视图，供表单下拉；配置在连接配置 → 业务上游 / 连接器）"""
     values = ctx.runtime.settings_svc.view(ctx.db, "oa")["values"]
     items = list(values.get("upstreams") or [])
     if items:
@@ -341,7 +341,7 @@ def _save_tool(ctx: AdminCtx, body: ToolIn, create: bool) -> dict:
                            "内置 / MCP 工具不可改 method、path、builtin_id 等核心字段；请用启停开关或「MCP 连接」页同步")
         upstream = spec.get("upstream", DEFAULT_UPSTREAM)
         if upstream not in {u["key"] for u in _upstreams(ctx)}:
-            raise AppError(422, "VALIDATION_ERROR", f"业务上游 {upstream} 未在「OA 对接」中配置")
+            raise AppError(422, "VALIDATION_ERROR", f"业务上游 {upstream} 未在「连接配置 → 业务上游 / 连接器」中配置")
         result = engine.catalog.save_tool(ctx.db, spec, ctx.user.username)
         ctx.db.flush()
         engine.catalog.revalidate_skills(ctx.db)

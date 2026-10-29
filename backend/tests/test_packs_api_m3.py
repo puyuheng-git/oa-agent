@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from oa_agent.packs.schema import PackManifest
 from tests.conftest import audit_rows, login
 from tests.test_accounts_rbac import VIEWER_PASS, _role, _user
 
@@ -44,6 +45,35 @@ def test_disable_then_enable_oa_travel(admin):
     actions = {a["action"] for a in audit_rows(admin)}
     assert "pack.disable" in actions
     assert "pack.enable" in actions
+
+
+def test_enable_default_disabled_pack_persists(admin):
+    registry = admin.client.app.state.runtime.pack_registry
+    manifests = registry.all_manifests() + [
+        PackManifest(
+            id="opt_in",
+            display_name="Opt in",
+            version="1",
+            connectors=(),
+            skills=(),
+            tools_openapi=(),
+            write_contracts=(),
+            rules=None,
+            workflows=(),
+            default_enabled=False,
+        )
+    ]
+    registry.reload(manifests=manifests)
+
+    r = admin.post(f"{URL}/opt_in/enable", json={"reason": "显式启用"})
+    assert r.status_code == 200, r.text
+    assert r.json()["enabled"] is True
+    assert _by_id(admin.get(URL).json()["items"], "opt_in")["enabled"] is True
+
+    registry.reload(settings={})
+    assert registry.is_enabled("opt_in") is False
+    registry.reload(settings=admin.client.app.state.runtime.group_settings("packs"))
+    assert registry.is_enabled("opt_in") is True
 
 
 def test_packs_requires_ops_tool_manage(admin, installed):
