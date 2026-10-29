@@ -1,0 +1,10 @@
+id: demo_http
+display_name: Demo HTTP（无 OA）
+version: "1"
+connectors: [demo]
+default_enabled: true
+skills: []
+tools_openapi: []
+write_contracts: []
+rules: rules/intent.yaml
+workflows: []

@@ -55,9 +55,9 @@
   - `IdPContext` 可含 kv、secrets getter、now、clock skew  
 - 失败抛现有 `AppError` 或统一 `IdPError` 再映射（优先复用 AppError 以少改路由）
 
-- [ ] **Step 1: 写 FakeIdP 测 Protocol**
-- [ ] **Step 2: 实现**
-- [ ] **Step 3:** `uv run pytest tests/test_idp_m4.py -q`
+- [x] **Step 1: 写 FakeIdP 测 Protocol**
+- [x] **Step 2: 实现**
+- [x] **Step 3:** `uv run pytest tests/test_idp_m4.py -q`
 
 ---
 
@@ -69,7 +69,7 @@
 - Modify: `chat_launch.verify_assertion` 可委托适配器，或适配器调用现有 verify 再映射 Claims（**推荐适配器调现有函数**，零行为漂移）
 - Test: 复用/扩展 assertion 测；`test_idp_m4.py` 断言 claims.principal_id == oa
 
-- [ ] **Step 1–3: TDD；`tests/test_auth.py` 仍绿**
+- [x] **Step 1–3: TDD；`tests/test_auth.py` 仍绿**
 
 ---
 
@@ -81,7 +81,7 @@
 - 委托现有 `OfficeApiClient.mint_by_wework`  
 - wecom channel 路径改为经适配器/Broker（最小改动：提函数供 channel 调用）
 
-- [ ] **Step 1–3:** `uv run pytest tests/test_wecom.py tests/test_idp_m4.py -q`（按现有 wecom 测文件名调整）
+- [x] **Step 1–3:** `uv run pytest tests/test_wecom.py tests/test_idp_m4.py -q`（按现有 wecom 测文件名调整）
 
 ---
 
@@ -96,9 +96,9 @@
 - `ensure_connector_credentials(session, connector_ids: list[str])` — OA pack 依赖 office：调 mint；demo：写入静态 token  
 - Session 继续双写 `oa` / `principal_id` / `credentials`
 
-- [ ] **Step 1: 测 Broker + oa IdP 产生与现网同构 session 字段**
-- [ ] **Step 2: 实现**
-- [ ] **Step 3:** `tests/test_chat.py tests/test_auth.py` 绿
+- [x] **Step 1: 测 Broker + oa IdP 产生与现网同构 session 字段**
+- [x] **Step 2: 实现**
+- [x] **Step 3:** `tests/test_chat.py tests/test_auth.py` 绿
 
 ---
 
@@ -116,7 +116,7 @@
 ```
 HMAC 或共享口令二选一；简单口令即可（仅本地）。
 
-- [ ] **Step 1–3: 无 OA 依赖的端到端测绿**
+- [x] **Step 1–3: 无 OA 依赖的端到端测绿**
 
 ---
 
@@ -128,7 +128,7 @@ HMAC 或共享口令二选一；简单口令即可（仅本地）。
 - 注册到 IdP registry 但默认不启用  
 - Test: 调用即得到明确错误码（非 500 堆栈）
 
-- [ ] **Step 1–3: pytest 绿**
+- [x] **Step 1–3: pytest 绿**
 
 ---
 
@@ -140,9 +140,9 @@ HMAC 或共享口令二选一；简单口令即可（仅本地）。
 - 权威设计 §6 身份增补「IdP 适配器」一句  
 - Plan checkboxes
 
-- [ ] **Step 1:** `cd backend && uv run pytest -q`
-- [ ] **Step 2: 交付说明（手工/外部依赖未验证分列）**
-- [ ] **Step 3: 用户要求时再 commit/push**
+- [x] **Step 1:** `cd backend && uv run pytest -q`（557 passed, 1 skipped）
+- [x] **Step 2: 交付说明（手工/外部依赖未验证分列）** — `channel_idp_map` 因无 dict kind 未加，见交付
+- [x] **Step 3: 用户要求时再 commit/push**
 
 ---
 

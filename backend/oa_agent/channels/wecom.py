@@ -4,8 +4,8 @@
 → 每 30 秒 ping → 收 aibot_msg_callback / aibot_event_callback → 用回调的 req_id 回 aibot_respond_msg（流式，finish=true 结束）。
 同一机器人只能有一个有效连接，新连接会踢掉旧连接（旧连接收到 disconnected_event）。
 
-身份：消息里只有企业微信 userid（来自企业微信服务端，可信）。由 office-api `/agent/token/mint` 按企微绑定解析
-OA 主账号并签发员工 token，员工身份以 OA 返回的 oa 为准（Agent 不做映射、不读 td_oa）。只支持单聊。
+身份：消息里只有企业微信 userid（来自企业微信服务端，可信）。经 WeComIdP（委托 office-api `/agent/token/mint`）
+按企微绑定解析 OA 主账号并签发员工 token，员工身份以 OA 返回的 oa 为准（Agent 不做映射、不读 td_oa）。只支持单聊。
 """
 
 from __future__ import annotations
@@ -29,6 +29,8 @@ from oa_agent.chat.threads import ensure_thread
 from oa_agent.config.schema import default as default_setting
 from oa_agent.errors import AppError
 from oa_agent.ids import new_request_id, new_thread_id
+from oa_agent.identity.adapters.wecom import WeComIdP
+from oa_agent.identity.idp import IdPContext
 from oa_agent.integrations.office_api import OfficeApiError
 from oa_agent.observability.redact import redact
 
@@ -157,26 +159,47 @@ def _user_key(userid: str) -> str:
 
 
 def wecom_session(rt, userid: str) -> tuple[ChatSession, str]:
-    """企业微信用户的服务端会话：ticket 随机生成、只存在服务端；token 临近过期时按 userid 重新解析并签发。"""
+    """企业微信用户的服务端会话：ticket 随机生成、只存在服务端；token 临近过期时按 userid 经 WeComIdP 重新解析并签发。"""
     kv = rt.kv.current
     ticket = kv.get(_user_key(userid))
     session = chat_launch.load_session(kv, ticket) if ticket else None
     policy = service.launch_policy(rt)
     if session is None or session.token_expires_at - int(time.time()) < policy.remint_before:
         gateway_secret = service.load_settings(rt, "oa").get("gateway_secret")
-        result = service.office_client(rt).mint_by_wework(userid, gateway_secret)
-        if result.ttl_seconds <= 60:
+        client = service.office_client(rt)
+        claims = WeComIdP(client_factory=lambda: client).verify(
+            {"wework_user_id": userid},
+            ctx=IdPContext(secrets={"gateway_secret": gateway_secret}),
+        )
+        raw = claims.raw or {}
+        ttl_seconds = int(raw.get("ttl_seconds") or 0)
+        if ttl_seconds <= 60:
             raise AppError(502, "MINT_FAILED", "签发的员工令牌有效期过短")
-        expires_at = int(time.time()) + result.ttl_seconds
-        if session is None or session.oa != result.oa:
+        authorization = str(raw.get("authorization") or "")
+        oa = claims.principal_id
+        display_name = claims.display_name or oa
+        uid_raw = raw.get("uid")
+        try:
+            uid = int(uid_raw) if uid_raw is not None else None
+        except (TypeError, ValueError):
+            uid = None
+        expires_at = int(time.time()) + ttl_seconds
+        if session is None or session.oa != oa:
             ticket = secrets.token_urlsafe(32)
-            session = ChatSession(oa=result.oa, uid=result.uid, display_name=result.display_name or result.oa,
-                                  thread_id=new_thread_id(), office_token=result.authorization,
-                                  token_expires_at=expires_at, created_at=int(time.time()), channel=CHANNEL)
+            session = ChatSession(
+                oa=oa,
+                uid=uid,
+                display_name=display_name,
+                thread_id=new_thread_id(),
+                office_token=authorization,
+                token_expires_at=expires_at,
+                created_at=int(time.time()),
+                channel=CHANNEL,
+            )
             with rt.session() as db, db.begin():
                 ensure_thread(db, thread_id=session.thread_id, oa=session.oa, channel=CHANNEL)
         else:
-            session.office_token, session.token_expires_at = result.authorization, expires_at
+            session.office_token, session.token_expires_at = authorization, expires_at
     ttl = chat_launch.store_session(kv, ticket, session, policy)
     kv.set(_user_key(userid), ticket, ttl)
     return session, chat_launch.session_key(ticket)

@@ -418,6 +418,33 @@ GROUPS: dict[str, GroupDef] = {
             description="Domain Pack 启停覆盖。默认启用的包（如 oa_travel）无需列出；"
                         "只需把要关闭的包 id 写入 disabled_ids。",
         ),
+        GroupDef(
+            "idp",
+            "身份提供者",
+            "热生效",
+            (
+                FieldDef(
+                    "demo_idp_enabled",
+                    "启用 Demo IdP",
+                    "bool",
+                    False,
+                    "开启后允许用共享口令建立本地 demo 会话（无 OA/office）。"
+                    "仅供本地开发与自动化测试；生产环境务必保持关闭。",
+                ),
+                FieldDef(
+                    "demo_shared_secret",
+                    "Demo 共享口令",
+                    "str",
+                    "",
+                    "Demo IdP 校验用的本地共享口令（明文存配置，仅限本机）。"
+                    "与入站 payload.secret 一致才签发主体；生产勿开启 Demo。",
+                    max=256,
+                ),
+            ),
+            description="身份提供者（IdP）开关与本地 demo 参数。"
+                        "Demo 默认关闭；开启后仍须正确共享口令才能建会话。"
+                        "渠道→IdP 映射（channel_idp_map）待 FieldDef 支持 dict 后配置化。",
+        ),
     )
 }
 

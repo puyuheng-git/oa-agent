@@ -103,6 +103,10 @@
 - 分发锁定：本机目录 + 后台启停；不上传 zip（见多系统规格）。
 - M3 **不做**：IdP/OIDC（M4）、连接器管理 UI 大改（M5）。
 
+#### IdP 适配器（M4）
+
+「证明对话者是谁」经 **`identity/` IdP Protocol + IdentityBroker**：`oa_assertion` / `wecom` / `demo` 正式适配器；`oidc` 仅骨架（未实现错误码）。外部协议与员工可见文案不变；demo 默认关闭。渠道路由配置 map（`idp.channel_idp_map`）待 schema 支持 dict 后再加。详情见多系统规格 M4 与交付说明。
+
 ---
 
 ## 4. 仓库结构
@@ -207,10 +211,12 @@ oa-langGraph/
 
 ## 6. 身份与会话
 
+身份证明入口经 **IdP 适配器**（M4）：OA iframe → `oa_assertion`；企微 → `wecom`（仍委托 office-api mint）；本地演示 → `demo`（默认关）。`IdentityBroker` 将 `PrincipalClaims` 映射为会话（`oa` / `principal_id` / `credentials` 双写）。OIDC 适配器仅骨架。
+
 ### 6.1 员工对话（OA iframe）
 
 1. OA 宿主页（GBK，`inc/auth.php` 登录校验）服务端构造 assertion：`{oa, uid, display_name, exp(≤60s), nonce, iss: "oa-host", aud: "oa-langgraph"}`，HMAC-SHA256 签名。
-2. 宿主页服务端 `POST /v1/chat/launch`（带 assertion）→ Agent 校验签名/时效/nonce → mint office token（调 office-api `/agent/token/mint`）→ 返回一次性 `launch_code`（60s，单次使用）。
+2. 宿主页服务端 `POST /v1/chat/launch`（带 assertion）→ Agent 经 `OaAssertionIdP` / Broker 校验签名/时效/nonce → mint office token（调 office-api `/agent/token/mint`）→ 返回一次性 `launch_code`（60s，单次使用）。外部协议不变。
 3. 宿主页输出 `<iframe src="https://agent/chat/?launch=CODE">`。
 4. iframe 内 SPA `POST /v1/chat/session`（launch_code）→ 获得 chat ticket，**仅存内存**，请求用 `Authorization: Bearer`（避开第三方 Cookie 限制）。
 5. 安全头：`Content-Security-Policy: frame-ancestors <配置的 OA 域名>`；ticket TTL 30 分钟，可续期；office token 只存 Redis，不下发浏览器。
@@ -221,7 +227,7 @@ oa-langGraph/
 
 1. **连接**：后台线程连接 `wss://openws.work.weixin.qq.com` → `aibot_subscribe{bot_id, secret}`（errcode≠0 视为失败）→ 每 30 秒 `ping`；75 秒无任何下行帧视为断线；断线指数退避（1→60 秒）重连；每 10 秒检查配置，变更即重连。同一机器人只允许一个连接：收到 `disconnected_event`（被新连接替换）后 5 分钟再试，状态如实显示。**单实例部署**（与 §15.1 一致）。
 2. **消息**：`aibot_msg_callback` 按 `msgid` 去重（10 分钟）；只处理单聊，群聊回复「请在单聊中向我提问」；支持 `text`、`voice`（转文字）、`mixed` 中的文字，其余类型提示只支持文字。
-3. **身份**：消息中的 `from.userid` 来自企业微信服务端（经 BotID+Secret 鉴权的连接），可信；Agent **不做映射**，调用 office-api `POST /agent/token/mint`（表单 `wework_user_id`、`gateway_secret`），由 OA 按企微绑定解析主账号并签发员工 token，员工身份以 OA 返回的 `oa` 为准。未绑定等失败时把 OA 返回的 `msg` 回给员工。会话存服务端（随机 ticket，不外发，30 分钟滑动，token 临近过期按 userid 重新解析签发），`channel = "wecom"`；之后与 OA iframe 走同一条 `handle_message` 链路（限流、去重、运行记录、对话记录、介入、重试一致）。
+3. **身份**：消息中的 `from.userid` 来自企业微信服务端（经 BotID+Secret 鉴权的连接），可信；Agent **不做映射**，经 **`WeComIdP.verify`** 调用 office-api `POST /agent/token/mint`（表单 `wework_user_id`、`gateway_secret`），由 OA 按企微绑定解析主账号并签发员工 token，员工身份以 OA 返回的 `oa` 为准。未绑定等失败时把 OA 返回的 `msg` 回给员工。会话存服务端（随机 ticket，不外发，30 分钟滑动，token 临近过期按 userid 重新解析签发），`channel = "wecom"`；之后与 OA iframe 走同一条 `handle_message` 链路（限流、去重、运行记录、对话记录、介入、重试一致）。
 4. **回复**：先回流式消息「正在查询…」（`finish=false`），完成后同一 `stream.id` 推送最终 Markdown（`finish=true`），超过 20000 字节截断提示；`enter_chat` 事件回复欢迎语（可用 Skill 与示例）。转人工的结果企业微信不主动推送，提示员工稍后重新提问。
 5. **状态**：`/readyz` 与配置中心「企业微信」页显示 未配置 / 连接中 / 已连接 / 已断开（含原因，Secret 不出现在状态、日志与错误中）。
 

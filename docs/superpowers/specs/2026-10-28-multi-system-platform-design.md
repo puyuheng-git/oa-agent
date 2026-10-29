@@ -299,4 +299,5 @@ integrations/office_api.py  → 迁入 connectors/http_profiles/oa_office.py（�
 - M1：[`multi-system-m1-connectors`](../plans/2026-10-28-multi-system-m1-connectors.md) · [`multi-system-m1-delivery`](../../delivery/2026-10-28-multi-system-m1-delivery.md)  
 - M2：[`multi-system-m2-envelope`](../plans/2026-10-28-multi-system-m2-envelope.md) · [`multi-system-m2-delivery`](../../delivery/2026-10-28-multi-system-m2-delivery.md)  
 - M3：[`multi-system-m3-packs`](../plans/2026-10-28-multi-system-m3-packs.md) · [`multi-system-m3-delivery`](../../delivery/2026-10-28-multi-system-m3-delivery.md)  
-- **下一步 M4：** [`multi-system-m4-idp`](../plans/2026-10-29-multi-system-m4-idp.md)（OIDC 仅骨架）
+- M4：[`multi-system-m4-idp`](../plans/2026-10-29-multi-system-m4-idp.md) · [`multi-system-m4-delivery`](../../delivery/2026-10-29-multi-system-m4-delivery.md)（OIDC 仅骨架）  
+- **下一步 M5：** 管理端连接器/包产品化、命名去 OA 中心化、演示 Pack（见 §9）
