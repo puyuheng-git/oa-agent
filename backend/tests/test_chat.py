@@ -394,11 +394,11 @@ def test_chat_path_serves_farewell_not_spa(chat):
     assert r.headers["content-type"].startswith("text/html")
 
 
-def test_chat_farewell_shows_configured_ui_url(chat, admin):
+def test_chat_farewell_with_ui_url_does_not_expose_chat_shell_link(chat, admin):
     admin.put("/v1/admin/settings/oa", json={"values": {"chat_ui_base_url": "https://chat.example.com"}})
     body = chat.get("/chat/").text
-    assert 'href="https://chat.example.com/"' in body
-    assert "打开新对话" in body
+    assert "chat.example.com" not in body
+    assert "打开新对话" not in body
     assert "回 OA 打开助手" in body
     assert "puyuheng-git" not in body
 

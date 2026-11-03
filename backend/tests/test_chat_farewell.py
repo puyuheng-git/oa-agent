@@ -23,20 +23,20 @@ def test_farewell_without_ui_url_empty_string_same_as_none():
     assert "回 OA 打开助手" in html
 
 
-def test_farewell_with_ui_url_secondary_chat_link_and_oa_primary():
+def test_farewell_with_ui_url_does_not_render_secondary_chat_link():
     html = build_farewell_html("https://chat.example.com")
     assert _REPO_SNIPPET not in html
-    assert 'href="https://chat.example.com/"' in html
-    assert "打开新对话" in html
+    assert "chat.example.com" not in html
+    assert "打开新对话" not in html
+    assert "btn-secondary" not in html
     assert "回 OA 打开助手" in html
-    assert "btn-secondary" in html and "打开新对话" in html
     assert "goBackToOa" in html
 
 
-def test_farewell_strips_trailing_slash_on_base_url():
+def test_farewell_with_ui_url_trailing_slash_still_no_chat_cta():
     html = build_farewell_html("https://chat.example.com/")
-    assert 'href="https://chat.example.com/"' in html
-    assert "https://chat.example.com//" not in html
+    assert "chat.example.com" not in html
+    assert "打开新对话" not in html
 
 
 def test_farewell_uses_configured_oa_entry_href():
