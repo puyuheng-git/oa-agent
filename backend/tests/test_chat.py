@@ -397,7 +397,17 @@ def test_chat_path_serves_farewell_not_spa(chat):
 def test_chat_farewell_shows_configured_ui_url(chat, admin):
     admin.put("/v1/admin/settings/oa", json={"values": {"chat_ui_base_url": "https://chat.example.com"}})
     body = chat.get("/chat/").text
-    assert "https://chat.example.com" in body
+    assert 'href="https://chat.example.com/"' in body
+    assert "打开新对话" in body
+    assert "返回 OA" in body
+    assert "puyuheng-git" not in body
+
+
+def test_chat_farewell_default_has_back_without_repo(chat):
+    body = chat.get("/chat/").text
+    assert "返回 OA" in body
+    assert "goBackToOa" in body
+    assert "puyuheng-git" not in body
 
 
 def test_embed_script_served_as_utf8(chat):
