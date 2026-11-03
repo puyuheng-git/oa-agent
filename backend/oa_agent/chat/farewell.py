@@ -24,8 +24,11 @@ def build_farewell_html(
     *,
     oa_entry_url: str | None = None,
 ) -> str:
-    """生成中文迁移说明 HTML（内联样式，无外部依赖）。"""
-    chat_url = (chat_ui_base_url or "").strip().rstrip("/")
+    """生成中文迁移说明 HTML（内联样式，无外部依赖）。
+
+    ``chat_ui_base_url`` 保留供调用方签名稳定；告别页不渲染指向独立 UI 根路径的按钮。
+    """
+    del chat_ui_base_url
     oa_href_raw = (oa_entry_url or "").strip()
     if oa_href_raw:
         safe_oa = html.escape(oa_href_raw, quote=True)
@@ -41,27 +44,13 @@ def build_farewell_html(
         "</p>"
     )
     body = "<p>请从 OA 工作台的智能助手入口重新进入。</p>"
-    if chat_url:
-        safe_chat = html.escape(chat_url, quote=True)
-        chat_btn = (
-            f'<a class="btn btn-secondary" href="{safe_chat}/" rel="noopener noreferrer">'
-            "打开新对话</a>"
-        )
-        entry = (
-            f"{body}"
-            '<div class="actions">'
-            f"{oa_btn}{chat_btn}"
-            "</div>"
-            f"{back_fallback}"
-        )
-    else:
-        entry = (
-            f"{body}"
-            '<div class="actions">'
-            f"{oa_btn}"
-            "</div>"
-            f"{back_fallback}"
-        )
+    entry = (
+        f"{body}"
+        '<div class="actions">'
+        f"{oa_btn}"
+        "</div>"
+        f"{back_fallback}"
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -92,10 +81,6 @@ def build_farewell_html(
       background: #0068e6; color: #fff;
     }}
     .btn-primary:hover {{ background: #0052b8; }}
-    .btn-secondary {{
-      background: #eef2f7; color: #1a2332;
-    }}
-    .btn-secondary:hover {{ background: #dde4ed; }}
   </style>
 </head>
 <body>
