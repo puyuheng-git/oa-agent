@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 import sqlalchemy as sa
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from oa_agent.admin import (
@@ -20,6 +20,7 @@ from oa_agent.admin import (
 )
 from oa_agent.auth import admin as admin_auth
 from oa_agent.bootstrap import setup_api
+from oa_agent.chat import farewell as chat_farewell
 from oa_agent.chat import router as chat_router
 from oa_agent.config.service import normalize_origin
 from oa_agent.db.migrate import revision_status
@@ -33,7 +34,9 @@ log = logging.getLogger("oa_agent")
 
 SETUP_PREFIXES = ("/setup", "/v1/setup")
 ALWAYS_OPEN = ("/healthz", "/readyz", "/assets", "/favicon.ico")
-SPA_ENTRIES = ("setup", "admin", "chat")
+SPA_ENTRIES = ("setup", "admin")
+CHAT_CORS_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+CHAT_CORS_HEADERS = "Authorization, Content-Type, Accept, X-Request-Id"
 FRAME_CACHE_SECONDS = 30
 
 
@@ -51,6 +54,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.runtime = runtime
     install_error_handlers(app)
     frame_cache: dict = {"at": float("-inf"), "value": "'none'"}
+    chat_ui_cache: dict = {"at": float("-inf"), "value": ""}
 
     def frame_ancestors() -> str:
         """/chat 只允许被配置的 OA 域名嵌入；未配置时禁止嵌入。缓存 30 秒。"""
@@ -67,6 +71,45 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             except Exception:  # noqa: BLE001 —— 读不到配置时沿用上次结果
                 log.exception("读取 allowed_frame_origins 失败")
         return frame_cache["value"]
+
+    def chat_ui_base_url() -> str:
+        if runtime.mode != NORMAL:
+            return ""
+        now = time.monotonic()
+        if now - chat_ui_cache["at"] > FRAME_CACHE_SECONDS:
+            chat_ui_cache["at"] = now
+            try:
+                with runtime.session() as db:
+                    raw = runtime.settings_svc.effective(db, "oa").get("chat_ui_base_url") or ""
+                chat_ui_cache["value"] = str(raw).strip().rstrip("/")
+            except Exception:  # noqa: BLE001
+                log.exception("读取 chat_ui_base_url 失败")
+        return chat_ui_cache["value"]
+
+    def chat_cors_headers(origin: str) -> dict[str, str]:
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": CHAT_CORS_METHODS,
+            "Access-Control-Allow-Headers": CHAT_CORS_HEADERS,
+            "Vary": "Origin",
+        }
+
+    @app.middleware("http")
+    async def chat_cors(request: Request, call_next):
+        path = request.url.path
+        if not path.startswith("/v1/chat"):
+            return await call_next(request)
+        allowed = set(runtime.settings.chat_cors_allowlist())
+        origin = request.headers.get("origin")
+        if request.method == "OPTIONS":
+            if origin and origin in allowed:
+                return Response(status_code=204, headers=chat_cors_headers(origin))
+            return Response(status_code=403)
+        response = await call_next(request)
+        if origin and origin in allowed:
+            for key, value in chat_cors_headers(origin).items():
+                response.headers[key] = value
+        return response
 
     @app.middleware("http")
     async def gate_and_headers(request: Request, call_next):
@@ -108,7 +151,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def readyz():
         return _readiness(runtime)
 
-    _mount_frontend(app, runtime)
+    _mount_frontend(app, runtime, chat_ui_base_url)
     return app
 
 
@@ -152,7 +195,7 @@ def _readiness(rt: AppRuntime):
     return JSONResponse(checks, status_code=200 if ready else 503)
 
 
-def _mount_frontend(app: FastAPI, rt: AppRuntime) -> None:
+def _mount_frontend(app: FastAPI, rt: AppRuntime, chat_ui_url_fn) -> None:
     dist = rt.settings.frontend_dist
     if (dist / "assets").is_dir():
         app.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
@@ -189,6 +232,14 @@ def _mount_frontend(app: FastAPI, rt: AppRuntime) -> None:
         serve, redirect = spa_handlers(entry)
         app.add_api_route(f"/{entry}/", serve, include_in_schema=False)
         app.add_api_route(f"/{entry}", redirect, include_in_schema=False)
+
+    @app.get("/chat/", include_in_schema=False, response_class=HTMLResponse)
+    def chat_farewell_page():
+        return chat_farewell.build_farewell_html(chat_ui_url_fn() or None)
+
+    @app.get("/chat", include_in_schema=False)
+    def chat_farewell_redirect():
+        return RedirectResponse("/chat/")
 
 
 def __getattr__(name: str):

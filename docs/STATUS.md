@@ -1,6 +1,6 @@
 # 项目完成度与后续扩展
 
-**更新日期：** 2026-10-29  
+**更新日期：** 2026-11-03  
 **权威设计：** [`design/2026-10-09-oa-langgraph-design.md`](design/2026-10-09-oa-langgraph-design.md)  
 **冲突时以 `design/` 为准；** `history/` / `reference/` 仅供追溯。
 
@@ -40,6 +40,7 @@
 | 多系统 M3 Domain Pack | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M3；计划 [`multi-system-m3-packs`](superpowers/plans/2026-10-28-multi-system-m3-packs.md) | [`multi-system-m3-delivery`](delivery/2026-10-28-multi-system-m3-delivery.md) | ✅ |
 | 多系统 M4 IdP | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M4；计划 [`multi-system-m4-idp`](superpowers/plans/2026-10-29-multi-system-m4-idp.md) | [`multi-system-m4-delivery`](delivery/2026-10-29-multi-system-m4-delivery.md) | ✅（OIDC 仅骨架；渠道路由 map 待 schema） |
 | 多系统 M5 产品化 | [`multi-system-platform-design`](superpowers/specs/2026-10-28-multi-system-platform-design.md) M5；计划 [`multi-system-m5-productize`](superpowers/plans/2026-10-29-multi-system-m5-productize.md) | [`multi-system-m5-delivery`](delivery/2026-10-29-multi-system-m5-delivery.md) | ✅（OIDC 真联调、HTTP 入口接 `verify_channel` 后置） |
+| STD-009 对话 UI 外置（编排侧） | 员工 Q&A 静态站 `oa-agent-chat` | [`2026-11-03-std-009-orchestration`](delivery/2026-11-03-std-009-orchestration.md) | ✅ 本仓库：`/chat` 迁移页 + CORS + `chat_ui_base_url` |
 
 **清理（2026-10-28）：** 已删除 `scripts/` 下一批一次性修补/反编译临时脚本（`_*`），仅保留 `start.ps1` / `start.sh`。
 
