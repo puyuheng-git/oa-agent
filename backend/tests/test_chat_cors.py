@@ -7,8 +7,16 @@ import respx
 from fastapi.testclient import TestClient
 
 from oa_agent.main import create_app
+from oa_agent.settings import AppSettings
 from tests.conftest import make_settings, login, install_payload
 from tests.test_chat import HMAC_SECRET, OFFICE, GATEWAY, make_assertion, mint_handler
+
+
+def test_chat_cors_origins_reads_chat_cors_origins_env(monkeypatch):
+    monkeypatch.setenv("CHAT_CORS_ORIGINS", "https://from-env.test")
+    monkeypatch.delenv("OA_AGENT_CHAT_CORS_ORIGINS", raising=False)
+    settings = AppSettings()
+    assert settings.chat_cors_allowlist() == ["https://from-env.test"]
 
 
 @pytest.fixture
