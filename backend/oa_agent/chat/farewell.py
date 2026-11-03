@@ -19,36 +19,46 @@ function goBackToOa() {
 """
 
 
-def build_farewell_html(chat_ui_base_url: str | None) -> str:
+def build_farewell_html(
+    chat_ui_base_url: str | None,
+    *,
+    oa_entry_url: str | None = None,
+) -> str:
     """生成中文迁移说明 HTML（内联样式，无外部依赖）。"""
-    url = (chat_ui_base_url or "").strip().rstrip("/")
-    back_btn = (
-        '<button type="button" class="btn btn-secondary" onclick="goBackToOa()">返回 OA</button>'
-    )
+    chat_url = (chat_ui_base_url or "").strip().rstrip("/")
+    oa_href_raw = (oa_entry_url or "").strip()
+    if oa_href_raw:
+        safe_oa = html.escape(oa_href_raw, quote=True)
+        oa_btn = f'<a class="btn btn-primary" href="{safe_oa}">回 OA 打开助手</a>'
+    else:
+        oa_btn = (
+            '<a class="btn btn-primary" href="#" onclick="goBackToOa(); return false;">'
+            "回 OA 打开助手</a>"
+        )
     back_fallback = (
         '<p id="back-fallback" class="hint" hidden>'
         "无法自动返回时，请关闭本窗口或标签页，从 OA 工作台中的智能助手入口重新进入。"
         "</p>"
     )
-    if url:
-        safe_href = html.escape(url, quote=True)
+    body = "<p>请从 OA 工作台的智能助手入口重新进入。</p>"
+    if chat_url:
+        safe_chat = html.escape(chat_url, quote=True)
+        chat_btn = (
+            f'<a class="btn btn-secondary" href="{safe_chat}/" rel="noopener noreferrer">'
+            "打开新对话</a>"
+        )
         entry = (
-            "<p>员工对话页已迁至独立站点。点击下方按钮打开新对话，或返回 OA 继续其他工作。</p>"
+            f"{body}"
             '<div class="actions">'
-            f'<a class="btn btn-primary" href="{safe_href}/" rel="noopener noreferrer">打开新对话</a>'
-            f"{back_btn}"
+            f"{oa_btn}{chat_btn}"
             "</div>"
-            '<p class="hint">若从 OA 进入，请让 OA 宿主页 iframe 指向上述对话页地址'
-            "（或联系管理员更新「员工对话页地址」）。</p>"
             f"{back_fallback}"
         )
     else:
         entry = (
-            "<p>员工对话界面已迁出本服务，本地址不再提供对话功能。</p>"
-            "<p>请从 <strong>OA 工作台</strong> 中的智能助手入口重新进入；"
-            "OA 宿主页会完成身份校验并打开新的对话页。</p>"
+            f"{body}"
             '<div class="actions">'
-            f"{back_btn}"
+            f"{oa_btn}"
             "</div>"
             f"{back_fallback}"
         )
@@ -57,7 +67,7 @@ def build_farewell_html(chat_ui_base_url: str | None) -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>对话页已迁移</title>
+  <title>问答页已迁移</title>
   <style>
     body {{
       font-family: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -90,7 +100,7 @@ def build_farewell_html(chat_ui_base_url: str | None) -> str:
 </head>
 <body>
   <main class="card">
-    <h1>员工对话页已迁移</h1>
+    <h1>问答页已迁移</h1>
     {entry}
   </main>
 {_BACK_SCRIPT}

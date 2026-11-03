@@ -55,6 +55,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     install_error_handlers(app)
     frame_cache: dict = {"at": float("-inf"), "value": "'none'"}
     chat_ui_cache: dict = {"at": float("-inf"), "value": ""}
+    oa_entry_cache: dict = {"at": float("-inf"), "value": ""}
 
     def frame_ancestors() -> str:
         """/chat 只允许被配置的 OA 域名嵌入；未配置时禁止嵌入。缓存 30 秒。"""
@@ -85,6 +86,20 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             except Exception:  # noqa: BLE001
                 log.exception("读取 chat_ui_base_url 失败")
         return chat_ui_cache["value"]
+
+    def oa_entry_url() -> str:
+        if runtime.mode != NORMAL:
+            return ""
+        now = time.monotonic()
+        if now - oa_entry_cache["at"] > FRAME_CACHE_SECONDS:
+            oa_entry_cache["at"] = now
+            try:
+                with runtime.session() as db:
+                    raw = runtime.settings_svc.effective(db, "oa").get("oa_entry_url") or ""
+                oa_entry_cache["value"] = str(raw).strip()
+            except Exception:  # noqa: BLE001
+                log.exception("读取 oa_entry_url 失败")
+        return oa_entry_cache["value"]
 
     def chat_cors_headers(origin: str) -> dict[str, str]:
         return {
@@ -151,7 +166,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def readyz():
         return _readiness(runtime)
 
-    _mount_frontend(app, runtime, chat_ui_base_url)
+    _mount_frontend(app, runtime, chat_ui_base_url, oa_entry_url)
     return app
 
 
@@ -195,7 +210,12 @@ def _readiness(rt: AppRuntime):
     return JSONResponse(checks, status_code=200 if ready else 503)
 
 
-def _mount_frontend(app: FastAPI, rt: AppRuntime, chat_ui_url_fn) -> None:
+def _mount_frontend(
+    app: FastAPI,
+    rt: AppRuntime,
+    chat_ui_url_fn,
+    oa_entry_url_fn,
+) -> None:
     dist = rt.settings.frontend_dist
     if (dist / "assets").is_dir():
         app.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
@@ -235,7 +255,10 @@ def _mount_frontend(app: FastAPI, rt: AppRuntime, chat_ui_url_fn) -> None:
 
     @app.get("/chat/", include_in_schema=False, response_class=HTMLResponse)
     def chat_farewell_page():
-        return chat_farewell.build_farewell_html(chat_ui_url_fn() or None)
+        return chat_farewell.build_farewell_html(
+            chat_ui_url_fn() or None,
+            oa_entry_url=oa_entry_url_fn() or None,
+        )
 
     @app.get("/chat", include_in_schema=False)
     def chat_farewell_redirect():

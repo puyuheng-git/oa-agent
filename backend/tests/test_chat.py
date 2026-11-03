@@ -390,7 +390,7 @@ def test_chat_path_serves_farewell_not_spa(chat):
     r = chat.get("/chat/")
     assert r.status_code == 200
     assert "OLD CHAT SPA" not in r.text
-    assert "迁移" in r.text
+    assert "问答页已迁移" in r.text
     assert r.headers["content-type"].startswith("text/html")
 
 
@@ -399,15 +399,26 @@ def test_chat_farewell_shows_configured_ui_url(chat, admin):
     body = chat.get("/chat/").text
     assert 'href="https://chat.example.com/"' in body
     assert "打开新对话" in body
-    assert "返回 OA" in body
+    assert "回 OA 打开助手" in body
     assert "puyuheng-git" not in body
 
 
 def test_chat_farewell_default_has_back_without_repo(chat):
     body = chat.get("/chat/").text
-    assert "返回 OA" in body
+    assert "回 OA 打开助手" in body
+    assert 'href="#"' in body
     assert "goBackToOa" in body
     assert "puyuheng-git" not in body
+
+
+def test_chat_farewell_uses_configured_oa_entry(chat, admin):
+    admin.put(
+        "/v1/admin/settings/oa",
+        json={"values": {"oa_entry_url": "https://oa.example.com/assistant"}},
+    )
+    body = chat.get("/chat/").text
+    assert 'href="https://oa.example.com/assistant"' in body
+    assert "回 OA 打开助手" in body
 
 
 def test_embed_script_served_as_utf8(chat):
