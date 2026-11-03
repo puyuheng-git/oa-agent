@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from oa_agent.config.service import normalize_origin
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -22,6 +25,16 @@ class AppSettings(BaseSettings):
     """仅测试使用：允许安装向导以 SQLite 代替 MySQL。"""
     require_redis: bool = False
     """生产多实例须为 True；为 True 时进程内 MemoryKV 会在启动校验中被拒绝。"""
+    chat_cors_origins: str = Field(default="", validation_alias="CHAT_CORS_ORIGINS")
+    """逗号分隔的员工对话静态站 Origin（如 https://chat.example.com）。环境变量 CHAT_CORS_ORIGINS。"""
+
+    def chat_cors_allowlist(self) -> list[str]:
+        out: list[str] = []
+        for part in self.chat_cors_origins.split(","):
+            origin = normalize_origin(part)
+            if origin:
+                out.append(origin)
+        return out
 
     @property
     def bootstrap_path(self) -> Path:

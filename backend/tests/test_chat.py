@@ -382,6 +382,24 @@ def test_chat_frame_ancestors_tolerates_legacy_trailing_slash(chat):
     assert chat.get("/chat/").headers["Content-Security-Policy"] == "frame-ancestors http://127.0.0.1"
 
 
+def test_chat_path_serves_farewell_not_spa(chat):
+    dist = runtime(chat).settings.frontend_dist
+    chat_dir = dist / "chat"
+    chat_dir.mkdir(parents=True, exist_ok=True)
+    (chat_dir / "index.html").write_text("<html><body>OLD CHAT SPA</body></html>", encoding="utf-8")
+    r = chat.get("/chat/")
+    assert r.status_code == 200
+    assert "OLD CHAT SPA" not in r.text
+    assert "迁移" in r.text
+    assert r.headers["content-type"].startswith("text/html")
+
+
+def test_chat_farewell_shows_configured_ui_url(chat, admin):
+    admin.put("/v1/admin/settings/oa", json={"values": {"chat_ui_base_url": "https://chat.example.com"}})
+    body = chat.get("/chat/").text
+    assert "https://chat.example.com" in body
+
+
 def test_embed_script_served_as_utf8(chat):
     """OA 页面是 GBK：挂件脚本必须显式声明 UTF-8。未构建时如实返回 404。"""
     dist = runtime(chat).settings.frontend_dist

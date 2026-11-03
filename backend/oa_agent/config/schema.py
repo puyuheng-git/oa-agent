@@ -92,6 +92,14 @@ GROUPS: dict[str, GroupDef] = {
                 FieldDef("assertion_hmac_secret", "OA assertion HMAC 密钥", "secret",
                          help="校验 OA 宿主页签发的员工身份断言（assertion）的密钥，须与 OA 侧配置一致。只写不读。"),
                 FieldDef("allowed_frame_origins", "允许嵌入的 OA 域名", "list", [], "如 https://oa.example.com"),
+                FieldDef(
+                    "chat_ui_base_url",
+                    "员工对话页地址",
+                    "url",
+                    "",
+                    "独立静态员工对话前端基址（STD-009，如 https://chat.example.com）。"
+                    "留空时本服务 /chat 仅提示从 OA 入口进入；OA 宿主页 iframe 应指向此外部地址而非本机 /chat。",
+                ),
                 FieldDef("success_codes", "业务上游成功码", "list", ["0", "200"], "响应 code 字段视为成功的取值"),
                 FieldDef("business_hint_max_chars", "业务提示语最大长度", "int", 200,
                          "业务上游返回的 msg/message 提示语（如「该单据不存在」）展示给员工前的截断长度。"
