@@ -100,6 +100,13 @@ GROUPS: dict[str, GroupDef] = {
                     "独立静态员工对话前端基址（STD-009，如 https://chat.example.com）。"
                     "留空时本服务 /chat 仅提示从 OA 入口进入；OA 宿主页 iframe 应指向此外部地址而非本机 /chat。",
                 ),
+                FieldDef(
+                    "oa_entry_url",
+                    "OA 智能助手入口",
+                    "url",
+                    "",
+                    "OA 工作台智能助手页面地址；/chat 迁移页「回 OA 打开助手」按钮指向此处。留空时使用浏览器返回。",
+                ),
                 FieldDef("success_codes", "业务上游成功码", "list", ["0", "200"], "响应 code 字段视为成功的取值"),
                 FieldDef("business_hint_max_chars", "业务提示语最大长度", "int", 200,
                          "业务上游返回的 msg/message 提示语（如「该单据不存在」）展示给员工前的截断长度。"
