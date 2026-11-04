@@ -421,6 +421,48 @@ def test_chat_farewell_uses_configured_oa_entry(chat, admin):
     assert "回 OA 打开助手" in body
 
 
+def test_chat_with_launch_redirects_to_configured_ui(chat, admin):
+    admin.put(
+        "/v1/admin/settings/oa",
+        json={"values": {"chat_ui_base_url": "https://chat.example.com"}},
+    )
+    r = chat.get("/chat/?launch=LCODE123&embed=1", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "https://chat.example.com/?launch=LCODE123&embed=1"
+
+
+def test_chat_without_launch_still_farewell_when_ui_configured(chat, admin):
+    admin.put(
+        "/v1/admin/settings/oa",
+        json={"values": {"chat_ui_base_url": "https://chat.example.com"}},
+    )
+    r = chat.get("/chat/")
+    assert r.status_code == 200
+    assert "问答页已迁移" in r.text
+    assert "chat.example.com" not in r.text
+
+
+def test_chat_with_launch_without_ui_url_returns_bridge_error(chat):
+    r = chat.get("/chat/?launch=LCODE123", follow_redirects=False)
+    assert r.status_code == 503
+    assert "无法打开对话页" in r.text
+    assert "chat_ui_base_url" in r.text
+    assert "问答页已迁移" not in r.text
+
+
+def test_chat_path_redirect_preserves_launch_query(chat, admin):
+    admin.put(
+        "/v1/admin/settings/oa",
+        json={"values": {"chat_ui_base_url": "https://chat.example.com/"}},
+    )
+    r = chat.get("/chat?launch=ABC&embed=1", follow_redirects=False)
+    assert r.status_code in (302, 307)
+    assert r.headers["location"] == "/chat/?launch=ABC&embed=1"
+    r2 = chat.get(r.headers["location"], follow_redirects=False)
+    assert r2.status_code == 302
+    assert r2.headers["location"] == "https://chat.example.com/?launch=ABC&embed=1"
+
+
 def test_embed_script_served_as_utf8(chat):
     """OA 页面是 GBK：挂件脚本必须显式声明 UTF-8。未构建时如实返回 404。"""
     dist = runtime(chat).settings.frontend_dist

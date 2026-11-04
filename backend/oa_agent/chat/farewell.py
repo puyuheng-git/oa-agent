@@ -91,3 +91,70 @@ def build_farewell_html(
 {_BACK_SCRIPT}
 </body>
 </html>"""
+
+
+def build_launch_bridge_error_html(*, oa_entry_url: str | None = None) -> str:
+    """带 launch 但尚未配置独立对话 UI 基址时的可读错误页（勿与无 launch 告别页混淆）。"""
+    oa_href_raw = (oa_entry_url or "").strip()
+    if oa_href_raw:
+        safe_oa = html.escape(oa_href_raw, quote=True)
+        oa_btn = f'<a class="btn btn-primary" href="{safe_oa}">回 OA 打开助手</a>'
+    else:
+        oa_btn = (
+            '<a class="btn btn-primary" href="#" onclick="goBackToOa(); return false;">'
+            "回 OA 打开助手</a>"
+        )
+    back_fallback = (
+        '<p id="back-fallback" class="hint" hidden>'
+        "无法自动返回时，请关闭本窗口或标签页，从 OA 工作台中的智能助手入口重新进入。"
+        "</p>"
+    )
+    entry = (
+        "<p>对话入口已携带登录凭证，但本服务尚未配置员工对话页地址"
+        "（<code>chat_ui_base_url</code>）。请联系管理员在编排后台完成配置后重试。</p>"
+        '<div class="actions">'
+        f"{oa_btn}"
+        "</div>"
+        f"{back_fallback}"
+    )
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>对话页未配置</title>
+  <style>
+    body {{
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #f4f6f9; color: #1a2332;
+    }}
+    .card {{
+      max-width: 32rem; padding: 1.75rem 2rem; background: #fff; border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(15, 23, 42, 0.08); line-height: 1.65;
+    }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 1rem; }}
+    code {{ font-size: 0.9em; background: #eef2f7; padding: 0.1em 0.35em; border-radius: 4px; }}
+    .hint {{ font-size: 0.92rem; color: #4a5568; margin-top: 0.75rem; }}
+    .actions {{
+      display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1.25rem 0 0.5rem;
+    }}
+    .btn {{
+      display: inline-block; padding: 0.55rem 1.15rem; border-radius: 8px;
+      font-size: 0.95rem; font-weight: 500; text-decoration: none; cursor: pointer;
+      border: none; line-height: 1.4;
+    }}
+    .btn-primary {{
+      background: #0068e6; color: #fff;
+    }}
+    .btn-primary:hover {{ background: #0052b8; }}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>无法打开对话页</h1>
+    {entry}
+  </main>
+{_BACK_SCRIPT}
+</body>
+</html>"""
