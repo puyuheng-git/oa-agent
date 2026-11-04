@@ -44,3 +44,12 @@ def test_farewell_uses_configured_oa_entry_href():
     assert 'href="https://oa.example.com/general/ds/agent/"' in html
     assert "回 OA 打开助手" in html
     assert 'href="#"' not in html
+
+
+def test_launch_bridge_error_html_mentions_config():
+    from oa_agent.chat.farewell import build_launch_bridge_error_html
+
+    html = build_launch_bridge_error_html()
+    assert "无法打开对话页" in html
+    assert "chat_ui_base_url" in html
+    assert "问答页已迁移" not in html

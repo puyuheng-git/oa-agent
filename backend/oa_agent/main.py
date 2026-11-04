@@ -253,16 +253,35 @@ def _mount_frontend(
         app.add_api_route(f"/{entry}/", serve, include_in_schema=False)
         app.add_api_route(f"/{entry}", redirect, include_in_schema=False)
 
-    @app.get("/chat/", include_in_schema=False, response_class=HTMLResponse)
-    def chat_farewell_page():
-        return chat_farewell.build_farewell_html(
-            chat_ui_url_fn() or None,
-            oa_entry_url=oa_entry_url_fn() or None,
+    def _chat_entry_response(request: Request) -> HTMLResponse | RedirectResponse:
+        launch = (request.query_params.get("launch") or "").strip()
+        if launch:
+            base = chat_ui_url_fn()
+            if base:
+                qs = request.url.query
+                location = f"{base}/" + (f"?{qs}" if qs else "")
+                return RedirectResponse(location, status_code=302)
+            return HTMLResponse(
+                chat_farewell.build_launch_bridge_error_html(
+                    oa_entry_url=oa_entry_url_fn() or None,
+                ),
+                status_code=503,
+            )
+        return HTMLResponse(
+            chat_farewell.build_farewell_html(
+                chat_ui_url_fn() or None,
+                oa_entry_url=oa_entry_url_fn() or None,
+            ),
         )
 
+    @app.get("/chat/", include_in_schema=False, response_class=HTMLResponse)
+    def chat_farewell_page(request: Request):
+        return _chat_entry_response(request)
+
     @app.get("/chat", include_in_schema=False)
-    def chat_farewell_redirect():
-        return RedirectResponse("/chat/")
+    def chat_farewell_redirect(request: Request):
+        qs = request.url.query
+        return RedirectResponse("/chat/" + (f"?{qs}" if qs else ""))
 
 
 def __getattr__(name: str):
