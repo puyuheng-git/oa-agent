@@ -59,6 +59,22 @@ def test_chat_cors_preflight_allowed(cors_client):
     assert "POST" in r.headers.get("access-control-allow-methods", "")
 
 
+def test_chat_cors_preflight_allows_idempotency_key_header(cors_client):
+    client, _ = cors_client
+    origin = "https://chat.static.test"
+    r = client.options(
+        "/v1/chat/launch",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization, content-type, idempotency-key",
+        },
+    )
+    assert r.status_code == 204
+    allow_headers = r.headers.get("access-control-allow-headers", "")
+    assert "idempotency-key" in allow_headers.lower()
+
+
 def test_chat_cors_preflight_rejects_unknown_origin(cors_client):
     client, _ = cors_client
     r = client.options("/v1/chat/launch", headers={"Origin": "https://evil.example"})

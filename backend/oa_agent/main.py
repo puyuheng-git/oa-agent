@@ -36,7 +36,7 @@ SETUP_PREFIXES = ("/setup", "/v1/setup")
 ALWAYS_OPEN = ("/healthz", "/readyz", "/assets", "/favicon.ico")
 SPA_ENTRIES = ("setup", "admin")
 CHAT_CORS_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-CHAT_CORS_HEADERS = "Authorization, Content-Type, Accept, X-Request-Id"
+CHAT_CORS_HEADERS = "Authorization, Content-Type, Accept, X-Request-Id, Idempotency-Key"
 FRAME_CACHE_SECONDS = 30
 
 
