@@ -124,6 +124,7 @@ def test_date_ranges(text, expected):
 def test_intent_rules_filters_and_detail():
     assert intent_rules.parse("本月未报销的行程", TODAY)["params"]["status"] == 0
     assert intent_rules.parse("查看报销单 12345 详情", TODAY) == {"intent": "detail", "params": {"id": 12345}}
+    assert intent_rules.parse("查看报销单的详情", TODAY) == {"intent": "detail", "params": {}}
     assert intent_rules.parse("今天天气怎么样", TODAY)["intent"] == "help"
 
 

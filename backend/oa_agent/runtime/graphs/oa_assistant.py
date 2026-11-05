@@ -343,6 +343,32 @@ def _node_output(name: str, out: dict) -> dict | None:
 
 # ---- understand ----
 
+def _coerce_tool_required_params(parsed: dict, tools: dict) -> dict:
+    """规则/路由直接给出 tool+params 时，补齐与 LLM 归一化相同的必填校验 → ASK。"""
+    if parsed.get("intent") != TOOL:
+        return parsed
+    name = parsed.get("tool")
+    if not name or name not in tools:
+        return parsed
+    spec = tools[name][0]
+    params = dict(parsed.get("params") or {})
+    missing = [
+        k for k, rule in spec.model_params.items()
+        if rule.get("required") and "default" not in rule and params.get(k) in (None, "")
+    ]
+    if not missing:
+        return parsed
+    kept = {k: v for k, v in parsed.items() if k not in ("params", "steps", "tool", "intent", "missing")}
+    return {
+        **kept,
+        "intent": ASK,
+        "tool": name,
+        "params": {},
+        "missing": missing,
+        "steps": [],
+    }
+
+
 def understand(state: TravelState, ctx: RunContext) -> dict:
     reset = {"tool_result": None, "reply": None, "handoff": None, "decision": None, "missing": [],
              "chat_reply": None, "steps": [], "step_index": 0, "step_results": [], "chain_stop": None,
@@ -350,6 +376,7 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
     tools = ctx.tools()
     parsed = _prefer_explicit_memory(_understand(state, ctx, tools), state.get("message") or "")
     parsed = _apply_long_term_memory(parsed, ctx)
+    parsed = _coerce_tool_required_params(parsed, tools)
     spec = tools[parsed["tool"]][0] if parsed.get("intent") == TOOL and parsed.get("tool") in tools else None
     if spec is not None and "limit" in spec.model_params and "limit" not in parsed["params"]:
         parsed["params"] = {**parsed["params"], "limit": ctx.num("list_default_limit")}

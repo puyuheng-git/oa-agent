@@ -78,6 +78,8 @@ def parse(text: str, today: date) -> dict:
     ids = re.findall(r"(?<![\d-])(\d{1,12})(?![\d-])", text)
     if detail and ids:
         return {"intent": DETAIL, "params": {"id": int(ids[-1])}}
+    if detail and _TOPIC.search(text):
+        return {"intent": DETAIL, "params": {}}
 
     params: dict = {}
     rng = parse_date_range(text, today)
