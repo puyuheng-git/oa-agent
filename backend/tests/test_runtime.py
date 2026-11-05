@@ -110,6 +110,7 @@ TODAY = date(2026, 10, 9)  # 周五
 
 @pytest.mark.parametrize("text,expected", [
     ("查上周行程报销", ("2026-09-28", "2026-10-04")),
+    ("查上周的行程报销", ("2026-09-28", "2026-10-04")),
     ("本周的行程", ("2026-10-05", "2026-10-09")),
     ("上月行程报销", ("2026-09-01", "2026-09-30")),
     ("最近7天的行程", ("2026-10-03", "2026-10-09")),
@@ -119,6 +120,11 @@ def test_date_ranges(text, expected):
     parsed = intent_rules.parse(text, TODAY)
     assert parsed["intent"] == "list"
     assert (parsed["params"]["date_gte"], parsed["params"]["date_lte"]) == expected
+
+
+def test_last_week_monday_to_sunday_for_fixed_thursday():
+    thu = date(2026, 11, 5)
+    assert intent_rules.parse_date_range("查上周的行程报销", thu) == (date(2026, 10, 26), date(2026, 11, 1))
 
 
 def test_intent_rules_filters_and_detail():

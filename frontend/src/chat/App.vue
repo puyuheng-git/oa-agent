@@ -27,7 +27,7 @@ import {
   type SkillMenuItem,
   type SwitchThreadResult,
 } from './api'
-import { MockAgentAdapter } from './agent/adapter'
+import { MockAgentAdapter, mapRunStatus } from './agent/adapter'
 import { buildDelivery } from './delivery'
 import AppLayout from './components/AppLayout.vue'
 import type {
@@ -263,10 +263,10 @@ function pollRun(msg: ChatMessage, startedAt = Date.now()) {
         msg.reply = r.reply
         msg.text = plainText(r.reply.content)
         msg.delivery = buildDelivery(r.reply, currentTask.value) ?? undefined
-        mockAdapter.syncLiveStatus('completed')
+        mockAdapter.syncLiveStatus(mapRunStatus(r.run_status))
         return
       }
-      if (r.run_status) mockAdapter.syncLiveStatus('waiting_approval')
+      if (r.run_status) mockAdapter.syncLiveStatus(mapRunStatus(r.run_status))
     } catch (e) {
       if ((e as { status?: number }).status === 401) {
         expire()
@@ -355,7 +355,7 @@ async function send(text?: string) {
       const last = messages.value[messages.value.length - 1]
       if (last) pollRun(last)
     } else {
-      mockAdapter.syncLiveStatus(r.reply.type === 'error' ? 'failed' : 'completed')
+      mockAdapter.syncLiveStatus(mapRunStatus(r.run_status))
     }
     void loadThreads()
   } catch (e) {

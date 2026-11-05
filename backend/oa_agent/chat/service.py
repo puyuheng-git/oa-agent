@@ -52,7 +52,7 @@ from oa_agent.runtime.multi_agent import DomainSpec
 from oa_agent.runtime.releases import Release, ReleaseError
 from oa_agent.runtime.run_service import (
     CANCEL_REQUESTED, CANCELLED, FAILED, RUNNING, SUCCEEDED, TERMINAL, WAITING_CONFIRMATION, WAITING_HUMAN,
-    StaleState,
+    WAITING_INPUT, StaleState,
 )
 from oa_agent.packs.registry import PackRegistry
 from oa_agent.packs.state import load_disabled_ids
@@ -625,8 +625,9 @@ def _drive(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
     reply = state.get("reply") or {"type": "text", "content": "", "data": None}
     spec = engine.registry.get(state.get("tool") or "")
     detail_id = (state.get("params") or {}).get("id") if spec is not None and spec.result_kind == "object" else None
-    final = engine.runs.finish(rec, SUCCEEDED, business_record_id=str(detail_id) if detail_id else None)
-    if final != SUCCEEDED:
+    terminal = WAITING_INPUT if state.get("intent") == travel_query.ASK else SUCCEEDED
+    final = engine.runs.finish(rec, terminal, business_record_id=str(detail_id) if detail_id else None)
+    if final not in (SUCCEEDED, WAITING_INPUT):
         reply = {"type": "error", "content": text(rt, "run_cancelled") if final == CANCELLED
                  else text(rt, "upstream_unavailable"), "data": None, "error_code": final.upper()}
     store_reply(rt, rec.run_id, reply)

@@ -17,7 +17,7 @@ from oa_agent.packs.registry import PackRegistry
 from oa_agent.runtime import intent_rules
 from oa_agent.runtime.graphs import travel_query as tq
 from oa_agent.settings import REPO_ROOT
-from tests.test_chat import DETAIL_URL, chat, office, open_chat, send  # noqa: F401
+from tests.test_chat import DETAIL_URL, LIST_URL, chat, office, open_chat, send  # noqa: F401
 
 OPENAPI = REPO_ROOT / "openapi" / "travel_expense.yaml"
 SKILL = REPO_ROOT / "skills" / "travel_expense_query.yaml"
@@ -83,9 +83,46 @@ def test_detail_without_id_asks_instead_of_calling_tool(chat, office):
     route = office.get(DETAIL_URL)
     h = open_chat(chat)
     body = send(chat, h, "查看报销单的详情").json()
-    assert body["run_status"] == "succeeded"
-    assert "单号" in body["reply"]["content"]
+    assert body["run_status"] == "waiting_input"
+    content = body["reply"]["content"]
+    assert "单号" in content
+    assert "查询" not in content or content.count("查询") <= 1
+    assert "查询行程报销查询" not in content
     assert not route.called
+
+
+def test_ask_reply_has_no_duplicated_query_prefix():
+    reg = ToolRegistry.load()
+    spec = reg.get(DETAIL)
+    reply = tq._ask_reply(spec, None, ["id"])
+    assert reply["content"] == "请提供 **单号** 后再问我一次。"
+    assert "查询行程报销" not in reply["content"]
+
+
+def test_last_week_on_thursday_2026_11_05():
+    thu = date(2026, 11, 5)
+    parsed = intent_rules.parse("查上周的行程报销", thu)
+    assert (parsed["params"]["date_gte"], parsed["params"]["date_lte"]) == ("2026-10-26", "2026-11-01")
+
+
+def test_understand_overrides_llm_wrong_last_week_dates(monkeypatch, chat, office):
+    """模型填错「上周」区间时，仍以规则（Asia/Shanghai 日历周）为准。"""
+    from tests.test_agent_chat import ScriptedModel, use_model
+
+    wrong = {
+        "action": "tool",
+        "tool": LIST,
+        "args": {"date_gte": "2026-10-19", "date_lte": "2026-10-25"},
+    }
+    route = office.get(LIST_URL).mock(
+        return_value=httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}}),
+    )
+    use_model(monkeypatch, [wrong])
+    h = open_chat(chat)
+    body = send(chat, h, "查上周的行程报销").json()
+    assert body["run_status"] == "succeeded"
+    qp = json.loads(route.calls.last.request.url.params["queryParams"])
+    assert qp["date_gte"] == "2026-10-26" and qp["date_lte"] == "2026-11-01"
 
 
 def test_validate_args_rejects_detail_without_id():
