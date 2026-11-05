@@ -26,6 +26,7 @@ from oa_agent.integrations.office_api import (
     DEFAULT_UPSTREAM,
     OfficeApiClient,
     OfficeApiError,
+    employee_facing_error,
     mint_base_url,
     upstream_clients,
 )
@@ -604,7 +605,11 @@ def _drive(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
     except (ToolError, AppError) as exc:
         code = getattr(exc, "code", "RUN_FAILED")
         final = engine.runs.finish(rec, FAILED, error_code=code, error_summary=exc.message)
-        return _error_reply(rt, rec, code, exc.message, tracked, final, getattr(exc, "user_message", ""))
+        return _error_reply(
+            rt, rec, code, exc.message, tracked, final,
+            getattr(exc, "user_message", ""),
+            getattr(exc, "http_status", None),
+        )
     except Exception as exc:  # noqa: BLE001
         log.exception("运行 %s 失败", rec.run_id)
         final = engine.runs.finish(rec, FAILED, error_code="RUN_FAILED", error_summary=f"{type(exc).__name__}: {exc}")
@@ -663,7 +668,11 @@ def _drive_write(rt: AppRuntime, rec: RunRecorder, session: ChatSession, expense
     except (ToolError, AppError) as exc:
         code = getattr(exc, "code", "RUN_FAILED")
         final = engine.runs.finish(rec, FAILED, error_code=code, error_summary=exc.message)
-        return _error_reply(rt, rec, code, exc.message, tracked, final, getattr(exc, "user_message", ""))
+        return _error_reply(
+            rt, rec, code, exc.message, tracked, final,
+            getattr(exc, "user_message", ""),
+            getattr(exc, "http_status", None),
+        )
     except Exception as exc:  # noqa: BLE001
         log.exception("写 Workflow 运行 %s 失败", rec.run_id)
         final = engine.runs.finish(rec, FAILED, error_code="RUN_FAILED", error_summary=f"{type(exc).__name__}: {exc}")
@@ -712,7 +721,11 @@ def confirm_write(rt: AppRuntime, session: ChatSession, task_id: str, token: str
     except (ToolError, AppError) as exc:
         code = getattr(exc, "code", "RUN_FAILED")
         final = engine.runs.finish(rec, FAILED, error_code=code, error_summary=exc.message)
-        return _error_reply(rt, rec, code, exc.message, True, final, getattr(exc, "user_message", ""))
+        return _error_reply(
+            rt, rec, code, exc.message, True, final,
+            getattr(exc, "user_message", ""),
+            getattr(exc, "http_status", None),
+        )
     except Exception as exc:  # noqa: BLE001
         log.exception("写 Workflow 恢复 %s 失败", run.run_id)
         final = engine.runs.finish(rec, FAILED, error_code="RUN_FAILED", error_summary=f"{type(exc).__name__}: {exc}")
@@ -780,8 +793,17 @@ def _result(rec: RunRecorder, status: str, reply: dict, tracked: bool) -> dict:
             "tool_calls": rec.tool_call_count, "observability": "ok" if tracked else "degraded"}
 
 
-def user_reply_for(rt: AppRuntime, code: str, message: str = "", hint: str = "") -> dict:
+def user_reply_for(
+    rt: AppRuntime,
+    code: str,
+    message: str = "",
+    hint: str = "",
+    http_status: int | None = None,
+) -> dict:
     """hint：office-api 返回给员工的提示语（业务校验失败等），有则原样展示，比通用错误更有用"""
+    mapped = employee_facing_error(code, hint=hint, http_status=http_status)
+    if mapped:
+        return {"type": "error", "content": mapped, "data": None, "error_code": code}
     if hint:
         return {"type": "error", "content": f"业务系统提示：{hint}", "data": None, "error_code": code}
     key = USER_MESSAGE_KEYS.get(code) or ("upstream_unavailable" if code.startswith("UPSTREAM") else "generic_failure")
@@ -790,8 +812,8 @@ def user_reply_for(rt: AppRuntime, code: str, message: str = "", hint: str = "")
 
 
 def _error_reply(rt: AppRuntime, rec: RunRecorder, code: str, message: str, tracked: bool,
-                 status: str = FAILED, hint: str = "") -> dict:
-    reply = user_reply_for(rt, code, message, hint)
+                 status: str = FAILED, hint: str = "", http_status: int | None = None) -> dict:
+    reply = user_reply_for(rt, code, message, hint, http_status)
     store_reply(rt, rec.run_id, reply)
     return _result(rec, status, reply, tracked)
 

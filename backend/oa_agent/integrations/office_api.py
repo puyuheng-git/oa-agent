@@ -23,6 +23,34 @@ MAX_HINT = 200
 _TAG_RE = re.compile(r"<[^>]+>")
 _GENERIC_RE = re.compile(r"(?i)^(ok|success|succeed|successful|成功|操作成功|请求成功|获取成功|查询成功|"
                          r"获取数据成功|数据获取成功|加载成功)[!！。.]*$")
+_VAGUE_FAILURE_RE = re.compile(
+    r"(?i)^(请求失败|操作失败|处理失败|系统错误|系统异常|失败|error|failed)[!！。.…]*$"
+)
+_NOT_FOUND_HINT_RE = re.compile(r"不存在|未找到|找不到|无此|没有该|无数据|not\s*found", re.I)
+_FORBIDDEN_HINT_RE = re.compile(r"权限|无权|不允许|禁止|forbidden|permission|denied", re.I)
+
+
+def employee_facing_error(
+    code: str,
+    *,
+    hint: str = "",
+    http_status: int | None = None,
+) -> str | None:
+    """将上游错误转为员工可读文案。返回 None 表示沿用 hint 或配置项默认逻辑。"""
+    if code not in ("UPSTREAM_BIZ_ERROR", "UPSTREAM_HTTP_ERROR", "UPSTREAM_BAD_RESPONSE"):
+        return None
+    text = (hint or "").strip()
+    if _NOT_FOUND_HINT_RE.search(text) or http_status == 404:
+        return "未找到该报销单，请核对单号是否正确。"
+    if _FORBIDDEN_HINT_RE.search(text) or http_status == 403:
+        return "你没有权限查看该报销单。"
+    if text and not _VAGUE_FAILURE_RE.match(text):
+        return None
+    if code == "UPSTREAM_HTTP_ERROR" and http_status is not None and http_status >= 500:
+        return None
+    if text or code == "UPSTREAM_BIZ_ERROR":
+        return "查询失败，请稍后再试。"
+    return None
 
 
 def business_hint(body: object, max_len: int = MAX_HINT) -> str:
