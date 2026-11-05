@@ -101,6 +101,7 @@ export const RUN_STATUS: Record<string, { label: string; type: TagType }> = {
   running: { label: '运行中', type: 'primary' },
   waiting_confirmation: { label: '待用户确认', type: 'warning' },
   waiting_human: { label: '待人工介入', type: 'warning' },
+  waiting_input: { label: '待补充参数', type: 'warning' },
   cancel_requested: { label: '取消中', type: 'warning' },
   succeeded: { label: '成功', type: 'success' },
   failed: { label: '失败', type: 'danger' },

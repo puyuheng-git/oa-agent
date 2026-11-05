@@ -1,5 +1,11 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { MockAgentAdapter } from './adapter'
+import { MockAgentAdapter, mapRunStatus } from './adapter'
+
+describe('mapRunStatus', () => {
+  it('maps waiting_input for ask / missing-param runs', () => {
+    expect(mapRunStatus('waiting_input')).toBe('waiting_input')
+  })
+})
 
 describe('MockAgentAdapter.syncLiveStatus elapsedMs', () => {
   beforeEach(() => {

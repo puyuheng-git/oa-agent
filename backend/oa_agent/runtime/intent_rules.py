@@ -71,6 +71,15 @@ def parse_date_range(text: str, today: date) -> tuple[date, date] | None:
     return None
 
 
+def merge_relative_date_params(text: str, today: date, params: dict | None) -> dict:
+    """用户话里含相对日期（上周/本月等）时，以规则解析为准覆盖模型或错误填参。"""
+    merged = dict(params or {})
+    rng = parse_date_range(text, today)
+    if rng:
+        merged["date_gte"], merged["date_lte"] = rng[0].isoformat(), rng[1].isoformat()
+    return merged
+
+
 def parse(text: str, today: date) -> dict:
     """返回 {intent, params}。params 只含模型可见字段。"""
     text = text.strip()

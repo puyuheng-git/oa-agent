@@ -377,6 +377,10 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
     parsed = _prefer_explicit_memory(_understand(state, ctx, tools), state.get("message") or "")
     parsed = _apply_long_term_memory(parsed, ctx)
     parsed = _coerce_tool_required_params(parsed, tools)
+    if parsed.get("intent") == TOOL:
+        parsed["params"] = intent_rules.merge_relative_date_params(
+            state.get("message") or "", ctx.today, parsed.get("params"),
+        )
     spec = tools[parsed["tool"]][0] if parsed.get("intent") == TOOL and parsed.get("tool") in tools else None
     if spec is not None and "limit" in spec.model_params and "limit" not in parsed["params"]:
         parsed["params"] = {**parsed["params"], "limit": ctx.num("list_default_limit")}
@@ -1048,9 +1052,8 @@ def help_text(skills: list[SkillState] | None, tools: dict) -> str:
 
 
 def _ask_reply(spec: ToolSpec, skill: SkillState | None, missing: list[str]) -> dict:
-    title = (skill.display_name if skill else "") or spec.summary or spec.name
     names = "、".join(spec.model_params.get(k, {}).get("label") or k for k in missing)
-    return {"type": "markdown", "content": f"查询{title}需要提供：**{names}**。请补充后再问我一次", "data": None}
+    return {"type": "markdown", "content": f"请提供 **{names}** 后再问我一次。", "data": None}
 
 
 def _cell(value) -> str:
