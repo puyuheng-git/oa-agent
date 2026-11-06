@@ -4,7 +4,6 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { errorMessage } from '@/shared/http'
 import { formatTime } from '@/shared/format'
-import { memoryKindLabel } from '@/chat/api'
 import { can } from '../auth'
 import { NO_DATA } from '../runs'
 import {
@@ -26,6 +25,7 @@ import {
   removeVisibilityGrant,
   restoreEmployeeMemory,
   restoreEmployeeThread,
+  memoryKindLabel,
   type EmployeeMemory,
   type EmployeeMessage,
   type EmployeeThread,

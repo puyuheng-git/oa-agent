@@ -11,6 +11,7 @@ const groups: MenuGroup[] = [
 const leaves: MenuLeaf[] = [
   { path: '/runs', title: '运行记录', code: 'RUNS', perm: 'ops.run.view', icon, group: 'monitor' },
   { path: '/conversations', title: '对话记录', code: 'DIALOGS', perm: 'ops.run.view_sensitive', icon, group: 'monitor' },
+  { path: '/files', title: '文件管理', code: 'FILES', perm: 'ops.file.view', icon, group: 'monitor' },
   { path: '/interventions', title: '介入中心', code: 'HANDOFF', perm: 'ops.intervention.handle', icon, group: 'handoff' },
   { path: '/accounts', title: '账号', code: 'ACCOUNTS', perm: 'sys.account.manage', icon, group: 'security' },
   { path: '/audit', title: '审计日志', code: 'AUDIT', perm: 'ops.audit.view', icon, group: 'security' },
@@ -30,6 +31,7 @@ describe('groupOf', () => {
   it('按子项路径找到所属组', () => {
     const all = visibleGroups(groups, leaves, () => true)
     expect(groupOf(all, '/conversations')?.id).toBe('monitor')
+    expect(groupOf(all, '/files')?.id).toBe('monitor')
     expect(groupOf(all, '/status')).toBeUndefined()
   })
 })

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Callable
 
@@ -95,13 +96,21 @@ def text(rt: AppRuntime, key: str) -> str:
 
 
 def launch_policy(rt: AppRuntime) -> chat_launch.LaunchPolicy:
-    c = {k: int(setting(rt, "chat", k)) for k in ("assertion_max_ttl_seconds", "assertion_clock_skew_seconds",
-                                                   "launch_code_ttl_seconds", "ticket_ttl_minutes",
-                                                   "remint_before_seconds")}
-    return chat_launch.LaunchPolicy(max_assertion_ttl=c["assertion_max_ttl_seconds"],
-                                    clock_skew=c["assertion_clock_skew_seconds"],
-                                    launch_ttl=c["launch_code_ttl_seconds"], ticket_ttl=c["ticket_ttl_minutes"] * 60,
-                                    remint_before=c["remint_before_seconds"])
+    """票据策略。chat 组只读一次库，避免每个字段各开一次连接。"""
+    chat = load_settings(rt, "chat")
+
+    def _int(key: str) -> int:
+        value = chat.get(key)
+        if value is None or value == "":
+            spec = GROUPS["chat"].field(key)
+            value = spec.default if spec is not None else 0
+        return int(value)
+
+    return chat_launch.LaunchPolicy(max_assertion_ttl=_int("assertion_max_ttl_seconds"),
+                                    clock_skew=_int("assertion_clock_skew_seconds"),
+                                    launch_ttl=_int("launch_code_ttl_seconds"),
+                                    ticket_ttl=_int("ticket_ttl_minutes") * 60,
+                                    remint_before=_int("remint_before_seconds"))
 
 
 def office_client(rt: AppRuntime) -> OfficeApiClient:
@@ -352,11 +361,12 @@ def employee_session(rt: AppRuntime, run: Run) -> tuple[ChatSession | None, dict
 
 # ---- 对话入口 ----
 
-def guard_message(rt: AppRuntime, session: ChatSession, message: str, client_msg_id: str) -> None:
-    if not message.strip():
+def guard_message(rt: AppRuntime, session: ChatSession, message: str, client_msg_id: str,
+                  attachment_ids: list[str] | None = None) -> None:
+    if not message.strip() and not attachment_ids:
         raise AppError(422, "VALIDATION_ERROR", "消息不能为空")
     max_chars = int(setting(rt, "chat", "message_max_chars"))
-    if len(message) > max_chars:
+    if message.strip() and len(message) > max_chars:
         raise AppError(422, "VALIDATION_ERROR", f"消息不能超过 {max_chars} ")
     try:
         with rt.session() as db:
@@ -376,10 +386,24 @@ def guard_message(rt: AppRuntime, session: ChatSession, message: str, client_msg
 
 
 def handle_message(rt: AppRuntime, session: ChatSession, message: str, correlation_id: str,
-                   session_key: str = "", on_delta: Callable[[str], None] | None = None) -> dict:
+                   session_key: str = "", on_delta: Callable[[str], None] | None = None,
+                   attachment_ids: list[str] | None = None) -> dict:
     """on_delta：流式回调，每次收到回复正文的新增片段；渠道自行累积并节流刷新"""
+    ids = list(attachment_ids or [])
+    if ids:
+        from oa_agent.chat.attachment_files import bind_uploads
+
+        with rt.session() as db:
+            bind_uploads(
+                db,
+                tenant_id=rt.tenant_id,
+                oa=session.oa,
+                thread_id=session.thread_id,
+                file_ids=ids,
+            )
     _supersede_waiting(rt, session)
-    return start_run(rt, session, message, correlation_id, session_key=session_key, on_delta=on_delta)
+    return start_run(rt, session, message, correlation_id, session_key=session_key, on_delta=on_delta,
+                     attachment_ids=ids)
 
 
 def _supersede_waiting(rt: AppRuntime, session: ChatSession) -> None:
@@ -404,7 +428,8 @@ def _supersede_waiting(rt: AppRuntime, session: ChatSession) -> None:
 
 def start_run(rt: AppRuntime, session: ChatSession, message: str, correlation_id: str, *, session_key: str,
               run_id: str | None = None, parent_run_id: str | None = None, operator: str | None = None,
-              on_delta: Callable[[str], None] | None = None) -> dict:
+              on_delta: Callable[[str], None] | None = None,
+              attachment_ids: list[str] | None = None) -> dict:
     engine = rt.engine
     release = current_release(rt)
     domains = multi_agent.domains_from_config(release.config)
@@ -443,7 +468,7 @@ def start_run(rt: AppRuntime, session: ChatSession, message: str, correlation_id
         except Exception:  # noqa: BLE001 —"只影响之后能否恢"重试，不影响本次对话
             log.exception("保存运行上下文失败：%s", rec.run_id)
     return _drive(rt, rec, session, release.config, tracked,
-                  lambda ctx: engine.invoke(ctx, message, session.thread_id), check=True, on_delta=on_delta,
+                  lambda ctx: engine.invoke(ctx, message, session.thread_id, attachment_ids=attachment_ids), check=True, on_delta=on_delta,
                   domain=domain)
 
 
@@ -491,10 +516,19 @@ def _identity_from_session(session: ChatSession, connector_id: str | None = None
     )
 
 
+def _identity_for_run(session: ChatSession, rec: RunRecorder) -> Identity:
+    """跑图时写入当前 thread/run，供导出登记追溯；缺则保持 None。"""
+    return replace(
+        _identity_from_session(session),
+        thread_id=getattr(session, "thread_id", None) or None,
+        run_id=getattr(rec, "run_id", None) or None,
+    )
+
+
 def _build_write_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession) -> travel_reimburse_submit.WriteRunContext:
     return travel_reimburse_submit.WriteRunContext(
         recorder=rec,
-        identity=_identity_from_session(session),
+        identity=_identity_for_run(session, rec),
         read_executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
                                    int(setting(rt, "oa", "tool_remark_max_chars")),
                                    mcp_client=get_mcp_client(rt),
@@ -564,7 +598,7 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
     return travel_query.RunContext(
         on_delta=on_delta,
         recorder=rec,
-        identity=_identity_from_session(session),
+        identity=_identity_for_run(session, rec),
         executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
                               int(setting(rt, "oa", "tool_remark_max_chars")),
                               mcp_client=get_mcp_client(rt),
@@ -805,6 +839,8 @@ def user_reply_for(
     mapped = employee_facing_error(code, hint=hint, http_status=http_status)
     if mapped:
         return {"type": "error", "content": mapped, "data": None, "error_code": code}
+    if code == "ATTACHMENT_CORRUPT":
+        return {"type": "error", "content": hint or message, "data": None, "error_code": code}
     if hint:
         return {"type": "error", "content": f"业务系统提示：{hint}", "data": None, "error_code": code}
     key = USER_MESSAGE_KEYS.get(code) or ("upstream_unavailable" if code.startswith("UPSTREAM") else "generic_failure")

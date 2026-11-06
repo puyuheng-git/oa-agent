@@ -29,9 +29,8 @@ const BUILTIN: Record<string, ToolGuide> = {
   'sys.export': {
     kind: 'builtin', builtin_id: 'sys.export', summary: '导出文件并返回下载票据', risk_level: 'medium',
     runtime: 'BuiltinRuntime（进程内）', needs_sandbox: true,
-    how: '把文本写入本机 data/exports/{tenant}/，签发一次性下载票据；不直连 OA 业务库。',
-    constraints: ['内容体积有上限', '票据有过期时间（见沙箱策略 export_ttl_seconds）', '文件名经清洗，禁止路径穿越'],
-    default_sandbox_policy: { export_ttl_seconds: 3600 },
+    how: '把文本写入本机或 OSS（按系统设置），登记下载票据，链接长期有效（须本人登录）；不直连 OA 业务库。',
+    constraints: ['内容体积有上限', '文件名缺省为 导出.xlsx', '文件名经清洗，禁止路径穿越'],
     model_params: { content: p('内容', '要导出的文本', { required: true }), filename: p('文件名') },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
     edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',

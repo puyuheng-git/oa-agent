@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import operator
 import re
 import secrets
@@ -22,10 +23,15 @@ from urllib.parse import urlsplit
 import httpx
 import sqlalchemy as sa
 
+from oa_agent.db.models import ExportFile
 from oa_agent.errors import AppError
 from oa_agent.executor.executor import MSG_NOT_AVAILABLE, Identity, ToolError
+from oa_agent.executor.export_store import ExportStore, OssConfig
 from oa_agent.executor.registry import ToolSpec
+from oa_agent.ids import new_export_file_id
 from oa_agent.security.prompt_guard import normalize_text, scan_flags, scrub_html_with_flags
+
+log = logging.getLogger(__name__)
 
 CHINA_TZ = timezone(timedelta(hours=8))
 DEFAULT_TIMEZONE = "Asia/Shanghai"
@@ -35,8 +41,8 @@ CALC_MAX_POW_EXPONENT = 64
 CALC_MAX_ABS = 10 ** 100
 
 EXPORT_MAX_BYTES = 1024 * 1024
-EXPORT_DEFAULT_TTL = 3600
 EXPORT_FILENAME_MAX = 80
+XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 MEMORY_LIST_LIMIT = 50
 
 HTTP_DEFAULT_MAX_BYTES = 65536
@@ -135,13 +141,15 @@ class BuiltinRuntime:
 
     def __init__(self, *, tenant_id: str = "dscpa", session_factory: Callable[[], Any] | None = None,
                  data_dir: Path | str | None = None, kv: Any | None = None, vault: Any | None = None,
-                 global_setting: Callable[[str, str], Any] | None = None):
+                 global_setting: Callable[[str, str], Any] | None = None,
+                 export_store: Callable[[], ExportStore] | None = None):
         self.tenant_id = tenant_id
         self.session_factory = session_factory
         self.data_dir = Path(data_dir) if data_dir is not None else None
         self.kv = kv
         self.vault = vault
         self.global_setting = global_setting
+        self._export_store_factory = export_store
         self._handlers: dict[str, Callable[[ToolSpec, dict, Identity], dict]] = {
             "sys.time": self._time, "sys.calc": self._calc, "sys.export": self._export, "sys.memory": self._memory,
             "sys.http": self._http, "sys.web_search": self._web_search, "sys.fs_read": self._fs_read,
@@ -171,41 +179,81 @@ class BuiltinRuntime:
         return {"expression": expression, "result": safe_calc(expression)}
 
     # ---- sys.export
-    def _export_dir(self) -> Path:
+    def _export_store(self) -> ExportStore | None:
+        if self._export_store_factory is not None:
+            return self._export_store_factory()
         if self.data_dir is None:
-            raise _not_available()
-        return self.data_dir / "exports" / _safe_segment(self.tenant_id)
+            return None
+        return ExportStore(data_dir=self.data_dir, tenant_id=self.tenant_id)
 
     def _export(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
-        root = self._export_dir()
         content = args.get("content")
         if not isinstance(content, str) or not content:
             raise _invalid("缺少参数 content")
-        data = content.encode("utf-8")
+        raw_fn = args.get("filename")
+        if raw_fn is None or (isinstance(raw_fn, str) and not str(raw_fn).strip()):
+            from oa_agent.executor.xlsx_export import suggest_export_filename
+            filename = _safe_filename(suggest_export_filename(content))
+        else:
+            filename = _safe_filename(raw_fn)
+        if filename.lower().endswith(".xlsx"):
+            from oa_agent.executor.xlsx_export import content_to_xlsx
+            data = content_to_xlsx(content)
+        else:
+            data = content.encode("utf-8")
         if len(data) > EXPORT_MAX_BYTES:
             raise _invalid(f"导出内容不能超过 {EXPORT_MAX_BYTES // 1024} KB")
-        filename = _safe_filename(args.get("filename"))
-        ttl = int((spec.sandbox_policy or {}).get("export_ttl_seconds") or EXPORT_DEFAULT_TTL)
+        store = self._export_store()
+        if store is None or self.session_factory is None:
+            raise _not_available()
         ticket = secrets.token_urlsafe(18)
-        now = int(time.time())
-        root.mkdir(parents=True, exist_ok=True)
-        (root / f"{ticket}.bin").write_bytes(data)
-        meta = {"ticket": ticket, "oa": identity.oa, "filename": filename, "size_bytes": len(data),
-                "created_at": now, "expires_at": now + ttl}
-        (root / f"{ticket}.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-        # 不返回服务器路径；下载由后续「下载票据」接口按 ticket + 员工身份校验
-        return {"ticket": ticket, "filename": filename, "size_bytes": len(data), "expires_in": ttl,
-                "expires_at": meta["expires_at"]}
+        file_id = new_export_file_id()
+        storage, object_key = store.put(ticket, data)
+        try:
+            with self.session_factory() as db:
+                with db.begin():
+                    db.add(ExportFile(
+                        file_id=file_id,
+                        tenant_id=self.tenant_id,
+                        ticket=ticket,
+                        oa=identity.oa,
+                        thread_id=_optional_text(getattr(identity, "thread_id", None)),
+                        run_id=_optional_text(getattr(identity, "run_id", None)),
+                        filename=filename,
+                        size_bytes=len(data),
+                        content_type=_export_content_type(filename),
+                        storage=storage,
+                        object_key=object_key,
+                    ))
+        except Exception as exc:
+            log.warning("export register failed: %s", type(exc).__name__)
+            store.delete(storage, object_key)
+            raise
+        return {"ticket": ticket, "filename": filename, "size_bytes": len(data), "file_id": file_id}
 
-    def read_export_meta(self, ticket: str) -> dict | None:
-        """按票据读取元数据（供下载接口校验 oa / 过期）；票据格式非法或不存在返回 None。"""
+    def take_export(self, ticket: str, oa: str) -> tuple[bytes, str] | None:
+        """按表登记校验本人后读取对象。不删除行、不删除对象；他人或不存在返回 None。"""
         if not _TICKET_RE.match(ticket or ""):
             return None
-        path = self._export_dir() / f"{ticket}.json"
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        store = self._export_store()
+        if store is None or self.session_factory is None:
             return None
+        try:
+            with self.session_factory() as db:
+                row = db.execute(
+                    sa.select(ExportFile).where(
+                        ExportFile.tenant_id == self.tenant_id,
+                        ExportFile.ticket == ticket,
+                    )
+                ).scalar_one_or_none()
+                if row is None or row.oa != oa or row.origin != "export":
+                    return None
+                storage, object_key, filename = row.storage, row.object_key, row.filename
+            data = store.get(storage, object_key)
+        except Exception as exc:
+            log.warning("export read failed: %s", type(exc).__name__)
+            return None
+        return data, filename or "导出.txt"
 
     # ---- sys.memory
     def _memory(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
@@ -556,8 +604,90 @@ def _safe_filename(raw: object) -> str:
     return name
 
 
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _export_content_type(filename: str) -> str:
+    lower = filename.lower()
+    if lower.endswith(".xlsx"):
+        return XLSX_CONTENT_TYPE
+    if lower.endswith(".csv"):
+        return "text/csv"
+    if lower.endswith(".json"):
+        return "application/json"
+    return "text/plain"
+
+
+def _oss_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _oss_values(rt: Any, db: Any | None = None) -> dict:
+    """读 oss 组明文（含 vault secret）。库不可用时回落 rt.setting。"""
+    svc = getattr(rt, "settings_svc", None)
+    if svc is not None and db is not None:
+        try:
+            return dict(svc.effective(db, "oss") or {})
+        except Exception as exc:
+            log.warning("读取 oss 配置失败: %s", type(exc).__name__)
+    session = getattr(rt, "session", None)
+    if svc is not None and callable(session):
+        try:
+            with session() as opened:
+                return dict(svc.effective(opened, "oss") or {})
+        except Exception as exc:
+            log.warning("读取 oss 配置失败: %s", type(exc).__name__)
+    setting = getattr(rt, "setting", None)
+    if callable(setting):
+        try:
+            return {
+                key: setting("oss", key)
+                for key in ("endpoint", "bucket", "prefix", "access_key_id", "access_key_secret")
+            }
+        except Exception as exc:
+            log.warning("读取 oss 配置失败: %s", type(exc).__name__)
+    return {}
+
+
+def _oss_config_from_runtime(rt: Any, db: Any | None = None) -> OssConfig:
+    values = _oss_values(rt, db)
+    return OssConfig(
+        endpoint=_oss_text(values.get("endpoint")),
+        bucket=_oss_text(values.get("bucket")),
+        prefix=_oss_text(values.get("prefix")),
+        access_key_id=_oss_text(values.get("access_key_id")),
+        access_key_secret=_oss_text(values.get("access_key_secret")),
+    )
+
+
+def build_export_store(rt: Any, db: Any | None = None) -> ExportStore:
+    """与 BuiltinRuntime 相同的 ExportStore 构造（oss 组热读取）。"""
+    return ExportStore(
+        data_dir=rt.settings.data_dir,
+        tenant_id=rt.tenant_id,
+        oss=_oss_config_from_runtime(rt, db),
+    )
+
+
 def build_builtin_runtime(rt: Any) -> BuiltinRuntime:
-    """从 AppRuntime 构造生产用 BuiltinRuntime：tenant / session（memory）/ data_dir（export 写 data/exports/{tenant}/）。"""
-    return BuiltinRuntime(tenant_id=rt.tenant_id, session_factory=rt.session, data_dir=rt.settings.data_dir,
-                          kv=rt.kv, vault=rt.vault, global_setting=rt.setting)
+    """从 AppRuntime 构造生产用 BuiltinRuntime。导出存储按 oss 组热读取（含 vault secret）。"""
+
+    def export_store() -> ExportStore:
+        return build_export_store(rt)
+
+    return BuiltinRuntime(
+        tenant_id=rt.tenant_id,
+        session_factory=rt.session,
+        data_dir=rt.settings.data_dir,
+        kv=rt.kv,
+        vault=rt.vault,
+        global_setting=rt.setting,
+        export_store=export_store,
+    )
 

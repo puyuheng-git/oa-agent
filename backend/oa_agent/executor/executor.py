@@ -44,6 +44,8 @@ class Identity:
     authorization: str
     principal_id: str = ""
     credentials: dict = field(default_factory=dict)  # connector_id -> {authorization, expires_at}
+    thread_id: str | None = None  # 导出登记用；无运行上下文时为空
+    run_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.principal_id:

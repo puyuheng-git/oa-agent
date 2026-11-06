@@ -15,8 +15,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 
 from oa_agent.admin import (
-    accounts_api, audit_api, catalog_api, conversations_api, employees_api, interventions_api, llm_api, routing_api,
-    runs_api, settings_api, workflows_api, mcp_servers_api, packs_api, connectors_api,
+    accounts_api, audit_api, catalog_api, conversations_api, employees_api, export_files_api, interventions_api,
+    llm_api, routing_api, runs_api, settings_api, workflows_api, mcp_servers_api, packs_api, connectors_api,
 )
 from oa_agent.auth import admin as admin_auth
 from oa_agent.bootstrap import setup_api
@@ -155,7 +155,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                    routing_api.router, interventions_api.router,
                    catalog_api.tools_router, catalog_api.skills_router, catalog_api.visibility_router,
                    workflows_api.router, mcp_servers_api.router, packs_api.router, connectors_api.router,
-                   conversations_api.router, chat_router.router):
+                   conversations_api.router, export_files_api.router, chat_router.router):
         app.include_router(router)
 
     @app.get("/healthz")

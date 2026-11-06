@@ -51,3 +51,11 @@ def new_model_call_id() -> str:
 
 def new_memory_id() -> str:
     return _new("mem")
+
+
+def new_export_file_id() -> str:
+    return _new("exp")
+
+
+def new_upload_file_id() -> str:
+    return _new("upl")

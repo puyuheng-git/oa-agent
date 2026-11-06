@@ -23,4 +23,5 @@ PERMISSIONS: dict[str, str] = {
     "ops.employee.sensitive": "员工治理：会话原文与记忆正文（访问即审计）",
     "ops.employee.manage": "员工治理：写操作",
     "ops.conversation.export": "对话记录导出（训练数据，导出即审计）",
+    "ops.file.view": "导出文件：列表与下载（访问即审计）",
 }

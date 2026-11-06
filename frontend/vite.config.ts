@@ -15,7 +15,6 @@ export default defineConfig({
       input: {
         setup: resolve(__dirname, 'setup/index.html'),
         admin: resolve(__dirname, 'admin/index.html'),
-        chat: resolve(__dirname, 'chat/index.html'),
       },
     },
   },

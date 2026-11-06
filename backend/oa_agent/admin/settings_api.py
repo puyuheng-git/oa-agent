@@ -12,6 +12,7 @@ from oa_agent.bootstrap import installer
 from oa_agent.bootstrap.files import DbParams, db_public_view, write_bootstrap
 from oa_agent.config.schema import GROUPS
 from oa_agent.errors import AppError
+from oa_agent.executor.export_store import check_oss
 from oa_agent.kv import check_redis
 
 router = APIRouter(prefix="/v1/admin/settings", tags=["admin-settings"])
@@ -30,11 +31,30 @@ class DatabaseIn(BaseModel):
     database: str = Field(min_length=1, max_length=64)
 
 
+def _oss_cfg_complete(cfg: dict) -> None:
+    if not str(cfg.get("endpoint") or "").strip():
+        raise AppError(422, "VALIDATION_ERROR", "请先填写 OSS Endpoint")
+    if not str(cfg.get("bucket") or "").strip():
+        raise AppError(422, "VALIDATION_ERROR", "请先填写 Bucket")
+    if not str(cfg.get("access_key_id") or "").strip():
+        raise AppError(422, "VALIDATION_ERROR", "请先填写 AccessKey ID")
+    if not str(cfg.get("access_key_secret") or "").strip():
+        raise AppError(422, "VALIDATION_ERROR", "请先填写 AccessKey Secret（或确保已保存过密钥）")
+
+
 def _run_test(group: str, cfg: dict) -> dict:
     if group == "redis":
         if not cfg.get("url"):
             raise AppError(422, "VALIDATION_ERROR", "请先填写 Redis 地址")
         return check_redis(cfg["url"], int(cfg.get("db") or 0), cfg.get("password"))
+    if group == "oss":
+        _oss_cfg_complete(cfg)
+        return check_oss(
+            str(cfg["endpoint"]).strip(),
+            str(cfg["bucket"]).strip(),
+            str(cfg["access_key_id"]).strip(),
+            str(cfg["access_key_secret"]),
+        )
     raise AppError(400, "NOT_TESTABLE", "该配置组暂不支持测试连接")
 
 

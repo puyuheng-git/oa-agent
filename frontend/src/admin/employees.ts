@@ -313,3 +313,13 @@ export async function batchVisibilityGrants(
 export function hiddenReasonLabel(code: string): string {
   return HIDDEN_REASON[code] ?? code
 }
+
+const MEMORY_KIND: Record<string, string> = {
+  preference: '偏好',
+  constraint: '约束',
+  note: '备注',
+}
+
+export function memoryKindLabel(kind: string): string {
+  return MEMORY_KIND[kind] ?? kind
+}

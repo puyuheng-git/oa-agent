@@ -207,10 +207,15 @@ class AgentEngine:
             self._write_contexts.pop(run_id, None)
             self._cancel_requested.discard(run_id)
 
-    def invoke(self, ctx: travel_query.RunContext, message: str, thread_id: str) -> dict:
+    def invoke(self, ctx: travel_query.RunContext, message: str, thread_id: str,
+               attachment_ids: list[str] | None = None) -> dict:
         if self.checkpointer.get_tuple({"configurable": {"thread_id": thread_id}}) is not None:
             ctx.recorder.event("checkpoint_restored", metadata={"thread_id": thread_id})
-        return self._run_graph(ctx, {"run_id": ctx.recorder.run_id, "message": message}, thread_id)
+        return self._run_graph(
+            ctx,
+            {"run_id": ctx.recorder.run_id, "message": message, "attachment_ids": list(attachment_ids or [])},
+            thread_id,
+        )
 
     def resume(self, ctx: travel_query.RunContext, thread_id: str, decision: dict) -> dict:
         ctx.recorder.event("checkpoint_restored", metadata={"thread_id": thread_id, "resume": True})
