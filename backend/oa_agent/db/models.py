@@ -557,3 +557,30 @@ class ConfigRelease(Base):
     previous_release_id: Mapped[str | None] = mapped_column(sa.String(40), nullable=True)
     released_by: Mapped[str] = mapped_column(sa.String(64), default="")
     released_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+
+
+class ExportFile(Base):
+    """员工导出文件登记（长期保留；storage 决定读取后端）。"""
+
+    __tablename__ = "agent_export_file"
+    __table_args__ = (
+        sa.UniqueConstraint("file_id", name="uk_export_file_id"),
+        sa.UniqueConstraint("ticket", name="uk_export_ticket"),
+        sa.Index("ix_export_created", "tenant_id", "created_at"),
+        sa.Index("ix_export_oa_created", "tenant_id", "oa", "created_at"),
+        sa.Index("ix_export_thread", "tenant_id", "thread_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    file_id: Mapped[str] = mapped_column(sa.String(40))
+    tenant_id: Mapped[str] = mapped_column(sa.String(32), default=DEFAULT_TENANT)
+    ticket: Mapped[str] = mapped_column(sa.String(64))
+    oa: Mapped[str] = mapped_column(sa.String(64))
+    thread_id: Mapped[str | None] = mapped_column(sa.String(40), nullable=True)
+    run_id: Mapped[str | None] = mapped_column(sa.String(40), nullable=True)
+    filename: Mapped[str] = mapped_column(sa.String(255))
+    size_bytes: Mapped[int] = mapped_column(sa.BigInteger)
+    content_type: Mapped[str] = mapped_column(sa.String(128))
+    storage: Mapped[str] = mapped_column(sa.String(16))  # local|oss
+    object_key: Mapped[str] = mapped_column(sa.String(512))
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)

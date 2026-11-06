@@ -160,22 +160,46 @@ def test_time_returns_iso_with_timezone():
         _runtime().call(_spec("sys.time"), {"timezone": "No/Such_Zone"}, identity=ID_ALICE)
 
 
-def test_export_writes_under_tenant_dir_and_returns_ticket(tmp_path):
-    rtm = _runtime(tmp_path=tmp_path)
+def test_export_writes_under_tenant_dir_and_returns_ticket(rt, tmp_path):
+    rtm = _runtime(rt, tmp_path)
     out = rtm.call(_spec("sys.export", sandbox_policy={"export_ttl_seconds": 60}),
                    {"filename": "../../etc/pass wd.csv", "content": "a,b\n1,2\n"}, identity=ID_ALICE)
-    assert out["ticket"] and out["size_bytes"] == 8 and out["expires_in"] == 60
+    assert out["ticket"] and out["size_bytes"] == 8
+    assert str(out.get("file_id") or "").startswith("exp_")
+    assert "expires_in" not in out and "expires_at" not in out
     assert "/" not in out["filename"] and ".." not in out["filename"] and "path" not in out
-    files = [p for p in (tmp_path / "exports" / "dscpa").rglob("*") if p.is_file()]
+    root = tmp_path / "exports" / "dscpa"
+    files = [p for p in root.rglob("*") if p.is_file()]
     assert any(p.read_text(encoding="utf-8") == "a,b\n1,2\n" for p in files)
-    assert all((tmp_path / "exports" / "dscpa") in p.parents for p in files)
-    meta = rtm.read_export_meta(out["ticket"])
-    assert meta["oa"] == "alice" and meta["filename"] == out["filename"]
+    assert all(root in p.parents for p in files)
+    assert not list(root.glob("*.json"))
+    from oa_agent.db.models import ExportFile
+
+    with rt.session() as db:
+        row = db.scalar(sa.select(ExportFile).where(ExportFile.ticket == out["ticket"]))
+    assert row is not None and row.oa == "alice" and row.filename == out["filename"]
+    assert row.thread_id is None and row.run_id is None and row.storage == "local"
+    assert row.content_type == "text/csv"
+
+
+def test_export_defaults_filename_when_omitted(rt, tmp_path):
+    rtm = _runtime(rt, tmp_path)
+    out = rtm.call(_spec("sys.export"), {"content": "a,b\n1,2\n"}, identity=ID_ALICE)
+    assert out["filename"] == "导出.xlsx"
+    assert out["ticket"] and out["size_bytes"] > 0
 
 
 def test_export_requires_data_dir_and_content():
     with pytest.raises(ToolError) as e:
         _runtime().call(_spec("sys.export"), {"filename": "a.txt", "content": "x"}, identity=ID_ALICE)
+    assert e.value.code == "TOOL_NOT_AVAILABLE"
+
+
+def test_export_without_session_is_not_available(tmp_path):
+    with pytest.raises(ToolError) as e:
+        _runtime(tmp_path=tmp_path).call(
+            _spec("sys.export"), {"filename": "a.txt", "content": "x"}, identity=ID_ALICE,
+        )
     assert e.value.code == "TOOL_NOT_AVAILABLE"
 
 
@@ -278,7 +302,14 @@ def test_build_builtin_runtime_from_app_runtime_wires_tenant_session_data_dir(rt
     rtm = build_builtin_runtime(rt)
     assert rtm.tenant_id == rt.tenant_id and rtm.data_dir == rt.settings.data_dir and rtm.session_factory is not None
     out = rtm.call(_spec("sys.export"), {"filename": "a.txt", "content": "x"}, identity=ID_ALICE)
+    assert str(out.get("file_id") or "").startswith("exp_")
+    assert "expires_in" not in out and "expires_at" not in out
     assert (rt.settings.data_dir / "exports" / rt.tenant_id / f"{out['ticket']}.bin").is_file()
+    from oa_agent.db.models import ExportFile
+
+    with rt.session() as db:
+        row = db.scalar(sa.select(ExportFile).where(ExportFile.ticket == out["ticket"]))
+    assert row is not None and row.storage == "local" and row.oa == "alice" and row.file_id == out["file_id"]
     rtm.call(_spec("sys.memory"), {"action": "add", "text": "喜欢靠窗座位"}, identity=ID_ALICE)
     assert [m["text"] for m in rtm.call(_spec("sys.memory"), {"action": "list"}, identity=ID_ALICE)["items"]] == ["喜欢靠窗座位"]
 

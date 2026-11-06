@@ -159,7 +159,7 @@ Skill 是面向员工的一组能力。员工提问时，模型会看到**所有
 
 1. **OA 宿主页**（服务端）构造断言 `{oa, uid, display_name, exp(≤60 秒), nonce, iss:"oa-host", aud:"oa-langgraph"}`，JSON 做 base64url（去掉 `=`）后，用“OA assertion HMAC 密钥”做 HMAC-SHA256，得到 `<body>.<hex 签名>`。
 2. 宿主页**服务端**调用 `POST {Agent}/v1/chat/launch`，body `{"assertion": "..."}`，得到 `launch_code`（60 秒、一次性）。
-3. 页面输出 `<iframe src="{Agent}/chat/?launch={launch_code}">`。Agent 后台“允许嵌入的 OA 域名”必须包含宿主页的协议+域名。
+3. 页面输出 `<iframe src="{对话站点}/?launch={launch_code}">`。对话站点的 `frame-ancestors` 必须包含宿主页的协议+域名（部署手册 §6.1）。Agent 不再提供 `/chat/`。
 4. Agent 用 `AGENT_GATEWAY_SECRET` 调 office-api `POST /agent/token/mint`（表单 `oa`、`gateway_secret`）为该员工换取 token，之后以该 token 调用业务接口；token 只存在服务端，不下发浏览器。
 
 5. **业务接口的提示语会展示给员工**：响应 `{code, msg, data}` 中的 `msg`（也认 `message`、`errMsg`）按下面规则处理，所以请写成员工能看懂的话，不要放 SQL、堆栈或内部信息。
@@ -183,15 +183,15 @@ Skill 是面向员工的一组能力。员工提问时，模型会看到**所有
     // width: '24rem', height: '40rem', right: '1rem', bottom: '1rem'
   }
 </script>
-<script src="https://<Agent 域名>/embed.js" charset="utf-8" defer></script>
+<script src="https://<对话站点域名>/embed.js" charset="utf-8" defer></script>
 ```
 
 - 页面右下角出现气泡，点开是对话窗口；窗口右上角 ↻ 重新连接、× 关闭；手机宽度（≤640px）全屏。
 - 也可以用样式覆盖：`#oa-agent-bubble-button { background-color: ... !important; }`、`#oa-agent-bubble-window { width: ... !important; height: ... !important; }`。
 - **配置里没有、也不能有员工身份或密钥。** 与 Dify 在前端传 `user_id` 不同：前端参数可被任意伪造，本系统身份只认 OA 服务端签发的断言（硬约束：模型/客户端自报的 `oa` 一律丢弃）。
-- 首次点开气泡时，挂件 iframe 打开 `hostUrl`（同 OA 域名，自动带上 OA 登录 Cookie）。`assistant_host.php?mode=embed` 的约定：校验 OA 登录（未登录返回提示）→ 按上面第 1、2 步签断言、换 `launch_code` → **302 跳转**到 `{Agent}/chat/?launch={launch_code}&embed=1`（`embed=1` 时对话页不显示自身页头）。
-- `charset="utf-8"` 必须保留：OA 页面是 GBK，脚本里的中文需按 UTF-8 解码（Agent 也会在响应头声明 UTF-8）。
-- Agent 后台“允许嵌入的 OA 域名”必须包含 OA 的协议+域名。
+- 首次点开气泡时，挂件 iframe 打开 `hostUrl`（同 OA 域名，自动带上 OA 登录 Cookie）。`assistant_host.php?mode=embed` 的约定：校验 OA 登录（未登录返回提示）→ 按上面第 1、2 步签断言、换 `launch_code` → **302 跳转**到 `{对话站点}/?launch={launch_code}&embed=1`（`embed=1` 时对话页不显示自身页头）。
+- `charset="utf-8"` 必须保留：OA 页面是 GBK，脚本里的中文需按 UTF-8 解码。`embed.js` 由对话静态站点提供，不在 Agent 进程上。
+- 对话站点的 `Content-Security-Policy: frame-ancestors` 必须包含 OA 的协议+域名。管理后台「允许嵌入的 OA 域名」不再写入响应头。
 - 会话过期后窗口内会提示“点窗口右上角 ↻ 重新连接”。
 
 ### 4.2 企业微信智能机器人（长连接）

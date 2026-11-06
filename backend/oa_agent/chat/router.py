@@ -7,13 +7,13 @@ import logging
 import queue
 import threading
 import time
+from typing import Literal
+from urllib.parse import quote
 
 import sqlalchemy as sa
-from typing import Literal
-
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from oa_agent.auth import chat_launch
@@ -316,6 +316,25 @@ def refresh(request: Request, auth: ChatAuth = Depends(chat_auth)):
     ttl = chat_launch.refresh_session(rt.kv.current, auth.ticket, auth.session, lambda: office_client(rt),
                                       load_settings(rt, "oa").get("gateway_secret"), launch_policy(rt))
     return {"expires_in": ttl}
+
+
+@router.get("/exports/{ticket}")
+def download_export(ticket: str, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    """下载本员工的导出文件。不存在或不是本人则 404。"""
+    from oa_agent.executor.builtin_runtime import build_builtin_runtime
+
+    taken = build_builtin_runtime(get_runtime(request)).take_export(ticket, auth.session.oa)
+    if taken is None:
+        raise AppError(404, "NOT_FOUND", "文件不存在")
+    data, filename = taken
+    media = "application/octet-stream"
+    if filename.lower().endswith(".xlsx"):
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return Response(
+        content=data,
+        media_type=media,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
 
 
 @router.post("/messages")

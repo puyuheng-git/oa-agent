@@ -47,10 +47,10 @@ Authorization **签发与 checkLogin 的真相源在 Service**，不在某一个
 
 ### 3.3 OA（PHP 5.2, GBK）— iframe 宿主页
 
-- 新文件 `general/ds/agent/assistant_host.php`：`inc/auth.php` 登录校验 → 服务端构造 assertion `{oa, uid, display_name, exp≤60s, nonce, iss:"oa-host", aud:"oa-langgraph"}` 并 HMAC-SHA256 签名 → 服务端 POST Agent `/v1/chat/launch` 换一次性 `launch_code` → 输出 `<iframe src="{AGENT_URL}/chat/?launch=CODE">`。
-- assertion 与 office token 均不进浏览器；OA 环境变量：`AGENT_URL`、`OA_ASSERTION_HMAC_SECRET`（与 Agent 后台配置一致）。
+- 新文件 `general/ds/agent/assistant_host.php`：`inc/auth.php` 登录校验 → 服务端构造 assertion `{oa, uid, display_name, exp≤60s, nonce, iss:"oa-host", aud:"oa-langgraph"}` 并 HMAC-SHA256 签名 → 服务端 POST Agent `/v1/chat/launch` 换一次性 `launch_code` → 输出 `<iframe src="{CHAT_STATIC_URL}/?launch=CODE">`。
+- assertion 与 office token 均不进浏览器；OA 环境变量：`AGENT_URL`（换码）、`CHAT_STATIC_URL`（对话页与 `embed.js`）、`OA_ASSERTION_HMAC_SECRET`（与 Agent 后台配置一致）。
 - 菜单入口由 OA 管理员按现有菜单机制挂载（整页方式，可选）。
-- **悬浮挂件方式**：同一文件支持 `?mode=embed`——登录校验与签名、换码流程不变，最后改为 `302` 跳转到 `{AGENT_URL}/chat/?launch=CODE&embed=1`；未登录时返回提示文本。OA 公共页面引入 `window.oaAgentConfig = { hostUrl: '/general/ds/agent/assistant_host.php?mode=embed' }` 与 `<script src="{AGENT_URL}/embed.js" charset="utf-8" defer>`，脚本只负责气泡与 iframe，不携带任何身份或密钥。
+- **悬浮挂件方式**：同一文件支持 `?mode=embed`——登录校验与签名、换码流程不变，最后改为 `302` 跳转到 `{CHAT_STATIC_URL}/?launch=CODE&embed=1`；未登录时返回提示文本。OA 公共页面引入 `window.oaAgentConfig = { hostUrl: '/general/ds/agent/assistant_host.php?mode=embed' }` 与 `<script src="{CHAT_STATIC_URL}/embed.js" charset="utf-8" defer>`，脚本只负责气泡与 iframe，不携带任何身份或密钥。
 
 #### 3.3.1 接口契约（Agent P1 已实现，以 Agent 代码为准）
 
@@ -84,7 +84,7 @@ $assertion = $body . '.' . hash_hmac('sha256', $body, OA_ASSERTION_HMAC_SECRET);
 // curl POST AGENT_URL/v1/chat/launch，超时 5 秒，取 launch_code
 ```
 
-**嵌入白名单**：Agent 后台「OA 对接 → 允许嵌入的 OA 域名」填写 OA 的 origin（如 `https://oa.example.com`），否则 `/chat` 的 CSP `frame-ancestors 'none'` 会拒绝嵌入。
+**嵌入白名单**：在对话静态站点响应头配置 `Content-Security-Policy: frame-ancestors`（包含 OA 的 origin，如 `https://oa.example.com`）。Agent 不再托管对话页，管理后台中的「允许嵌入的 OA 域名」不写入响应头。
 
 **mint 响应（office-api `/agent/token/mint`）**：Agent 按 `{code, msg, data: {authorization, uid, oa, expire}}` 解析，`code` 成功值在 Agent 后台「office-api 成功码」配置（默认 `0`、`200`）；`expire` 为剩余秒数或 Unix 时间戳均可；返回的 `oa` 必须与请求一致。**此格式尚未与现网联调确认。**
 

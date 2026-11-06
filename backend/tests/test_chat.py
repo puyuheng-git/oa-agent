@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError
 
 from oa_agent.auth.chat_launch import sign_assertion
-from oa_agent.db.models import Run, RunEvent, Setting
+from oa_agent.db.models import Run, RunEvent
 from oa_agent.runtime.llm import ModelConfig
 
 OFFICE = "http://office.test"
@@ -369,26 +369,9 @@ def test_monitoring_db_down_chat_still_works(chat, office):
     assert rt.engine.sink.status()["spool_pending"] == 0
 
 
-def test_chat_frame_ancestors(chat):
-    assert "https://oa.example.com" in chat.get("/chat/").headers["Content-Security-Policy"]
+def test_chat_page_and_embed_are_not_hosted(chat):
+    """员工对话页与 embed.js 由独立静态站点托管，Agent 不再提供这两个入口。"""
+    assert chat.get("/chat/").status_code == 404
+    assert chat.get("/embed.js").status_code == 404
     assert chat.get("/admin/").headers["Content-Security-Policy"] == "frame-ancestors 'none'"
-
-
-def test_chat_frame_ancestors_tolerates_legacy_trailing_slash(chat):
-    """修复前保存的 `http://127.0.0.1/` 不能被静默丢弃成 'none'。"""
-    with runtime(chat).session() as db, db.begin():
-        db.execute(sa.update(Setting).where(Setting.setting_group == "oa", Setting.setting_key == "allowed_frame_origins")
-                   .values(value_json=["http://127.0.0.1/"]))
-    assert chat.get("/chat/").headers["Content-Security-Policy"] == "frame-ancestors http://127.0.0.1"
-
-
-def test_embed_script_served_as_utf8(chat):
-    """OA 页面是 GBK：挂件脚本必须显式声明 UTF-8。未构建时如实返回 404。"""
-    dist = runtime(chat).settings.frontend_dist
-    assert chat.get("/embed.js").json()["error"]["code"] == "FRONTEND_NOT_BUILT"
-    dist.mkdir(parents=True, exist_ok=True)
-    (dist / "embed.js").write_text("var t = '智能助手'", encoding="utf-8")
-    r = chat.get("/embed.js")
-    assert r.status_code == 200
-    assert r.headers["content-type"] == "application/javascript; charset=utf-8"
-    assert "智能助手" in r.content.decode("utf-8")
+    assert chat.get("/admin/").headers["X-Frame-Options"] == "DENY"

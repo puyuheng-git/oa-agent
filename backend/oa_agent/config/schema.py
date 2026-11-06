@@ -91,7 +91,9 @@ GROUPS: dict[str, GroupDef] = {
                          help="向签发入口换员工 token 时使用的网关密钥，须与 OA 侧配置一致。只写不读。"),
                 FieldDef("assertion_hmac_secret", "OA assertion HMAC 密钥", "secret",
                          help="校验 OA 宿主页签发的员工身份断言（assertion）的密钥，须与 OA 侧配置一致。只写不读。"),
-                FieldDef("allowed_frame_origins", "允许嵌入的 OA 域名", "list", [], "如 https://oa.example.com"),
+                FieldDef("allowed_frame_origins", "允许嵌入的 OA 域名", "list", [],
+                         "不再由 Agent 写入响应头。员工对话页在独立静态站点，把 OA 的 origin 配到该站点的 "
+                         "Content-Security-Policy frame-ancestors。此处仅保留历史配置，保存不会改变嵌入策略。"),
                 FieldDef("success_codes", "业务上游成功码", "list", ["0", "200"], "响应 code 字段视为成功的取值"),
                 FieldDef("business_hint_max_chars", "业务提示语最大长度", "int", 200,
                          "业务上游返回的 msg/message 提示语（如「该单据不存在」）展示给员工前的截断长度。"
@@ -426,6 +428,46 @@ GROUPS: dict[str, GroupDef] = {
             ),
             description="Domain Pack 启停覆盖。默认启用的包（如 oa_travel）无需列出；"
                         "要关闭的包写入 disabled_ids，默认关闭但需开启的包写入 enabled_ids。",
+        ),
+        GroupDef(
+            "oss",
+            "导出 OSS 存储",
+            "热生效",
+            (
+                FieldDef(
+                    "endpoint",
+                    "Endpoint",
+                    "url",
+                    "",
+                    help="阿里云 OSS 访问域名，如 https://oss-cn-hangzhou.aliyuncs.com。",
+                ),
+                FieldDef("bucket", "Bucket", "str", "", help="存储桶名称。"),
+                FieldDef(
+                    "prefix",
+                    "对象前缀",
+                    "str",
+                    "",
+                    help="可选。导出对象键的前缀目录（不要首尾 /）；留空表示无前缀。",
+                ),
+                FieldDef(
+                    "access_key_id",
+                    "AccessKey ID",
+                    "str",
+                    "",
+                    help="RAM 用户的 AccessKey ID。",
+                ),
+                FieldDef(
+                    "access_key_secret",
+                    "AccessKey Secret",
+                    "secret",
+                    help="只写不读：保存后只显示末 4 位；留空表示不修改。"
+                         "Endpoint、Bucket、AccessKey ID 与 Secret 四项齐全后，新导出上传 OSS，否则仍存本地。",
+                ),
+            ),
+            testable=True,
+            description="员工导出文件的 OSS 目标。"
+                        "endpoint、bucket、AccessKey ID 与 Secret 四项齐全（Secret 已在密钥库中设置）时，"
+                        "新导出写入 OSS；任一项缺失则仍使用本地 data/exports。",
         ),
         GroupDef(
             "idp",

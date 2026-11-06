@@ -78,7 +78,7 @@
 
 | IdP | 渠道 | 配置位置 | 典型场景 |
 |-----|------|----------|----------|
-| `oa_assertion` | OA Web / iframe | OA 对接：assertion HMAC、允许嵌入域名；OA 宿主页 `POST /v1/chat/launch` | 生产员工从 OA 进入 |
+| `oa_assertion` | OA Web / iframe | OA 对接：assertion HMAC；宿主页 `POST /v1/chat/launch` 后 302 到独立对话站点。嵌入白名单在该站点的 `frame-ancestors` | 生产员工从 OA 进入 |
 | `wecom` | 企业微信单聊 | 连接配置 → 企业微信 BotID/Secret；OA 签发入口支持 `wework_user_id` mint | 生产移动办公 |
 | `demo` | `demo` | 连接配置 → **IdP** 组：`demo_idp_enabled`、`demo_shared_secret` | **仅本机/演示**；默认关闭，生产勿开 |
 

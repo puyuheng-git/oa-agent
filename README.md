@@ -10,7 +10,7 @@ OA 智能助手的 Agent 服务：员工在 OA 内通过 iframe 查询本人行�
 .\scripts\start.ps1 -BindHost 0.0.0.0     # Linux: HOST=0.0.0.0 scripts/start.sh
 ```
 
-首次启动进入安装向导 `/setup/`（安装令牌在 `data/setup.token`）。务必备份 `data/master.key`。员工入口是 OA 页面里的悬浮气泡（OA 粘贴 `embed.js` 代码，见使用说明 §4.1）。详见：
+首次启动进入安装向导 `/setup/`（安装令牌在 `data/setup.token`）。务必备份 `data/master.key`。本进程只提供管理后台和 `/v1/chat/*`；员工对话页在独立静态站点 oa-agent-chat（见部署手册 §6.1、使用说明 §4.1）。详见：
 
 - [部署与运维手册](docs/ops/deployment.md)
 - [使用说明](docs/ops/user-guide.md)

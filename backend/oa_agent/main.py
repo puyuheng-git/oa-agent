@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from contextlib import asynccontextmanager
 
 import sqlalchemy as sa
@@ -15,13 +14,12 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from oa_agent.admin import (
-    accounts_api, audit_api, catalog_api, conversations_api, employees_api, interventions_api, llm_api, routing_api,
-    runs_api, settings_api, workflows_api, mcp_servers_api, packs_api, connectors_api,
+    accounts_api, audit_api, catalog_api, conversations_api, employees_api, export_files_api, interventions_api,
+    llm_api, routing_api, runs_api, settings_api, workflows_api, mcp_servers_api, packs_api, connectors_api,
 )
 from oa_agent.auth import admin as admin_auth
 from oa_agent.bootstrap import setup_api
 from oa_agent.chat import router as chat_router
-from oa_agent.config.service import normalize_origin
 from oa_agent.db.migrate import revision_status
 from oa_agent.db.models import LlmModel, LlmProvider
 from oa_agent.errors import error_body, install_error_handlers
@@ -29,12 +27,9 @@ from oa_agent.ids import new_request_id
 from oa_agent.runtime_state import NORMAL, SETUP, AppRuntime
 from oa_agent.settings import AppSettings
 
-log = logging.getLogger("oa_agent")
-
 SETUP_PREFIXES = ("/setup", "/v1/setup")
 ALWAYS_OPEN = ("/healthz", "/readyz", "/assets", "/favicon.ico")
-SPA_ENTRIES = ("setup", "admin", "chat")
-FRAME_CACHE_SECONDS = 30
+SPA_ENTRIES = ("setup", "admin")
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
@@ -50,23 +45,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app = FastAPI(title="OA LangGraph Agent", version="0.1.0", lifespan=lifespan)
     app.state.runtime = runtime
     install_error_handlers(app)
-    frame_cache: dict = {"at": float("-inf"), "value": "'none'"}
-
-    def frame_ancestors() -> str:
-        """/chat 只允许被配置的 OA 域名嵌入；未配置时禁止嵌入。缓存 30 秒。"""
-        if runtime.mode != NORMAL:
-            return "'none'"
-        now = time.monotonic()
-        if now - frame_cache["at"] > FRAME_CACHE_SECONDS:
-            frame_cache["at"] = now
-            try:
-                with runtime.session() as db:
-                    origins = runtime.settings_svc.effective(db, "oa").get("allowed_frame_origins") or []
-                origins = [o for o in map(normalize_origin, origins) if o]
-                frame_cache["value"] = " ".join(origins) or "'none'"
-            except Exception:  # noqa: BLE001 —— 读不到配置时沿用上次结果
-                log.exception("读取 allowed_frame_origins 失败")
-        return frame_cache["value"]
 
     @app.middleware("http")
     async def gate_and_headers(request: Request, call_next):
@@ -83,11 +61,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         response.headers["X-Request-Id"] = rid
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
-        if path.startswith("/chat"):
-            response.headers.setdefault("Content-Security-Policy", f"frame-ancestors {frame_ancestors()}")
-        else:
-            response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
-            response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+        response.headers.setdefault("X-Frame-Options", "DENY")
         if path.startswith("/v1/"):
             response.headers.setdefault("Cache-Control", "no-store")
         return response
@@ -97,7 +72,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                    routing_api.router, interventions_api.router,
                    catalog_api.tools_router, catalog_api.skills_router, catalog_api.visibility_router,
                    workflows_api.router, mcp_servers_api.router, packs_api.router, connectors_api.router,
-                   conversations_api.router, chat_router.router):
+                   conversations_api.router, export_files_api.router, chat_router.router):
         app.include_router(router)
 
     @app.get("/healthz")
@@ -160,16 +135,6 @@ def _mount_frontend(app: FastAPI, rt: AppRuntime) -> None:
     @app.get("/", include_in_schema=False)
     def root():
         return RedirectResponse("/setup/" if rt.mode == SETUP else "/admin/")
-
-    @app.get("/embed.js", include_in_schema=False)
-    def embed_js():
-        script = dist / "embed.js"
-        if not script.exists():
-            return JSONResponse(error_body("FRONTEND_NOT_BUILT", "前端未构建：cd frontend && npm run build"),
-                                status_code=404)
-        # 显式 charset：OA 页面是 GBK，脚本里的中文必须按 UTF-8 解码
-        return FileResponse(script, media_type="application/javascript; charset=utf-8",
-                            headers={"Cache-Control": "no-cache"})
 
     def spa_handlers(entry: str):
         index = dist / entry / "index.html"

@@ -41,12 +41,12 @@
 | 运营库 | 独立 MySQL `agent_ops`；Agent 对 OA 业务库 `td_oa` **零访问** |
 | 安装 | 首启安装向导 + 本机主密钥文件 `data/master.key` |
 | 配置 | MySQL 连接经安装向导；Redis、LLM 提供方/Key、office-api 地址、与 OA 共享的 HMAC 密钥等均在管理后台 UI 配置 |
-| 对话入口 | OA 页面 iframe 嵌入 Agent 对话页；身份由 OA 签名 assertion 证明 |
+| 对话入口 | OA 页面 iframe 嵌入独立静态站点 oa-agent-chat；身份由 OA 签名 assertion 证明，换票仍走 Agent `POST /v1/chat/launch` |
 | 管理后台 | 独立系统，自建账号/角色/权限点；与 OA 账号体系无关 |
 | 会话 | Redis（连接在 UI 配置） |
 | 租户 | 预留 `tenant_id`，一期固定 `dscpa` |
 | 代码 | 从零重写，旧网关仅参考 |
-| 前端 | Vue 3 + Vite + Element Plus，多入口（`admin`、`chat`），构建产物由 FastAPI 静态托管 |
+| 前端 | 管理后台与安装向导：Vue 3 + Vite + Element Plus，入口 `admin` / `setup`，由 FastAPI 静态托管。员工对话页在独立仓库 oa-agent-chat |
 
 ---
 
@@ -56,11 +56,15 @@
           ┌──────────── OA（PHP 5.2）────────────┐
 员工 ──>  │ 宿主页 assistant_host.php            │
           │  服务端签 HMAC assertion ──┐         │
-          │  <iframe src=agent/chat?launch=…>    │
+          │  <iframe src=chat-static/?launch=…>  │
           └────────────────────────────┼─────────┘
                                        v
+┌──────── oa-agent-chat（静态站点）────────┐
+│ 对话页 / embed.js ── 同源反代 /v1/chat/* │
+└────────────────────┬─────────────────────┘
+                     v
 ┌──────────────────── oa-langGraph（独立服务器）────────────────────┐
-│ /chat (SPA)  ── /v1/chat/* ── Session(Redis) ── LangGraph Runtime │
+│ /v1/chat/* ── Session(Redis) ── LangGraph Runtime                 │
 │                                     │            ├ Checkpointer(SQLite)
 │                                     │            └ Observability → agent_ops
 │                                     └── MCP Registry/Executor ─────────┐
@@ -137,8 +141,8 @@ oa-langGraph/
 │   │   └── integrations/office_api.py  # mint token、业务 API 客户端
 │   └── tests/
 ├── frontend/
-│   ├── package.json / vite.config.ts   # 多入口 admin / chat / setup
-│   └── src/{admin,chat,setup,shared}/
+│   ├── package.json / vite.config.ts   # 入口 admin / setup（对话页在 oa-agent-chat）
+│   └── src/{admin,setup,shared}/
 ├── openapi/travel_expense.yaml
 ├── data/                          # 运行时生成：master.key、bootstrap.json、checkpoints.sqlite（不入库）
 └── docs/
@@ -193,6 +197,7 @@ oa-langGraph/
 | 配置中心 | 运行参数 `runtime` | 原有 5 项加上下限；新增巡检间隔（30 秒）、过期事件清理间隔（60 分钟）、监控统计缓存（30 秒，0 = 实时）、P95 最少样本（20）、对话导出单次上限（50000 条）与最大跨度（92 天） |
 | 配置中心 | OA 对接 `oa` | 签发地址与业务上游目录拆分；业务提示语最大长度（200 字）、备注字段最大长度（100 字） |
 | 配置中心 | Apipost 导入 `import` | 拉取超时（10 秒）、文档大小上限（2000 KB）、单次最多接口数（20）、列表默认列数（6） |
+| 配置中心 | 导出存储 `oss` | 阿里云 OSS endpoint / bucket / prefix / AccessKey（secret 只写不读）；配齐则新导出文件上传 OSS，否则落本地 `data/exports/` |
 | 工作流配置 | 基础 | 意图解析方式、指定模型、列表默认条数、上游故障处理、帮助回复 |
 | 工作流配置 | 对话与角色 | 非查询问题、**角色设定** `assistant_persona`（≤500 字，留空恢复默认）、回答补充要求 |
 | 工作流配置 | 多轮对话与会话压缩 | 对话轮数 `history_turns`（6，0～30）、每条历史最大字数（600）、查询摘要保留记录 ID 数（20）、**超出轮数时压缩**（开）、**压缩方式**（截断 / 滚动摘要 / 要点提取，默认截断）、记忆最大字数（800）、截断每条保留字数（80） |
@@ -217,9 +222,9 @@ oa-langGraph/
 
 1. OA 宿主页（GBK，`inc/auth.php` 登录校验）服务端构造 assertion：`{oa, uid, display_name, exp(≤60s), nonce, iss: "oa-host", aud: "oa-langgraph"}`，HMAC-SHA256 签名。
 2. 宿主页服务端 `POST /v1/chat/launch`（带 assertion）→ Agent 经 `OaAssertionIdP` / Broker 校验签名/时效/nonce → mint office token（调 office-api `/agent/token/mint`）→ 返回一次性 `launch_code`（60s，单次使用）。外部协议不变。
-3. 宿主页输出 `<iframe src="https://agent/chat/?launch=CODE">`。
+3. 宿主页输出 `<iframe src="https://<对话站点>/?launch=CODE">`（内嵌加 `&embed=1`）。Agent 不再托管 `/chat/`。
 4. iframe 内 SPA `POST /v1/chat/session`（launch_code）→ 获得 chat ticket，**仅存内存**，请求用 `Authorization: Bearer`（避开第三方 Cookie 限制）。
-5. 安全头：`Content-Security-Policy: frame-ancestors <配置的 OA 域名>`；ticket TTL 30 分钟，可续期；office token 只存 Redis，不下发浏览器。
+5. 嵌入白名单在对话静态站点的 `Content-Security-Policy: frame-ancestors`。Agent 上的页面一律 `frame-ancestors 'none'`。ticket TTL 30 分钟，可续期；office token 只存 Redis，不下发浏览器。
 
 ### 6.2 企微（智能机器人长连接，2026-10-10 实现）
 
@@ -354,6 +359,7 @@ oa-langGraph/
 | `ops.run.view` | 总览、列表、详情（事件含员工输入与回复，密钥类已打码） |
 | `ops.run.view_sensitive` | 完整对话记录与模型调用原文（访问即审计） |
 | `ops.conversation.export` | 对话记录导出 JSONL（训练数据，导出即审计） |
+| `ops.file.view` | 导出文件：列表与下载（访问即审计） |
 | `ops.run.operate` | 取消、恢复、重试 |
 | `ops.intervention.handle` | 管理员介入 |
 | `ops.tool.manage` / `ops.skill.manage` | 新建、编辑、从文件导入、启停、激活版本 |
@@ -413,6 +419,7 @@ cancel_requested → cancelled | succeeded | failed   (以实际停止结果为�
 | `/v1/admin/tools/*`、`/v1/admin/skills/*` | 列表/详情、新建（POST）、编辑（PUT `/{name}`）、从文件导入（`/sync`）、从 Apipost 生成草稿（`/v1/admin/tools/import/apipost`）、启停、版本 diff、激活；Skill 可见规则 GET/PUT `/{name}/visibility`（全量替换，`rules: []` 关闭裁剪） |
 | `/v1/admin/visibility/preview?oa=` | 预览指定 oa 当前可见 Skill 名列表（`ops.skill.manage` 读；`tags` 预留，本期空） |
 | `/v1/admin/workflows/*` | 草稿、校验、diff、发布、回滚 |
+| `/v1/admin/export-files`、`/v1/admin/export-files/{file_id}/download` | 导出文件列表与下载（`ops.file.view`，访问即审计） |
 | `/v1/admin/audit` | 审计查询 |
 | `/v1/admin/employees` | 员工目录（`q` 前缀/精确、`page`/`page_size`）；`GET /{oa}/threads`（含 `deleted`）、`GET .../threads/{id}/messages`（sensitive）；PATCH/DELETE/restore/batch 会话元数据（manage）；`GET /{oa}/memory`（默认无正文，`include_text=1` 需 sensitive）、记忆 CRUD/restore/清空（manage）；`GET /{oa}/visibility` 预览；`POST/DELETE .../visibility/grants` 与 `.../grants/batch` 按 oa 追加/删除 allow/deny（manage；**不全量** replace Skill 规则，全量仍走 `PUT /skills/{name}/visibility`） |
 | `/healthz`、`/readyz` | 探活（readyz 检查 DB/Redis/LLM 配置状态，未配置项如实报告） |

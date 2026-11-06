@@ -56,6 +56,13 @@ MEMORY_FORGET = "memory_forget"
 
 # 模型不可用时的内置规则只覆盖行程报销两个 Tool；其"Tool 需要配置模"
 RULE_TOOLS = {LIST: "query_my_travel_expense_list", DETAIL: "query_my_travel_expense_detail"}
+EXPORT_TOOL = "builtin.export"
+_EXPORT_RE = re.compile(r"导出|导出来|存成文件|保存为文件|下载文件|下载表格|生成文件")
+_EXPORT_PREVIOUS_RE = re.compile(r"这条|这个|这份|刚才|上面|上一条")
+EXPORT_HINT = (
+    "\n- 员工要求导出、下载文件或保存为文件时，必须调用工具 builtin.export，"
+    "不要只用文字声称已经导出。content 填写要写入文件的正文，filename 可省略。\n"
+)
 
 REPLY_SUMMARY_CHARS = 12000   # 时间线事件摘要上限（事件"TEXT 列），完整回复在对话记录"
 DEFAULT_PERSONA = "你是公司的「OA 助手」，员工的智能助理"
@@ -242,6 +249,9 @@ class RunContext:
                 spec = registry.get(name)
                 if spec is not None and name not in out:
                     out[name] = (spec, skill)
+        export_spec = registry.get(EXPORT_TOOL)
+        if export_spec is not None and EXPORT_TOOL not in out:
+            out[EXPORT_TOOL] = (export_spec, _export_skill())
         return out
 
     def num(self, key: str) -> int:
@@ -341,6 +351,198 @@ def _node_output(name: str, out: dict) -> dict | None:
     return None
 
 
+def _export_skill() -> SkillState:
+    return SkillState(
+        name="builtin_export", enabled=True, valid=True,
+        display_name="导出文件",
+        description="把已查询到的数据或指定文本导出为可下载文件",
+        instructions="员工要求导出、下载文件或保存为文件时使用本工具，不要只用文字表示已经导出。",
+        examples=["把数据导出", "导出本月的报销"],
+        tools=[EXPORT_TOOL],
+    )
+
+
+def _with_export_hint(prompt: str, tools: dict) -> str:
+    if EXPORT_TOOL not in tools:
+        return prompt
+    return prompt + EXPORT_HINT
+
+
+def _csv_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    if text[:1] in ("=", "+", "-", "@"):
+        text = "'" + text
+    if any(ch in text for ch in ',\"'):
+        text = '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def _rows_to_csv(columns, rows) -> str:
+    keys: list = []
+    labels: list = []
+    if columns and isinstance(columns[0], dict):
+        keys = [c.get("key") for c in columns]
+        labels = [c.get("label") or c.get("key") for c in columns]
+    elif columns and isinstance(columns[0], str):
+        keys = list(columns)
+        labels = list(columns)
+    elif rows and isinstance(rows[0], dict):
+        keys = list(rows[0].keys())
+        labels = list(keys)
+    if not keys:
+        return ""
+    lines = [",".join(_csv_cell(x) for x in labels)]
+    for row in rows:
+        if isinstance(row, dict):
+            lines.append(",".join(_csv_cell(row.get(k)) for k in keys))
+    return "\n".join(lines)
+
+
+def _step_as_export_text(data) -> str:
+    if not isinstance(data, dict) or not data:
+        return ""
+    if isinstance(data.get("list"), list):
+        return _rows_to_csv([], data["list"])
+    if isinstance(data.get("text"), str):
+        return unwrap_untrusted(data["text"]).strip()
+    return _rows_to_csv([], [data])
+
+
+def _message_as_export_text(data, content: str | None) -> str | None:
+    if isinstance(data, dict):
+        kind = data.get("kind")
+        if kind == "table":
+            text = _rows_to_csv(data.get("columns") or [], data.get("items") or [])
+            return text or None
+        if kind == "record":
+            fields = data.get("fields") or []
+            item = data.get("item") or {}
+            lines = []
+            for field_def in fields:
+                key = field_def.get("key") if isinstance(field_def, dict) else field_def
+                label = field_def.get("label") if isinstance(field_def, dict) else key
+                lines.append(f"{label},{_csv_cell(item.get(key))}")
+            return "\n".join(lines) if lines else None
+        if kind == "file":
+            return None
+    text = (content or "").strip()
+    if not text or text.startswith("[已调用工具") or text.startswith("[多步查询"):
+        return None
+    return text
+
+
+def _last_export_text(ctx: RunContext) -> str | None:
+    """上一轮展示给该员工的结果，供「把数据导出」写入文件。不拿其他员工的记录。"""
+    if ctx.session_factory is None or not ctx.thread_id or ctx.identity is None:
+        return None
+    try:
+        import sqlalchemy as sa
+
+        from oa_agent.db.models import ConversationMessage
+
+        with ctx.session_factory() as db:
+            row = db.scalar(
+                sa.select(ConversationMessage).where(
+                    ConversationMessage.tenant_id == ctx.tenant_id,
+                    ConversationMessage.thread_id == ctx.thread_id,
+                    ConversationMessage.oa == ctx.identity.oa,
+                    ConversationMessage.role == "assistant",
+                ).order_by(ConversationMessage.id.desc()).limit(1)
+            )
+    except SQLAlchemyError:
+        return None
+    if row is None:
+        return None
+    return _message_as_export_text(row.data_json, row.content)
+
+
+def _inline_export_body(message: str) -> str | None:
+    matched = re.search(r"(?:导出|存成文件|保存为文件)\s*[:：]\s*(.+)", message or "", re.S)
+    if not matched:
+        return None
+    body = matched.group(1).strip()
+    return body or None
+
+
+def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
+                   rule_tool_map: dict | None, last_text: str | None) -> dict:
+    """员工要导出时调用 builtin.export。能对上查询工具则先查再导出，否则用上一轮结果或冒号后的正文。"""
+    if EXPORT_TOOL not in tools or not _EXPORT_RE.search(message or ""):
+        return parsed
+    if parsed.get("intent") in (MEMORY_WRITE, MEMORY_FORGET):
+        return parsed
+    params = parsed.get("params") or {}
+    if (parsed.get("intent") == TOOL and parsed.get("tool") == EXPORT_TOOL
+            and isinstance(params.get("content"), str) and params.get("content").strip()):
+        return parsed
+
+    inline = _inline_export_body(message)
+    query_name = None
+    query_params: dict = {}
+    # 「把这条导出来」指刚展示的那条，不重新发起列表查询
+    use_previous = bool(_EXPORT_PREVIOUS_RE.search(message or "")) and bool((last_text or "").strip())
+    if not inline and not use_previous:
+        if parsed.get("intent") == TOOL and parsed.get("tool") in tools and parsed.get("tool") != EXPORT_TOOL:
+            query_name = parsed["tool"]
+            query_params = dict(params)
+        else:
+            rule = intent_rules.parse(message or "", today)
+            mapped = (rule_tool_map or {}).get(rule.get("intent"))
+            if mapped and mapped in tools and mapped != EXPORT_TOOL:
+                query_name = mapped
+                query_params = dict(rule.get("params") or {})
+    filename = "导出.xlsx"
+    if query_name:
+        return {
+            "intent": TOOL,
+            "tool": query_name,
+            "params": query_params,
+            "steps": [
+                {"tool": query_name, "args": query_params},
+                {"tool": EXPORT_TOOL, "args": {"content": {"$from_step": 1}, "filename": filename}},
+            ],
+            "intent_source": "rules",
+            "missing": [],
+        }
+    body = inline or (last_text or "").strip()
+    if not body:
+        return {
+            "intent": ASK,
+            "tool": EXPORT_TOOL,
+            "params": {},
+            "missing": ["content"],
+            "intent_source": "rules",
+        }
+    return {
+        "intent": TOOL,
+        "tool": EXPORT_TOOL,
+        "params": {"content": body, "filename": filename},
+        "intent_source": "rules",
+        "missing": [],
+    }
+
+
+def _expand_export_args(name: str, args: dict, results: list[dict]) -> dict | None:
+    if name != EXPORT_TOOL:
+        return args
+    content = args.get("content")
+    if not (isinstance(content, dict) and "$from_step" in content):
+        return args
+    try:
+        index = int(content["$from_step"])
+    except (TypeError, ValueError):
+        index = 0
+    prev = results[index - 1] if 1 <= index <= len(results) else None
+    text = _step_as_export_text(prev)
+    if not text:
+        return None
+    return {**args, "content": text}
+
+
 # ---- understand ----
 
 def understand(state: TravelState, ctx: RunContext) -> dict:
@@ -348,8 +550,14 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
              "chat_reply": None, "steps": [], "step_index": 0, "step_results": [], "chain_stop": None,
              "memory_info": None}
     tools = ctx.tools()
-    parsed = _prefer_explicit_memory(_understand(state, ctx, tools), state.get("message") or "")
+    message = state.get("message") or ""
+    parsed = _prefer_explicit_memory(_understand(state, ctx, tools), message)
     parsed = _apply_long_term_memory(parsed, ctx)
+    parsed = _prefer_export(
+        parsed, message, tools, today=ctx.today,
+        rule_tool_map=ctx.rule_tool_map if ctx.rule_tool_map is not None else RULE_TOOLS,
+        last_text=_last_export_text(ctx),
+    )
     spec = tools[parsed["tool"]][0] if parsed.get("intent") == TOOL and parsed.get("tool") in tools else None
     if spec is not None and "limit" in spec.model_params and "limit" not in parsed["params"]:
         parsed["params"] = {**parsed["params"], "limit": ctx.num("list_default_limit")}
@@ -451,6 +659,7 @@ def _understand(state: TravelState, ctx: RunContext, tools: dict) -> dict:
             )
         else:
             prompt = SELECT_PROMPT.format(**fmt)
+        prompt = _with_export_hint(prompt, tools)
         prompt += USER_FENCE_NOTE
         messages = [
             ("system", prompt),
@@ -858,8 +1067,11 @@ def call_tool(state: TravelState, ctx: RunContext) -> dict:
     index = state.get("step_index") or 0
     results = list(state.get("step_results") or [])
     name = steps[index]["tool"]
+    expanded = _expand_export_args(name, dict(steps[index].get("args") or {}), results)
+    if expanded is None:
+        return {"chain_stop": {"step": index + 1, "tool": name, "reason": "export_empty"}, "handoff": None}
     try:
-        args = _resolve(steps[index].get("args") or {}, results)
+        args = _resolve(expanded, results)
     except _RefMissing as exc:
         return {"chain_stop": {"step": index + 1, "tool": name, "ref": exc.ref}, "handoff": None}
     spec = ctx.executor.registry.get(name)
@@ -936,6 +1148,10 @@ def _reply(state: TravelState, ctx: RunContext) -> dict:
     if state.get("intent") == CHAT and state.get("chat_reply"):
         return {"type": "markdown", "content": state["chat_reply"], "data": None}
     if state.get("intent") == ASK and name in tools:
+        if name == EXPORT_TOOL:
+            return {"type": "markdown",
+                    "content": "还没有可导出的内容。请先查询数据，或在「导出：」后面写上要保存的文字。",
+                    "data": None}
         return _ask_reply(*tools[name], state.get("missing") or [])
     if state.get("intent") != TOOL or name not in tools:
         configured = (ctx.config.get("help_text") or "").strip()
@@ -951,6 +1167,8 @@ def _reply(state: TravelState, ctx: RunContext) -> dict:
                 content = generated or NO_LLM_DEGRADE
         return {"type": "markdown", "content": content, "data": None}
     stop = state.get("chain_stop")
+    if stop and stop.get("reason") == "export_empty":
+        return {"type": "markdown", "content": "上一步没有可导出的数据。", "data": None}
     if stop and not state.get("step_results"):
         title = _title(tools, stop.get("tool"))
         return {"type": "markdown", "content": f"没能完成「{title}」的查询：缺少可用的查询条件", "data": None}
@@ -959,7 +1177,9 @@ def _reply(state: TravelState, ctx: RunContext) -> dict:
     result = state.get("tool_result") or {}
     data = result.get("data") or {}
     params = state.get("params") or {}
-    if spec.result_kind == "text":
+    if spec.name == EXPORT_TOOL or spec.builtin_id == "sys.export":
+        reply = _file_reply(spec, title, data, result.get("message") or "")
+    elif spec.result_kind == "text":
         reply = _text_reply(spec, title, data, result.get("message") or "")
     elif spec.result_kind == "list":
         reply = _list_reply(spec, title, data, params, result.get("message") or "", ctx.num("max_table_rows"))
@@ -1077,6 +1297,34 @@ def _list_reply(spec: ToolSpec, title: str, data: dict, params: dict, notice: st
                          "data": {"kind": "table", "tool": spec.name, "title": title,
                                   "columns": [{"key": c, "label": spec.label(c)} for c in cols],
                                   "items": rows, "total": total}}, notice)
+
+
+def _file_reply(spec: ToolSpec, title: str, data: dict, notice: str = "") -> dict:
+    """导出工具的结果是票据 JSON。给员工看文件名，票据只放在 data 里供下载。"""
+    body = unwrap_untrusted(str(data.get("text") or "")).strip()
+    try:
+        meta = json.loads(body)
+    except json.JSONDecodeError:
+        meta = None
+    if not isinstance(meta, dict) or not meta.get("ticket"):
+        return _text_reply(spec, title, data, notice)
+    filename = str(meta.get("filename") or "导出.xlsx")
+    content = f"已生成文件 **{filename}**，可下载。"
+    file_data: dict = {
+        "kind": "file",
+        "tool": spec.name,
+        "title": filename,
+        "filename": filename,
+        "ticket": meta.get("ticket"),
+        "size_bytes": meta.get("size_bytes"),
+    }
+    if meta.get("file_id"):
+        file_data["file_id"] = meta.get("file_id")
+    return _with_notice({
+        "type": "markdown",
+        "content": content,
+        "data": file_data,
+    }, notice)
 
 
 def _text_reply(spec: ToolSpec, title: str, data: dict, notice: str = "") -> dict:

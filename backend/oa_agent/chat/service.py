@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Callable
 
@@ -490,10 +491,19 @@ def _identity_from_session(session: ChatSession, connector_id: str | None = None
     )
 
 
+def _identity_for_run(session: ChatSession, rec: RunRecorder) -> Identity:
+    """跑图时写入当前 thread/run，供导出登记追溯；缺则保持 None。"""
+    return replace(
+        _identity_from_session(session),
+        thread_id=getattr(session, "thread_id", None) or None,
+        run_id=getattr(rec, "run_id", None) or None,
+    )
+
+
 def _build_write_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession) -> travel_reimburse_submit.WriteRunContext:
     return travel_reimburse_submit.WriteRunContext(
         recorder=rec,
-        identity=_identity_from_session(session),
+        identity=_identity_for_run(session, rec),
         read_executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
                                    int(setting(rt, "oa", "tool_remark_max_chars")),
                                    mcp_client=get_mcp_client(rt),
@@ -563,7 +573,7 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
     return travel_query.RunContext(
         on_delta=on_delta,
         recorder=rec,
-        identity=_identity_from_session(session),
+        identity=_identity_for_run(session, rec),
         executor=ToolExecutor(rt.engine.live_registry, tool_clients(rt),
                               int(setting(rt, "oa", "tool_remark_max_chars")),
                               mcp_client=get_mcp_client(rt),
