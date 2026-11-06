@@ -197,7 +197,7 @@ oa-langGraph/
 | 配置中心 | 运行参数 `runtime` | 原有 5 项加上下限；新增巡检间隔（30 秒）、过期事件清理间隔（60 分钟）、监控统计缓存（30 秒，0 = 实时）、P95 最少样本（20）、对话导出单次上限（50000 条）与最大跨度（92 天） |
 | 配置中心 | OA 对接 `oa` | 签发地址与业务上游目录拆分；业务提示语最大长度（200 字）、备注字段最大长度（100 字） |
 | 配置中心 | Apipost 导入 `import` | 拉取超时（10 秒）、文档大小上限（2000 KB）、单次最多接口数（20）、列表默认列数（6） |
-| 配置中心 | 导出存储 `oss` | 阿里云 OSS endpoint / bucket / prefix / AccessKey（secret 只写不读）；配齐则新导出文件上传 OSS，否则落本地 `data/exports/` |
+| 配置中心 | 导出存储 `oss` | 阿里云 OSS endpoint / bucket / prefix / AccessKey（secret 只写不读）；配齐则新导出文件与员工上传文件走 OSS，否则落本地。上传行为见 `docs/superpowers/specs/2026-11-06-chat-attachment-design.md` |
 | 工作流配置 | 基础 | 意图解析方式、指定模型、列表默认条数、上游故障处理、帮助回复 |
 | 工作流配置 | 对话与角色 | 非查询问题、**角色设定** `assistant_persona`（≤500 字，留空恢复默认）、回答补充要求 |
 | 工作流配置 | 多轮对话与会话压缩 | 对话轮数 `history_turns`（6，0～30）、每条历史最大字数（600）、查询摘要保留记录 ID 数（20）、**超出轮数时压缩**（开）、**压缩方式**（截断 / 滚动摘要 / 要点提取，默认截断）、记忆最大字数（800）、截断每条保留字数（80） |
@@ -285,7 +285,7 @@ oa-langGraph/
 
 - **Tool**＝一个业务上游上的 **GET 只读**接口：所属上游（`upstream` = 配置目录中的 `key`；未写时视为默认上游标识，旧版默认 `office` 且不写入以保持哈希）、相对路径（不得含域名）、超时、是否注入员工身份（`oa`）、JSON 参数字段（如 `queryParams`）、模型可填参数（类型、日期格式、必填、可选值及其名称、上下限、默认值、显示名、给模型的说明、是否顶层查询参数）、返回字段白名单（显示名称、列表列）、结果类型（列表/单条）。
 - **Skill**＝面向员工的一组能力：显示名称、说明、填参指引、示例问题（≤10）、可用 Tool。
-- **职责用语（2026-10-23 增；2026-10-26 目录 `executor/`）**：代码包 `executor` 对外称**执行器**（Registry/Executor：参数校验、身份注入、事件与限流）；标准 MCP Client 称**出站连接器**（适配层 + 安全边界；**D18′（2026-10-27）**：由「仅接口 + Noop」演进为可配置的真实出站 Client，Noop 仅作未配置回退，见下「Tool 三类来源」）。员工只见 Skill；Tool 经 Skill 间接暴露。目录可见性只挂在 Skill：`agent_skill_visibility_rule` + `VisibilityService` 裁剪欢迎页 `skills`、帮助、模型候选与执行前门禁；**无规则 = 不启裁剪**（同现网启用逻辑），有规则时须命中 allow 且不被 deny；规则即时生效、不进 Release 快照；OA 标签覆盖与真实出站 MCP 联调后置。
+- **职责用语（2026-10-23 增；2026-10-26 目录 `executor/`）**：代码包 `executor` 对外称**执行器**（Registry/Executor：参数校验、身份注入、事件与限流）；标准 MCP Client 称**出站连接器**（适配层 + 安全边界；**D18′（2026-10-27）**：由「仅接口 + Noop」演进为可配置的真实出站 Client，Noop 仅作未配置回退，见下「Tool 三类来源」）。员工只见 Skill；Tool 经 Skill 间接暴露。会话上传文件的 `sys.attachment_read` 不进 Skill 目录，由运行时在该会话注入（见 `docs/superpowers/specs/2026-11-06-chat-attachment-design.md`）。目录可见性只挂在 Skill：`agent_skill_visibility_rule` + `VisibilityService` 裁剪欢迎页 `skills`、帮助、模型候选与执行前门禁；**无规则 = 不启裁剪**（同现网启用逻辑），有规则时须命中 allow 且不被 deny；规则即时生效、不进 Release 快照；OA 标签覆盖与真实出站 MCP 联调后置。
 - 存储沿用 `agent_tool(_version)` / `agent_skill(_version)`，后台保存记 `source_file = "admin"`；与文件导入同一套规范化、哈希与版本规则：兼容变更立即生效，不兼容变更（删参数、新增必填、收紧可选值、改地址/路径/方法/身份注入、删返回字段、风险升级）存为待激活版本。后台保存时 `upstream` 必须是已配置的地址；从文件导入不校验，运行时找不到地址按 `UPSTREAM_NOT_CONFIGURED` 失败（员工看到「该查询功能尚未完成配置」），`tool_call_start` 事件 metadata 记录 `upstream`。
 - 仓库 `openapi/*.yaml`、`skills/*.yaml` 只在**首次启动表为空时导入一次**；之后以后台为准，「从文件导入」按钮用于批量导入（同名覆盖为新版本）。
 - 硬约束落点：表单只允许 GET；`model_params` 不得含身份字段；身份只能服务端注入；只返回白名单字段；`kind=office` 的运行时注册表只收「管理员启用 + 规范启用 + 低风险免确认 + GET + 有当前版本」的 Tool；`builtin` / `mcp` 的注册条件按 kind 分叉（见下「Tool 三类来源」）。
@@ -359,7 +359,7 @@ oa-langGraph/
 | `ops.run.view` | 总览、列表、详情（事件含员工输入与回复，密钥类已打码） |
 | `ops.run.view_sensitive` | 完整对话记录与模型调用原文（访问即审计） |
 | `ops.conversation.export` | 对话记录导出 JSONL（训练数据，导出即审计） |
-| `ops.file.view` | 导出文件：列表与下载（访问即审计） |
+| `ops.file.view` | 文件管理：导出与员工上传的列表、筛选与下载（访问即审计） |
 | `ops.run.operate` | 取消、恢复、重试 |
 | `ops.intervention.handle` | 管理员介入 |
 | `ops.tool.manage` / `ops.skill.manage` | 新建、编辑、从文件导入、启停、激活版本 |
@@ -409,7 +409,7 @@ cancel_requested → cancelled | succeeded | failed   (以实际停止结果为�
 | 前缀 | 用途 |
 |------|------|
 | `/v1/setup/*` | 安装向导（仅安装模式） |
-| `/v1/chat/launch`、`/v1/chat/session`、`/v1/chat/session/switch`、`/v1/chat/threads*`（列表/新建/消息/重命名/归档/软删）、`/v1/chat/memory*`（列表/单条软删/一键清空需 `confirm`）、`/v1/chat/messages`、`/v1/chat/messages/stream`（SSE） | 员工对话 |
+| `/v1/chat/launch`、`/v1/chat/session`、`/v1/chat/session/switch`、`/v1/chat/threads*`（列表/新建/消息/重命名/归档/软删）、`/v1/chat/memory*`（列表/单条软删/一键清空需 `confirm`）、`/v1/chat/messages`、`/v1/chat/messages/stream`（SSE）、`/v1/chat/attachments`、`/v1/chat/files/{file_id}` | 员工对话。上传与下载见 `docs/superpowers/specs/2026-11-06-chat-attachment-design.md` |
 | （无 HTTP 入口） | 企微走长连接（§6.2），Agent 主动连出 |
 | `/v1/admin/auth/*` | 后台登录、登出、改密 |
 | `/v1/admin/settings/*`、`/v1/admin/llm/*` | 配置中心、测试连接；`GET /providers/{id}/remote-models` 按提供方拉取远端模型列表（`sys.setting.view`，只读、不写审计） |
@@ -419,7 +419,7 @@ cancel_requested → cancelled | succeeded | failed   (以实际停止结果为�
 | `/v1/admin/tools/*`、`/v1/admin/skills/*` | 列表/详情、新建（POST）、编辑（PUT `/{name}`）、从文件导入（`/sync`）、从 Apipost 生成草稿（`/v1/admin/tools/import/apipost`）、启停、版本 diff、激活；Skill 可见规则 GET/PUT `/{name}/visibility`（全量替换，`rules: []` 关闭裁剪） |
 | `/v1/admin/visibility/preview?oa=` | 预览指定 oa 当前可见 Skill 名列表（`ops.skill.manage` 读；`tags` 预留，本期空） |
 | `/v1/admin/workflows/*` | 草稿、校验、diff、发布、回滚 |
-| `/v1/admin/export-files`、`/v1/admin/export-files/{file_id}/download` | 导出文件列表与下载（`ops.file.view`，访问即审计） |
+| `/v1/admin/export-files`、`/v1/admin/export-files/{file_id}/download` | 文件管理列表与下载（`ops.file.view`，访问即审计；含导出与员工上传，可按来源筛选） |
 | `/v1/admin/audit` | 审计查询 |
 | `/v1/admin/employees` | 员工目录（`q` 前缀/精确、`page`/`page_size`）；`GET /{oa}/threads`（含 `deleted`）、`GET .../threads/{id}/messages`（sensitive）；PATCH/DELETE/restore/batch 会话元数据（manage）；`GET /{oa}/memory`（默认无正文，`include_text=1` 需 sensitive）、记忆 CRUD/restore/清空（manage）；`GET /{oa}/visibility` 预览；`POST/DELETE .../visibility/grants` 与 `.../grants/batch` 按 oa 追加/删除 allow/deny（manage；**不全量** replace Skill 规则，全量仍走 `PUT /skills/{name}/visibility`） |
 | `/healthz`、`/readyz` | 探活（readyz 检查 DB/Redis/LLM 配置状态，未配置项如实报告） |

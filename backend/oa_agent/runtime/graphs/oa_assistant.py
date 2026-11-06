@@ -40,7 +40,7 @@ from oa_agent.runtime import intent_rules, memory as memory_mod
 from oa_agent.runtime.intent_rules import DETAIL, LIST
 from oa_agent.runtime.llm import ModelCallError, ModelConfig, invoke_json
 from oa_agent.observability.events import RunRecorder
-from oa_agent.security.prompt_guard import normalize_text, prepare_user_text, unwrap_untrusted
+from oa_agent.security.prompt_guard import normalize_text, prepare_user_text, unwrap_untrusted, wrap_untrusted
 
 WORKFLOW_ID = "oa_assistant"
 WORKFLOW_VERSION = "5"
@@ -61,7 +61,8 @@ _EXPORT_RE = re.compile(r"导出|导出来|存成文件|保存为文件|下载�
 _EXPORT_PREVIOUS_RE = re.compile(r"这条|这个|这份|刚才|上面|上一条")
 EXPORT_HINT = (
     "\n- 员工要求导出、下载文件或保存为文件时，必须调用工具 builtin.export，"
-    "不要只用文字声称已经导出。content 填写要写入文件的正文，filename 可省略。\n"
+    "不要只用文字声称已经导出。content 填写要写入文件的正文，filename 可省略；"
+    "用户没指定文件名时不要填「导出.xlsx」，留给服务端按内容命名。\n"
 )
 
 REPLY_SUMMARY_CHARS = 12000   # 时间线事件摘要上限（事件"TEXT 列），完整回复在对话记录"
@@ -189,6 +190,7 @@ WEEKDAYS = "一二三四五六日"
 class TravelState(TypedDict, total=False):
     run_id: str
     message: str
+    attachment_ids: list
     intent: str
     intent_source: str
     tool: str | None
@@ -206,6 +208,7 @@ class TravelState(TypedDict, total=False):
     history: list[dict]         # 最近几"[{role: user|assistant, content}]，随 Checkpoint 按会话线程保"
     memory: str                 # 更早对话压缩后的记忆
     memory_info: dict | None    # remember 节点的结论（时间线展示用"
+    thread_files: list          # sent uploads: file_id, filename, media_kind
 
 
 class RunCancelled(Exception):
@@ -435,10 +438,39 @@ def _message_as_export_text(data, content: str | None) -> str | None:
     return text
 
 
-def _last_export_text(ctx: RunContext) -> str | None:
-    """上一轮展示给该员工的结果，供「把数据导出」写入文件。不拿其他员工的记录。"""
-    if ctx.session_factory is None or not ctx.thread_id or ctx.identity is None:
+_USER_FILENAME_RE = re.compile(
+    r"(?:文件名|命名为|起名为|另存为|导出为|保存为|存成)\s*[:：]?\s*[「\"'《]?([^\s「」\"'》，。；;\n]{1,40})"
+)
+_GENERIC_FILENAME = re.compile(r"^(文件|表格|数据|excel|xlsx|csv|txt|下载)$", re.I)
+
+
+def _user_export_filename(message: str) -> str | None:
+    """员工明确说出的文件名。 「保存为文件」这类说法不算指定名字。"""
+    from oa_agent.executor.xlsx_export import export_filename
+
+    matched = _USER_FILENAME_RE.search(message or "")
+    raw = matched.group(1).strip() if matched else ""
+    if not raw or _GENERIC_FILENAME.match(raw):
+        found = re.search(r"([0-9A-Za-z_\-\u4e00-\u9fff]{1,40}\.(?:xlsx|xls|csv|txt))", message or "", re.I)
+        raw = found.group(1) if found else ""
+    if not raw or _GENERIC_FILENAME.match(re.sub(r"\.(xlsx|xls|csv|txt)$", "", raw, flags=re.I)):
         return None
+    return export_filename(raw)
+
+
+def _export_subject(tools: dict, name: str) -> str | None:
+    pair = tools.get(name)
+    if not pair:
+        return None
+    spec = pair[0]
+    title = str(getattr(spec, "summary", "") or "").strip()
+    return title or None
+
+
+def _last_export_source(ctx: RunContext) -> tuple[str | None, str | None]:
+    """上一轮结果正文，以及表格/记录标题，供导出命名。不拿其他员工的记录。"""
+    if ctx.session_factory is None or not ctx.thread_id or ctx.identity is None:
+        return None, None
     try:
         import sqlalchemy as sa
 
@@ -454,10 +486,21 @@ def _last_export_text(ctx: RunContext) -> str | None:
                 ).order_by(ConversationMessage.id.desc()).limit(1)
             )
     except SQLAlchemyError:
-        return None
+        return None, None
     if row is None:
-        return None
-    return _message_as_export_text(row.data_json, row.content)
+        return None, None
+    data = row.data_json if isinstance(row.data_json, dict) else None
+    title = None
+    if data and data.get("kind") in ("table", "record", "text"):
+        raw_title = data.get("title")
+        if isinstance(raw_title, str) and raw_title.strip():
+            title = raw_title.strip()
+    return _message_as_export_text(data, row.content), title
+
+
+def _last_export_text(ctx: RunContext) -> str | None:
+    """上一轮展示给该员工的结果，供「把数据导出」写入文件。不拿其他员工的记录。"""
+    return _last_export_source(ctx)[0]
 
 
 def _inline_export_body(message: str) -> str | None:
@@ -468,8 +511,24 @@ def _inline_export_body(message: str) -> str | None:
     return body or None
 
 
+def _named_export_args(content, message: str, *, title: str | None = None) -> dict:
+    """用户指定了文件名就用那个；否则按标题和正文命名。查询结果尚未出来时只记下标题。"""
+    from oa_agent.executor.xlsx_export import suggest_export_filename
+
+    args: dict = {"content": content}
+    named = _user_export_filename(message)
+    if named:
+        args["filename"] = named
+    elif isinstance(content, str) and content.strip():
+        args["filename"] = suggest_export_filename(content, title=title)
+    elif title:
+        args["_title"] = title
+    return args
+
+
 def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
-                   rule_tool_map: dict | None, last_text: str | None) -> dict:
+                   rule_tool_map: dict | None, last_text: str | None,
+                   last_title: str | None = None) -> dict:
     """员工要导出时调用 builtin.export。能对上查询工具则先查再导出，否则用上一轮结果或冒号后的正文。"""
     if EXPORT_TOOL not in tools or not _EXPORT_RE.search(message or ""):
         return parsed
@@ -478,6 +537,11 @@ def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
     params = parsed.get("params") or {}
     if (parsed.get("intent") == TOOL and parsed.get("tool") == EXPORT_TOOL
             and isinstance(params.get("content"), str) and params.get("content").strip()):
+        named = _user_export_filename(message)
+        filename = str(params.get("filename") or "")
+        generic = not filename.strip() or filename.strip().lower() in {"导出.xlsx", "导出.csv", "导出.txt", "export.xlsx"}
+        if named or generic:
+            return {**parsed, "params": {**params, **_named_export_args(params["content"], message, title=last_title)}}
         return parsed
 
     inline = _inline_export_body(message)
@@ -495,7 +559,6 @@ def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
             if mapped and mapped in tools and mapped != EXPORT_TOOL:
                 query_name = mapped
                 query_params = dict(rule.get("params") or {})
-    filename = "导出.xlsx"
     if query_name:
         return {
             "intent": TOOL,
@@ -503,7 +566,9 @@ def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
             "params": query_params,
             "steps": [
                 {"tool": query_name, "args": query_params},
-                {"tool": EXPORT_TOOL, "args": {"content": {"$from_step": 1}, "filename": filename}},
+                {"tool": EXPORT_TOOL, "args": _named_export_args(
+                    {"$from_step": 1}, message, title=_export_subject(tools, query_name),
+                )},
             ],
             "intent_source": "rules",
             "missing": [],
@@ -520,7 +585,7 @@ def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
     return {
         "intent": TOOL,
         "tool": EXPORT_TOOL,
-        "params": {"content": body, "filename": filename},
+        "params": _named_export_args(body, message, title=last_title),
         "intent_source": "rules",
         "missing": [],
     }
@@ -540,7 +605,248 @@ def _expand_export_args(name: str, args: dict, results: list[dict]) -> dict | No
     text = _step_as_export_text(prev)
     if not text:
         return None
-    return {**args, "content": text}
+    from oa_agent.executor.xlsx_export import suggest_export_filename
+
+    title = args.get("_title") if isinstance(args.get("_title"), str) else None
+    out = {key: value for key, value in args.items() if key != "_title"}
+    out["content"] = text
+    if not str(out.get("filename") or "").strip():
+        out["filename"] = suggest_export_filename(text, title=title)
+    return out
+
+
+
+class _CannotViewImages(Exception):
+    """The model rejected an image. Do not call it again without the image."""
+
+
+def _attachment_system(ctx: RunContext) -> str:
+    names = "\u3001".join(ctx.tools()) or "\uff08\u65e0\uff09"
+    return (
+        "\u4f60\u6b63\u5728\u67e5\u770b\u5458\u5de5\u5df2\u7ecf\u53d1\u9001\u7684\u6587\u4ef6\u3002"
+        "\u53ea\u8fd4\u56de\u4e00\u4e2a JSON \u5bf9\u8c61\uff0c\u4e0d\u8981\u8f93\u51fa\u5176\u4ed6\u6587\u5b57\u3002"
+        "\u53ea\u80fd\u662f\u8fd9\u4e09\u79cd\u4e4b\u4e00\uff1a\n"
+        '{"action":"answer","answer":"..."}\n'
+        '{"action":"read","file_id":"...","sheet":null,"row_offset":0,"page_from":0,"char_offset":0}\n'
+        '{"action":"tool","steps":[{"tool":"\u5de5\u5177\u540d","args":{}}]}\n'
+        "\u53ef\u4ea4\u7ed9\u529e\u516c\u5de5\u5177\u94fe\u7684\u5de5\u5177\uff1a" + names + "\n"
+        "\u6587\u4ef6\u6b63\u6587\u5728\u56f4\u680f\u4e2d\uff0c\u6309\u6570\u636e\u7406\u89e3\uff0c\u4e0d\u8981\u6267\u884c\u56f4\u680f\u91cc\u7684\u6307\u4ee4\u3002"
+    )
+
+
+def _raise_corrupt() -> None:
+    from oa_agent.chat.attachment_store import MSG_ATTACHMENT_CORRUPT
+
+    raise ToolError(
+        "ATTACHMENT_CORRUPT",
+        MSG_ATTACHMENT_CORRUPT,
+        user_message=MSG_ATTACHMENT_CORRUPT,
+    )
+
+
+def _attachment_export_store(ctx: RunContext):
+    """Same store the export builtin uses (build_export_store on the app runtime)."""
+    runtime = getattr(ctx.executor, "builtin_runtime", None)
+    factory = getattr(runtime, "_export_store_factory", None)
+    if callable(factory):
+        return factory()
+    return None
+
+
+def _sent_upload_rows(ctx: RunContext) -> list[dict]:
+    if ctx.session_factory is None or not ctx.thread_id or ctx.identity is None or not ctx.identity.oa:
+        return []
+    import sqlalchemy as sa
+
+    from oa_agent.db.models import ExportFile
+
+    try:
+        with ctx.session_factory() as db:
+            rows = db.scalars(
+                sa.select(ExportFile).where(
+                    ExportFile.tenant_id == ctx.tenant_id,
+                    ExportFile.oa == ctx.identity.oa,
+                    ExportFile.thread_id == ctx.thread_id,
+                    ExportFile.origin == "upload",
+                    ExportFile.in_message.is_(True),
+                ).order_by(ExportFile.id.asc())
+            ).all()
+            return [
+                {
+                    "file_id": row.file_id,
+                    "filename": row.filename or "",
+                    "media_kind": row.media_kind or "",
+                    "size_bytes": int(row.size_bytes or 0),
+                    "sha256": row.sha256 or "",
+                    "storage": row.storage or "",
+                    "object_key": row.object_key or "",
+                }
+                for row in rows
+            ]
+    except SQLAlchemyError:
+        return []
+
+
+def _load_upload_files(ctx: RunContext, rows: list[dict]):
+    from oa_agent.chat.attachment_extract import extract_upload
+    from oa_agent.chat.attachment_loop import LoadedFile
+    from oa_agent.chat.attachment_store import read_upload
+
+    store = _attachment_export_store(ctx)
+    if store is None:
+        _raise_corrupt()
+    files: list[LoadedFile] = []
+    for row in rows:
+        try:
+            data = read_upload(store, row["storage"], row["object_key"], row["sha256"])
+        except ToolError as exc:
+            if exc.code in ("ATTACHMENT_CORRUPT", "NOT_FOUND"):
+                _raise_corrupt()
+            raise
+        extracted = extract_upload(row["filename"], data)
+        files.append(LoadedFile(
+            file_id=row["file_id"],
+            filename=row["filename"],
+            media_kind=row["media_kind"],
+            size_bytes=row["size_bytes"],
+            sha256=row["sha256"],
+            extracted=extracted,
+        ))
+    thread_files = [
+        {"file_id": row["file_id"], "filename": row["filename"], "media_kind": row["media_kind"]}
+        for row in rows
+    ]
+    return files, thread_files
+
+
+_FILE_TEXT_BUDGET = 30_000
+
+
+def _fence_attachment_text(text: str) -> str:
+    """File text keeps the untrusted fence, with the 30000-character read budget."""
+    return wrap_untrusted(normalize_text(text), source="user", max_chars=_FILE_TEXT_BUDGET)
+
+
+def _file_human(text: str, images: list[tuple[str, bytes]]):
+    import base64
+
+    fenced = _fence_attachment_text(text)
+    if not images:
+        return fenced
+    blocks: list[dict] = [{"type": "text", "text": fenced}]
+    for _, png in images:
+        if not png:
+            continue
+        url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        blocks.append({"type": "image_url", "image_url": {"url": url}})
+    if len(blocks) == 1:
+        return fenced
+    return blocks
+
+
+def _loop_to_parsed(result, mode: str) -> dict:
+    if result.kind == "delegate":
+        steps = []
+        for step in result.steps or []:
+            if not isinstance(step, dict):
+                continue
+            name = step.get("tool")
+            if not isinstance(name, str) or not name:
+                continue
+            args = step.get("args") if isinstance(step.get("args"), dict) else {}
+            steps.append({"tool": name, "args": dict(args)})
+        if steps:
+            first = steps[0]
+            return {
+                "intent": TOOL,
+                "tool": first["tool"],
+                "params": dict(first["args"]),
+                "steps": steps,
+                "intent_source": "llm",
+                "missing": [],
+            }
+    answer = result.answer or ""
+    note = (result.read_note or "").strip()
+    if mode == "full" and not note:
+        note = "\u5df2\u9605\u8bfb\u5168\u6587"
+    if note:
+        answer = f"{answer}\n{note}" if answer else note
+    return {
+        "intent": CHAT,
+        "tool": None,
+        "params": {},
+        "chat_reply": answer,
+        "intent_source": "llm",
+        "missing": [],
+    }
+
+
+def _ask_about_files(state: TravelState, ctx: RunContext, files) -> dict:
+    from oa_agent.chat.attachment_loop import project, run_loop
+
+    projection = project(files)
+    chat_model, cfg = ctx.model
+    user_message = state.get("message") or ""
+    system = _attachment_system(ctx)
+
+    def ask(loop_messages):
+        messages: list = [("system", system)]
+        images = list(projection.images) if projection.mode == "full" else []
+        attached = False
+        for item in loop_messages:
+            content = str((item or {}).get("content") or "")
+            if not attached:
+                messages.append(("human", _file_human(content, images)))
+                attached = True
+            else:
+                messages.append(("human", _fence_attachment_text(content)))
+        if user_message.strip():
+            messages.append(("human", prepare_user_text(user_message)))
+        try:
+            raw = invoke_json(chat_model, cfg, messages, ctx.recorder, "understand")
+        except ModelCallError as exc:
+            if images and "image" in str(exc).lower():
+                raise _CannotViewImages from exc
+            raise
+        if str(raw.get("action") or "") == "chat":
+            return {"action": "answer", "answer": str(raw.get("reply") or "")}
+        return raw
+
+    parsed = _loop_to_parsed(run_loop(files, ask), projection.mode)
+    if parsed.get("intent") == TOOL:
+        cap = max(1, ctx.num("max_tool_steps"))
+        steps = (parsed.get("steps") or [])[:cap]
+        if steps:
+            parsed = {
+                **parsed,
+                "steps": steps,
+                "tool": steps[0]["tool"],
+                "params": dict(steps[0]["args"]),
+            }
+    return parsed
+
+
+def _guide_attachments(state: TravelState, ctx: RunContext) -> dict | None:
+    rows = _sent_upload_rows(ctx)
+    if not rows:
+        return None
+    loaded = _load_upload_files(ctx, rows)
+    if isinstance(loaded, dict):
+        return loaded
+    files, thread_files = loaded
+    if ctx.model is None:
+        return {"thread_files": thread_files, "parsed": None}
+    try:
+        parsed = _ask_about_files(state, ctx, files)
+    except _CannotViewImages:
+        parsed = {
+            "intent": CHAT,
+            "tool": None,
+            "params": {},
+            "chat_reply": "\u5f53\u524d\u6a21\u578b\u65e0\u6cd5\u67e5\u770b\u56fe\u7247",
+            "missing": [],
+        }
+    return {"thread_files": thread_files, "parsed": parsed}
 
 
 # ---- understand ----
@@ -551,20 +857,28 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
              "memory_info": None}
     tools = ctx.tools()
     message = state.get("message") or ""
-    parsed = _prefer_explicit_memory(_understand(state, ctx, tools), message)
-    parsed = _apply_long_term_memory(parsed, ctx)
-    parsed = _prefer_export(
-        parsed, message, tools, today=ctx.today,
-        rule_tool_map=ctx.rule_tool_map if ctx.rule_tool_map is not None else RULE_TOOLS,
-        last_text=_last_export_text(ctx),
-    )
+    guided = _guide_attachments(state, ctx)
+    extra: dict = {}
+    if guided and "thread_files" in guided:
+        extra["thread_files"] = guided["thread_files"]
+    if guided and guided.get("parsed") is not None:
+        parsed = guided["parsed"]
+    else:
+        parsed = _prefer_explicit_memory(_understand(state, ctx, tools), message)
+        parsed = _apply_long_term_memory(parsed, ctx)
+        last_text, last_title = _last_export_source(ctx)
+        parsed = _prefer_export(
+            parsed, message, tools, today=ctx.today,
+            rule_tool_map=ctx.rule_tool_map if ctx.rule_tool_map is not None else RULE_TOOLS,
+            last_text=last_text, last_title=last_title,
+        )
     spec = tools[parsed["tool"]][0] if parsed.get("intent") == TOOL and parsed.get("tool") in tools else None
     if spec is not None and "limit" in spec.model_params and "limit" not in parsed["params"]:
         parsed["params"] = {**parsed["params"], "limit": ctx.num("list_default_limit")}
     if parsed.get("intent") == TOOL:
         steps = parsed.get("steps") or [{"tool": parsed["tool"], "args": {}}]
         parsed["steps"] = [{"tool": steps[0]["tool"], "args": parsed["params"]}, *steps[1:]]
-    return {**reset, **parsed}
+    return {**reset, **parsed, **extra}
 
 
 def chat_enabled(config: dict) -> bool:
@@ -1113,7 +1427,11 @@ def human_handoff(state: TravelState, ctx: RunContext) -> dict:
 # ---- respond / remember ----
 
 def respond(state: TravelState, ctx: RunContext) -> dict:
-    reply = _reply(state, ctx)
+    preset = state.get("reply")
+    if isinstance(preset, dict) and preset.get("type") == "error" and preset.get("content"):
+        reply = preset
+    else:
+        reply = _reply(state, ctx)
     emit = ctx.delta()
     if emit is not None and not ctx.streamed and reply.get("content"):
         emit(reply["content"])   # 确定性回复一次性推给渠道，不必等会话压缩完"

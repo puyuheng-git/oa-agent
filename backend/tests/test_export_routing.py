@@ -84,6 +84,7 @@ def test_export_utterance_calls_export_tool_with_previous_text():
     assert out["intent"] == "tool"
     assert out["tool"] == "builtin.export"
     assert "张三,10" in out["params"]["content"]
+    assert out["params"]["filename"] == "张三.xlsx"
 
 
 def test_export_this_record_uses_previous_result_not_a_new_query():
@@ -101,6 +102,7 @@ def test_export_this_record_uses_previous_result_not_a_new_query():
     assert out["intent"] == "tool"
     assert out["tool"] == "builtin.export"
     assert "3843" in out["params"]["content"]
+    assert out["params"]["filename"] == "3843.xlsx"
     assert "steps" not in out
 
 
@@ -118,7 +120,56 @@ def test_export_plus_query_chains_list_then_export():
     assert out["tool"] == "query_my_travel_expense_list"
     assert out["steps"][1]["tool"] == "builtin.export"
     assert out["steps"][1]["args"]["content"]["$from_step"] == 1
+    assert out["steps"][1]["args"]["_title"] == "行程报销列表"
+    assert "filename" not in out["steps"][1]["args"]
     assert out["params"]["date_gte"] == "2026-11-01"
+
+
+def test_user_named_file_is_kept():
+    tools = {"builtin.export": (_export_spec(), None)}
+    parsed = {"intent": "chat", "tool": None, "params": {}, "chat_reply": "好"}
+    out = oa_assistant._prefer_export(
+        parsed, "导出为会议纪要", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text="姓名,金额\n张三,10", last_title="行程报销列表",
+    )
+    assert out["params"]["filename"] == "会议纪要.xlsx"
+
+
+def test_title_and_record_id_make_the_filename():
+    tools = {"builtin.export": (_export_spec(), None)}
+    parsed = {"intent": "chat", "tool": None, "params": {}, "chat_reply": "好"}
+    out = oa_assistant._prefer_export(
+        parsed, "把这条导出来", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text="单号,3843\n金额,5.00", last_title="行程报销",
+    )
+    assert out["params"]["filename"] == "行程报销-3843.xlsx"
+
+
+def test_call_tool_names_chained_export_from_query_title():
+    spec = _export_spec()
+
+    class _Exec:
+        registry = _Reg({"builtin.export": spec})
+
+        def execute(self, name, args, identity, rec, node):
+            return {"ok": True, "capability": name, "data": {"text": "ok"}, "message": ""}
+
+    ctx = _ctx(_Exec.registry, [])
+    ctx.executor = _Exec()
+    state = {
+        "steps": [
+            {"tool": "query_my_travel_expense_list", "args": {}},
+            {"tool": "builtin.export", "args": {"content": {"$from_step": 1}, "_title": "行程报销列表"}},
+        ],
+        "step_index": 1,
+        "step_results": [{"list": [{"id": 7, "amount": 3}, {"id": 8, "amount": 4}], "total": 2}],
+        "intent": "tool",
+    }
+    seen = oa_assistant._expand_export_args(
+        "builtin.export", state["steps"][1]["args"], state["step_results"],
+    )
+    assert seen["filename"] == "行程报销列表.xlsx"
+    assert "_title" not in seen
 
 
 def test_call_tool_fills_export_content_from_previous_step():

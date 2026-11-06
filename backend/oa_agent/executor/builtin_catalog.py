@@ -57,7 +57,7 @@ BUILTIN_CATALOG: list[BuiltinDef] = [
     BuiltinDef(
         "sys.export", "导出文件并返回下载票据", "medium", True, True,
         how="把文本写入本机或 OSS（按系统设置），登记下载票据，链接长期有效（须本人登录）；不直连 OA 业务库。",
-        constraints=("内容体积有上限", "文件名缺省为 导出.xlsx", "文件名经清洗，禁止路径穿越"),
+        constraints=("内容体积有上限", "未指定文件名时按导出内容命名", "文件名经清洗，禁止路径穿越"),
     ),
     BuiltinDef(
         "sys.memory", "员工长期记忆", "medium", True,

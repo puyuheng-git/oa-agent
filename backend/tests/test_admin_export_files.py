@@ -30,6 +30,9 @@ def _seed_export_file(
     thread_id: str | None = "thr_export_1",
     run_id: str | None = "run_export_1",
     created_at=None,
+    origin: str = "export",
+    media_kind: str | None = None,
+    in_message: bool = True,
 ) -> str:
     ticket = secrets.token_urlsafe(18)
     file_id = new_export_file_id()
@@ -49,6 +52,9 @@ def _seed_export_file(
                 content_type="text/plain",
                 storage=storage,
                 object_key=object_key,
+                origin=origin,
+                media_kind=media_kind,
+                in_message=in_message,
                 created_at=created_at or utcnow(),
             )
         )
@@ -144,3 +150,56 @@ def test_list_filters_oa_thread_filename_and_time(admin, installed):
     )
     ids = {i["file_id"] for i in by_time.json()["items"]}
     assert ids == {keep}
+
+
+def test_list_origin_filter(admin, installed):
+    rt = installed.app.state.runtime
+    export_id = _seed_export_file(rt, filename="exported.xlsx", oa="origin_alice")
+    upload_sent_id = _seed_export_file(
+        rt,
+        filename="upload-sent.png",
+        content=b"upload-sent-bytes",
+        oa="origin_alice",
+        origin="upload",
+        media_kind="image",
+        in_message=True,
+    )
+    upload_unsent_id = _seed_export_file(
+        rt,
+        filename="upload-unsent.png",
+        content=b"upload-unsent-bytes",
+        oa="origin_alice",
+        origin="upload",
+        media_kind="image",
+        in_message=False,
+    )
+
+    default = admin.get(LIST_URL, params={"oa": "origin_alice"})
+    assert default.status_code == 200, default.text
+    assert "object_key" not in default.text
+    default_ids = {i["file_id"] for i in default.json()["items"]}
+    assert export_id in default_ids
+    assert upload_sent_id in default_ids
+    assert upload_unsent_id not in default_ids
+
+    only_upload = admin.get(LIST_URL, params={"oa": "origin_alice", "origin": "upload"})
+    assert only_upload.status_code == 200, only_upload.text
+    upload_items = only_upload.json()["items"]
+    assert {i["file_id"] for i in upload_items} == {upload_sent_id}
+    assert all(i["origin"] == "upload" for i in upload_items)
+    assert upload_items[0]["media_kind"] == "image"
+
+    only_export = admin.get(LIST_URL, params={"oa": "origin_alice", "origin": "export"})
+    assert only_export.status_code == 200, only_export.text
+    export_items = only_export.json()["items"]
+    assert {i["file_id"] for i in export_items} == {export_id}
+    assert export_items[0]["origin"] == "export"
+
+    bad = admin.get(LIST_URL, params={"origin": "invalid"})
+    assert bad.status_code == 422
+
+    d = admin.get(_download_url(upload_sent_id))
+    assert d.status_code == 200, d.text
+    assert d.content == b"upload-sent-bytes"
+    actions = [a["action"] for a in audit_rows(admin)]
+    assert "export_file.download" in actions

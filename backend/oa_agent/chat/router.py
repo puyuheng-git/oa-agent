@@ -7,11 +7,11 @@ import logging
 import queue
 import threading
 import time
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import quote
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -54,6 +54,7 @@ class SessionIn(BaseModel):
 class MessageIn(BaseModel):
     message: str = Field(max_length=2000)
     client_msg_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    attachment_ids: list[Annotated[str, Field(max_length=40)]] = Field(default_factory=list, max_length=5)
 
 
 class ThreadPatchIn(BaseModel):
@@ -306,8 +307,8 @@ def switch_session(
             raise AppError(404, "THREAD_NOT_FOUND", "会话不存在")
     auth.session.thread_id = body.thread_id
     chat_launch.store_session(rt.kv.current, auth.ticket, auth.session, policy)
-    return {"thread_id": body.thread_id,
-            **_session_extras(rt, oa=auth.session.oa, office_token=auth.session.office_token)}
+    # 只改当前线程。能力菜单和轮询参数在打开会话时已经下发，这里重算会让每次切换都再查库。
+    return {"thread_id": body.thread_id}
 
 
 @router.post("/session/refresh")
@@ -337,12 +338,75 @@ def download_export(ticket: str, request: Request, auth: ChatAuth = Depends(chat
     )
 
 
+def _upload_thread_id(rt, auth: ChatAuth) -> str:
+    thread_id = (auth.session.thread_id or "").strip()
+    if thread_id:
+        return thread_id
+    channel = auth.session.channel or "oa_web"
+    with rt.session() as db, db.begin():
+        row = create_thread(db, oa=auth.session.oa, channel=channel, tenant_id=rt.tenant_id)
+        thread_id = row.thread_id
+    auth.session.thread_id = thread_id
+    chat_launch.store_session(rt.kv.current, auth.ticket, auth.session, launch_policy(rt))
+    return thread_id
+
+
+@router.post("/attachments")
+def upload_attachments(
+    request: Request,
+    auth: ChatAuth = Depends(chat_auth),
+    files: list[UploadFile] = File(...),
+):
+    from oa_agent.chat.attachment_files import save_uploads
+    from oa_agent.executor.builtin_runtime import build_export_store
+
+    rt = get_runtime(request)
+    thread_id = _upload_thread_id(rt, auth)
+    payload = [(item.filename or "", item.file.read()) for item in files]
+    store = build_export_store(rt)
+    with rt.session() as db:
+        saved = save_uploads(
+            db,
+            store,
+            tenant_id=rt.tenant_id,
+            oa=auth.session.oa,
+            thread_id=thread_id,
+            files=payload,
+        )
+    return {"files": saved}
+
+
+@router.get("/files/{file_id}")
+def download_owned_file(file_id: str, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.chat.attachment_files import read_owned
+    from oa_agent.executor.builtin_runtime import build_export_store
+
+    rt = get_runtime(request)
+    store = build_export_store(rt)
+    with rt.session() as db:
+        row, data = read_owned(
+            db,
+            store,
+            tenant_id=rt.tenant_id,
+            oa=auth.session.oa,
+            file_id=file_id,
+        )
+        filename = row.filename or "file"
+        media = row.content_type or "application/octet-stream"
+    return Response(
+        content=data,
+        media_type=media,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
 @router.post("/messages")
 def post_message(body: MessageIn, request: Request, auth: ChatAuth = Depends(chat_auth)):
     rt = get_runtime(request)
-    guard_message(rt, auth.session, body.message, body.client_msg_id)
+    guard_message(rt, auth.session, body.message, body.client_msg_id, body.attachment_ids)
     return handle_message(rt, auth.session, body.message.strip(), request.state.request_id,
-                          session_key=chat_launch.session_key(auth.ticket))
+                          session_key=chat_launch.session_key(auth.ticket),
+                          attachment_ids=body.attachment_ids)
 
 
 SSE_HEARTBEAT = 15  # 秒：无输出时发注释行，防止代理/负载均衡因空闲断开
@@ -357,7 +421,7 @@ def post_message_stream(body: MessageIn, request: Request, auth: ChatAuth = Depe
     """与 /messages 相同，但以 SSE 返回：delta 事件为回复正文的新增片段，done 事件为完整结果（与 /messages 响应同形）。
     校验失败（限流、重复、过长）仍以普通 JSON 错误返回。员工中途断开不影响运行，结果可按 run_id 查询。"""
     rt = get_runtime(request)
-    guard_message(rt, auth.session, body.message, body.client_msg_id)
+    guard_message(rt, auth.session, body.message, body.client_msg_id, body.attachment_ids)
     events: queue.Queue = queue.Queue()
     session, correlation_id = auth.session, request.state.request_id
     key = chat_launch.session_key(auth.ticket)
@@ -365,7 +429,8 @@ def post_message_stream(body: MessageIn, request: Request, auth: ChatAuth = Depe
     def work() -> None:
         try:
             result = handle_message(rt, session, body.message.strip(), correlation_id, session_key=key,
-                                    on_delta=lambda piece: events.put(("delta", {"text": piece})))
+                                    on_delta=lambda piece: events.put(("delta", {"text": piece})),
+                                    attachment_ids=body.attachment_ids)
             events.put(("done", result))
         except AppError as exc:
             events.put(("error", {"code": exc.code, "message": exc.message}))

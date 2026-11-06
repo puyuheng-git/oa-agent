@@ -185,7 +185,7 @@ def test_export_writes_under_tenant_dir_and_returns_ticket(rt, tmp_path):
 def test_export_defaults_filename_when_omitted(rt, tmp_path):
     rtm = _runtime(rt, tmp_path)
     out = rtm.call(_spec("sys.export"), {"content": "a,b\n1,2\n"}, identity=ID_ALICE)
-    assert out["filename"] == "导出.xlsx"
+    assert out["filename"] == "a-b.xlsx"
     assert out["ticket"] and out["size_bytes"] > 0
 
 

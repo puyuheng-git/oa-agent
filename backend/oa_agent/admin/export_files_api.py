@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 from datetime import UTC, datetime
+from typing import Literal
 from urllib.parse import quote
 
 import sqlalchemy as sa
@@ -40,6 +41,8 @@ def _item(row: ExportFile) -> dict:
         "filename": row.filename,
         "size_bytes": row.size_bytes,
         "storage": row.storage,
+        "origin": row.origin,
+        "media_kind": row.media_kind,
         "created_at": _iso(row.created_at),
     }
 
@@ -61,10 +64,23 @@ def list_export_files(
     filename: str | None = Query(None, max_length=255),
     start: datetime | None = None,
     end: datetime | None = None,
+    origin: Literal["upload", "export"] | None = None,
     ctx: AdminCtx = Depends(admin_read(VIEW)),
 ):
     F = ExportFile
     cond = [F.tenant_id == ctx.runtime.tenant_id]
+    if origin == "upload":
+        cond.append(F.origin == "upload")
+        cond.append(F.in_message.is_(True))
+    elif origin == "export":
+        cond.append(F.origin == "export")
+    else:
+        cond.append(
+            sa.or_(
+                F.origin == "export",
+                sa.and_(F.origin == "upload", F.in_message.is_(True)),
+            )
+        )
     if oa:
         cond.append(F.oa == oa.strip())
     if thread_id:

@@ -8,12 +8,20 @@ import { NO_DATA } from '../runs'
 import {
   conversationLink,
   downloadPath,
+  exportOriginLabel,
   listExportFiles,
   type ExportFileItem,
+  type ExportFileOrigin,
 } from '../files'
 
 const router = useRouter()
-const filters = reactive({ oa: '', thread_id: '', filename: '', page: 1 })
+const filters = reactive<{ oa: string; thread_id: string; filename: string; origin: ExportFileOrigin | ''; page: number }>({
+  oa: '',
+  thread_id: '',
+  filename: '',
+  origin: '',
+  page: 1,
+})
 const rows = ref<ExportFileItem[]>([])
 const total = ref(0)
 const loading = ref(false)
@@ -26,6 +34,7 @@ async function load() {
       oa: filters.oa,
       thread_id: filters.thread_id,
       filename: filters.filename,
+      origin: filters.origin || undefined,
       page: filters.page,
       page_size: PAGE_SIZE,
     })
@@ -93,6 +102,13 @@ onMounted(load)
       <el-form-item label="文件名">
         <el-input v-model="filters.filename" clearable placeholder="包含" style="width: 180px" />
       </el-form-item>
+      <el-form-item label="来源">
+        <el-select v-model="filters.origin" clearable placeholder="全部" style="width: 140px">
+          <el-option label="全部" value="" />
+          <el-option label="用户上传" value="upload" />
+          <el-option label="助手导出" value="export" />
+        </el-select>
+      </el-form-item>
       <el-button type="primary" native-type="submit">查询</el-button>
     </el-form>
 
@@ -101,6 +117,9 @@ onMounted(load)
         <template #default="{ row }">{{ row.created_at ? formatTime(row.created_at) : NO_DATA }}</template>
       </el-table-column>
       <el-table-column prop="filename" label="文件名" min-width="220" show-overflow-tooltip />
+      <el-table-column label="来源" width="110">
+        <template #default="{ row }">{{ exportOriginLabel(row.origin) }}</template>
+      </el-table-column>
       <el-table-column prop="oa" label="员工 OA" width="120" />
       <el-table-column label="thread_id" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">

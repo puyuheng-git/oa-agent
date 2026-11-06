@@ -1,6 +1,9 @@
 import { http } from '@/shared/http'
+import { NO_DATA } from './runs'
 
 export const EXPORT_FILES_BASE = '/v1/admin/export-files'
+
+export type ExportFileOrigin = 'upload' | 'export'
 
 export interface ExportFileItem {
   file_id: string
@@ -10,7 +13,15 @@ export interface ExportFileItem {
   filename: string
   size_bytes: number
   storage: string
+  origin: ExportFileOrigin | null
+  media_kind: string | null
   created_at: string | null
+}
+
+export function exportOriginLabel(origin: ExportFileOrigin | null | undefined): string {
+  if (origin === 'upload') return '用户上传'
+  if (origin === 'export') return '助手导出'
+  return NO_DATA
 }
 
 export interface ExportFileList {
@@ -35,6 +46,7 @@ export function listExportFiles(params: {
   oa?: string
   thread_id?: string
   filename?: string
+  origin?: ExportFileOrigin
   page?: number
   page_size?: number
 }): Promise<ExportFileList> {

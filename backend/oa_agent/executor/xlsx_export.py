@@ -1,12 +1,18 @@
-"""把表格或文本写成最小的 xlsx（Office Open XML），不依赖第三方库。"""
+"""Write tabular or plain text as a minimal xlsx workbook. No third-party dependency."""
 
 from __future__ import annotations
 
 import csv
 import io
 import json
+import re
 import zipfile
 from xml.sax.saxutils import escape
+
+_IDENT_LABELS = ("标题", "名称", "主题", "姓名", "单号", "编号", "单据号", "报销单号", "合同名称", "合同号", "项目名称", "项目")
+_FIELD_LABELS = _IDENT_LABELS + ("金额", "日期", "状态", "备注", "部门", "事由", "内容", "字段", "时间", "地点")
+_LABEL_TAIL = re.compile(r"(号|称|名|题|额|期|间|型|门|目|由|态|注|类|别|人|位)$")
+_UNSAFE_NAME = re.compile(r"[^0-9A-Za-z_.\-\u4e00-\u9fff]+")
 
 
 def _col_name(index: int) -> str:
@@ -75,12 +81,103 @@ def build_xlsx(headers: list[str], rows: list[list[object]]) -> bytes:
     return buf.getvalue()
 
 
+def _is_field_label(text: str) -> bool:
+    label = (text or "").strip()
+    if not label or len(label) > 12 or any(ch.isdigit() for ch in label):
+        return False
+    if label in _FIELD_LABELS:
+        return True
+    return bool(_LABEL_TAIL.search(label))
+
+
+def _record_pairs(content: str) -> list[tuple[str, str]] | None:
+    """Every line is field,value. Do not treat that as a CSV header row."""
+    lines = [ln.strip() for ln in (content or "").splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    pairs: list[tuple[str, str]] = []
+    for line in lines:
+        if line.count(",") != 1:
+            return None
+        left, right = (part.strip() for part in line.split(",", 1))
+        if not left or not right or not _is_field_label(left):
+            return None
+        pairs.append((left, right))
+    return pairs
+
+
+def _clean_stem(value: str | None) -> str:
+    text = str(value or "").replace("\\", "/").split("/")[-1].strip()
+    text = re.sub(r"\.(xlsx|xls|csv|txt)$", "", text, flags=re.I)
+    text = _UNSAFE_NAME.sub("_", text).strip("._")
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text[:40].rstrip("._")
+
+
+def export_filename(raw: str, *, default_ext: str = ".xlsx") -> str:
+    stem = _clean_stem(raw) or "导出"
+    given = str(raw or "")
+    match = re.search(r"\.(xlsx|xls|csv|txt)$", given, flags=re.I)
+    ext = f".{match.group(1).lower()}" if match else default_ext
+    name = stem + ext
+    if len(name) > 80:
+        name = stem[: 80 - len(ext)].rstrip("._") + ext
+    return name
+
+
+def _ident_from_pairs(pairs: list[tuple[str, str]]) -> str:
+    found = {label: value for label, value in pairs}
+    for label in _IDENT_LABELS:
+        value = _clean_stem(found.get(label))
+        if value:
+            return value
+    return ""
+
+
+def _ident_from_row(headers: list[str], row: list[str]) -> str:
+    for label in _IDENT_LABELS:
+        if label in headers:
+            index = headers.index(label)
+            value = _clean_stem(row[index] if index < len(row) else "")
+            if value:
+                return value
+    return ""
+
+
+def _first_text(content: str) -> str:
+    for line in (content or "").splitlines():
+        text = re.sub(r"^[#*\-\s]+", "", line).strip()
+        if text:
+            return text[:24]
+    return ""
+
+
+def suggest_export_filename(content: str, title: str | None = None) -> str:
+    """Name a file from its title, an identifier, column headers, or the first line."""
+    pairs = _record_pairs(content)
+    headers, rows = table_from_content(content)
+    single = bool(pairs) or len(rows) == 1
+    ident = _ident_from_pairs(pairs) if pairs else (_ident_from_row(headers, rows[0]) if len(rows) == 1 else "")
+    stem = _clean_stem(title)
+    if stem and single and ident and ident not in stem:
+        stem = f"{stem}-{ident}"
+    elif not stem:
+        useful = [h for h in headers if h not in {"内容", "字段"}]
+        if single and ident:
+            stem = ident
+        elif useful:
+            stem = _clean_stem("-".join(useful[:3]))
+        else:
+            stem = _clean_stem(_first_text(content))
+    return export_filename(stem or "导出")
+
+
 def _pairs(text: str) -> list[tuple[str, str]] | None:
     lines = [ln.strip().lstrip("-").strip() for ln in text.splitlines() if ln.strip()]
     pairs: list[tuple[str, str]] = []
     for line in lines:
-        if "：" in line:
-            left, right = line.split("：", 1)
+        if "\uff1a" in line:
+            left, right = line.split("\uff1a", 1)
         elif ":" in line and not line.lower().startswith("http"):
             left, right = line.split(":", 1)
         else:
@@ -90,7 +187,7 @@ def _pairs(text: str) -> list[tuple[str, str]] | None:
 
 
 def table_from_content(content: str) -> tuple[list[str], list[list[str]]]:
-    """JSON 表格、CSV，或「字段：值」文本，都收成表头和行。"""
+    """JSON table, CSV, field/value lines, or plain text become headers and rows."""
     raw = (content or "").strip()
     if raw.startswith("{"):
         try:
@@ -103,6 +200,9 @@ def table_from_content(content: str) -> tuple[list[str], list[list[str]]]:
             if headers or rows:
                 return headers or ["内容"], rows
     lines = [ln for ln in raw.splitlines() if ln.strip()]
+    record = _record_pairs(raw)
+    if record:
+        return ["字段", "内容"], [[left, right] for left, right in record]
     if lines and any("," in ln for ln in lines):
         parsed = list(csv.reader(io.StringIO(raw)))
         parsed = [row for row in parsed if any(cell.strip() for cell in row)]

@@ -192,7 +192,8 @@ class BuiltinRuntime:
             raise _invalid("缺少参数 content")
         raw_fn = args.get("filename")
         if raw_fn is None or (isinstance(raw_fn, str) and not str(raw_fn).strip()):
-            filename = "导出.xlsx"
+            from oa_agent.executor.xlsx_export import suggest_export_filename
+            filename = _safe_filename(suggest_export_filename(content))
         else:
             filename = _safe_filename(raw_fn)
         if filename.lower().endswith(".xlsx"):
@@ -245,7 +246,7 @@ class BuiltinRuntime:
                         ExportFile.ticket == ticket,
                     )
                 ).scalar_one_or_none()
-                if row is None or row.oa != oa:
+                if row is None or row.oa != oa or row.origin != "export":
                     return None
                 storage, object_key, filename = row.storage, row.object_key, row.filename
             data = store.get(storage, object_key)

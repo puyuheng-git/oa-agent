@@ -569,6 +569,7 @@ class ExportFile(Base):
         sa.Index("ix_export_created", "tenant_id", "created_at"),
         sa.Index("ix_export_oa_created", "tenant_id", "oa", "created_at"),
         sa.Index("ix_export_thread", "tenant_id", "thread_id"),
+        sa.Index("ix_export_origin", "tenant_id", "origin", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
@@ -583,4 +584,8 @@ class ExportFile(Base):
     content_type: Mapped[str] = mapped_column(sa.String(128))
     storage: Mapped[str] = mapped_column(sa.String(16))  # local|oss
     object_key: Mapped[str] = mapped_column(sa.String(512))
+    origin: Mapped[str] = mapped_column(sa.String(16), default="export", server_default="export")
+    sha256: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    media_kind: Mapped[str | None] = mapped_column(sa.String(16), nullable=True)
+    in_message: Mapped[bool] = mapped_column(sa.Boolean, default=True, server_default=sa.true())
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
