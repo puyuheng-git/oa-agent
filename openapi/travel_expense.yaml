@@ -76,7 +76,7 @@ paths:
         result:
           kind: object
           fields: [id, date, client_name, total_amount, status, status_text, source, source_text, transport_types_desc, remark, travel_route, is_meal_allowance, run_id, out_attendance_application_id, fiscal_year]
-          labels: { id: 单号, date: 日期, client_name: 客户, total_amount: 金额, status_text: 状态, source_text: 来源, transport_types_desc: 交通方式, travel_route: 行程路线, fiscal_year: 财年, remark: 备注 }
+          labels: { id: 单号, date: 行程日期, client_name: 客户, total_amount: 金额, status_text: 状态, source_text: 来源, transport_types_desc: 交通方式, travel_route: 行程路线, fiscal_year: 财年, remark: 备注 }
         model_params:
           id: { type: integer, minimum: 1, required: true, label: 单号, description: "报销单 ID" }
       responses:

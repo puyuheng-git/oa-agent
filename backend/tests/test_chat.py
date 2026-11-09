@@ -239,7 +239,11 @@ def test_detail_query(chat, office):
     h = open_chat(chat)
     body = send(chat, h, "查看报销单 101 的详情").json()
     data = body["reply"]["data"]
+    content = body["reply"]["content"]
     assert data["kind"] == "record" and data["tool"] == "query_my_travel_expense_detail"
+    assert "单号：101" in content and "状态：未报销" in content and "金额：120.00" in content
+    assert "行程日期：2026-09-30" in content
+    assert content == data.get("summary")
     assert data["item"] == {k: v for k, v in ROW.items()
                             if k not in ("internal_secret", "remark")} | {"remark": "备" * 100 + "…"}
     assert {f["key"]: f["label"] for f in data["fields"]}["client_name"] == "客户"

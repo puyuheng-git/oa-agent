@@ -1595,11 +1595,12 @@ def _ask_reply(spec: ToolSpec, skill: SkillState | None, missing: list[str]) -> 
 
 
 def _cell(value) -> str:
+    from oa_agent.executor.display_format import format_field_value
+
     if value is None or value == "":
         return ""
-    if isinstance(value, (dict, list)):
-        value = json.dumps(value, ensure_ascii=False)
-    return str(value).replace("|", "").replace("\n", " ")
+    text = format_field_value(value)
+    return text.replace("|", "").replace("\n", " ")
 
 
 def _value_text(rule: dict, value) -> str:
@@ -1689,16 +1690,21 @@ def _text_reply(spec: ToolSpec, title: str, data: dict, notice: str = "") -> dic
 
 
 def _record_reply(spec: ToolSpec, title: str, data: dict, params: dict, notice: str = "") -> dict:
+    from oa_agent.executor.display_format import format_record_item, record_human_summary, record_reply_body
+
     if not data:
         return {"type": "markdown", "content": notice or f"没有查到相关的{title}记录（或该记录不属于你）。",
                 "data": None}
     shown = [f for f in spec.result_fields if f in spec.result_labels] or list(spec.result_fields)
     fields = [f for f in shown if data.get(f) not in (None, "")]
-    lines = [f"**{title}**" + (f" {data['id']}" if data.get("id") not in (None, "") else ""), ""]
-    lines += [f"- {spec.label(f)}：{_cell(data[f])}" for f in fields]
-    return _with_notice({"type": "markdown", "content": "\n".join(lines),
+    display_item = format_record_item(data)
+    summary = record_human_summary(spec, title, data)
+    content = record_reply_body(spec, title, data)
+    return _with_notice({"type": "markdown", "content": content,
                          "data": {"kind": "record", "tool": spec.name, "title": title,
-                                  "fields": [{"key": f, "label": spec.label(f)} for f in fields], "item": data}},
+                                  "summary": summary, "human_summary": summary,
+                                  "fields": [{"key": f, "label": spec.label(f)} for f in fields],
+                                  "item": display_item}},
                         notice)
 
 def _route(state: TravelState) -> str:
