@@ -345,4 +345,10 @@ class ToolExecutor:
         rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
                   duration_ms=resp.duration_ms, output_summary={**summary, "message": resp.message} if resp.message
                   else summary, metadata={"http_status": resp.http_status, "connector_id": connector_id})
-        return {"ok": True, "capability": name, "data": result, "message": resp.message}
+        out: dict = {"ok": True, "capability": name, "data": result, "message": resp.message}
+        if spec.result_kind == "object" and result:
+            from oa_agent.executor.display_format import record_human_summary
+
+            title = (spec.summary or name or "").strip() or name
+            out["human_summary"] = record_human_summary(spec, title, result)
+        return out
