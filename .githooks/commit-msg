@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# 禁止纯英文提交说明：提交信息须包含至少一个汉字。
+set -euo pipefail
+
+msg_file="$1"
+
+python3 - "$msg_file" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+raw = open(path, encoding="utf-8", errors="replace").read()
+# 去掉 git 注释行
+lines = [ln for ln in raw.splitlines() if not ln.lstrip().startswith("#")]
+body = "\n".join(lines).strip()
+
+if not body:
+    print("错误：提交说明为空。", file=sys.stderr)
+    sys.exit(1)
+
+first = body.splitlines()[0].strip()
+if re.match(r"(?i)^(Merge|Revert)(\s|$)", first):
+    sys.exit(0)
+
+if not re.search(r"[\u4e00-\u9fff]", body):
+    print("错误：提交说明禁止使用纯英文，请至少包含中文说明。", file=sys.stderr)
+    print("当前说明：", file=sys.stderr)
+    print(body, file=sys.stderr)
+    sys.exit(1)
+PY

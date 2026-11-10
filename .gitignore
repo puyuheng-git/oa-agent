@@ -22,5 +22,6 @@ frontend/dist/
 .playwright-mcp/
 .DS_Store
 .idea/
+.cursor/
 .superpowers/
 .ui-shots/
