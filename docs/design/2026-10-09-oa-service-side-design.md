@@ -3,7 +3,7 @@
 **日期：** 2026-10-09
 **状态：** 设计待确认
 **权威设计：** [`2026-10-09-oa-langgraph-design.md`](2026-10-09-oa-langgraph-design.md)
-**说明：** 本文所述代码改动在 OA / puyueheng 仓库执行，文中路径均相对于 `D:\MYOA\webroot\puyueheng` 或 `D:\MYOA\webroot`。
+
 
 Agent 已定为**独立系统**（Python + LangGraph，独立仓库、独立部署、独立 MySQL `agent_ops`、独立管理后台账号体系）。本文只记录 OA 与 Service 需要承担的部分。
 
@@ -56,14 +56,14 @@ Authorization **签发与 checkLogin 的真相源在 Service**，不在某一个
 
 **assertion 线格式**：`base64url(UTF-8 JSON，去掉 = 填充) + "." + hex小写(HMAC-SHA256(secret, base64url部分))`
 
-| 字段 | 要求 |
-|------|------|
-| `oa` | 当前登录用户 OA 账号（Agent 只信任这里的 oa） |
-| `uid` | 整数，可选 |
-| `display_name` | 显示名；**必须先 `iconv('GBK', 'UTF-8', ...)`**，否则 PHP 5.2 `json_encode` 返回 null |
-| `exp` | Unix 秒，`time() + 50` 左右；Agent 拒绝已过期（允许 30 秒时钟偏差）或超过 60 秒后的值 |
-| `nonce` | ≥ 8 字符随机串，Agent 端一次性（重放返回 401 `ASSERTION_REPLAYED`） |
-| `iss` / `aud` | 固定 `"oa-host"` / `"oa-langgraph"` |
+| 字段             | 要求                                                                        |
+| -------------- | ------------------------------------------------------------------------- |
+| `oa`           | 当前登录用户 OA 账号（Agent 只信任这里的 oa）                                             |
+| `uid`          | 整数，可选                                                                     |
+| `display_name` | 显示名；**必须先** `iconv('GBK', 'UTF-8', ...)`，否则 PHP 5.2 `json_encode` 返回 null |
+| `exp`          | Unix 秒，`time() + 50` 左右；Agent 拒绝已过期（允许 30 秒时钟偏差）或超过 60 秒后的值               |
+| `nonce`        | ≥ 8 字符随机串，Agent 端一次性（重放返回 401 `ASSERTION_REPLAYED`）                       |
+| `iss` / `aud`  | 固定 `"oa-host"` / `"oa-langgraph"`                                         |
 
 **换启动码**：服务端 `POST {AGENT_URL}/v1/chat/launch`，`Content-Type: application/json`，body `{"assertion": "..."}`。
 成功 `200 {"launch_code": "...", "expires_in": 60}`；失败 `{"error": {"code", "message"}}`，常见 401 `ASSERTION_INVALID|ASSERTION_EXPIRED|ASSERTION_REPLAYED`、502 `MINT_FAILED`、503 `OA_NOT_CONFIGURED|OFFICE_API_NOT_CONFIGURED`。宿主页失败时显示「助手暂不可用」，不要把错误体原样输出给用户。
@@ -86,7 +86,7 @@ $assertion = $body . '.' . hash_hmac('sha256', $body, OA_ASSERTION_HMAC_SECRET);
 
 **嵌入白名单**：在对话静态站点响应头配置 `Content-Security-Policy: frame-ancestors`（包含 OA 的 origin，如 `https://oa.example.com`）。Agent 不再托管对话页，管理后台中的「允许嵌入的 OA 域名」不写入响应头。
 
-**mint 响应（office-api `/agent/token/mint`）**：Agent 按 `{code, msg, data: {authorization, uid, oa, expire}}` 解析，`code` 成功值在 Agent 后台「office-api 成功码」配置（默认 `0`、`200`）；`expire` 为剩余秒数或 Unix 时间戳均可；返回的 `oa` 必须与请求一致。**此格式尚未与现网联调确认。**
+**mint 响应（office-api** `/agent/token/mint`**）**：Agent 按 `{code, msg, data: {authorization, uid, oa, expire}}` 解析，`code` 成功值在 Agent 后台「office-api 成功码」配置（默认 `0`、`200`）；`expire` 为剩余秒数或 Unix 时间戳均可；返回的 `oa` 必须与请求一致。**此格式尚未与现网联调确认。**
 
 ### 3.4 企业微信入口：mint 支持 `wework_user_id`（Agent、OA 均已实现，待联调）
 
@@ -113,14 +113,13 @@ Agent 通过企业微信智能机器人长连接收到员工消息，只拿到�
 
 **写 API 契约（Agent O2 / MVP-3，2026-10-26 增）：**
 
-| 项 | 约定 |
-|----|------|
-| 草稿 | `POST .../go_out_travel_expense/submit/draft`（路径以 office-api 为准）；Body 仅含业务字段，**禁止**信任客户端/模型自报 `oa`、员工身份或权限结论 |
-| 提交 | `POST .../go_out_travel_expense/submit`；须带 **`Idempotency-Key`**（Agent 管理写与员工确认提交均服务端生成/校验） |
-| 身份 | 仅使用 office-api 以**该员工** token 解析出的身份；自报 `oa` 一律丢弃 |
-| 幂等 | 重复 `Idempotency-Key` 返回同一业务结果，不重复落单 |
-| 校验 | 草稿版本、字段、状态由 Service 重校验；Agent/LangGraph 不参与权限判定 |
-
+| 项   | 约定                                                                                                           |
+| --- | ------------------------------------------------------------------------------------------------------------ |
+| 草稿  | `POST .../go_out_travel_expense/submit/draft`（路径以 office-api 为准）；Body 仅含业务字段，**禁止**信任客户端/模型自报 `oa`、员工身份或权限结论 |
+| 提交  | `POST .../go_out_travel_expense/submit`；须带 `Idempotency-Key`（Agent 管理写与员工确认提交均服务端生成/校验）                      |
+| 身份  | 仅使用 office-api 以**该员工** token 解析出的身份；自报 `oa` 一律丢弃                                                            |
+| 幂等  | 重复 `Idempotency-Key` 返回同一业务结果，不重复落单                                                                          |
+| 校验  | 草稿版本、字段、状态由 Service 重校验；Agent/LangGraph 不参与权限判定                                                              |
 
 ---
 
