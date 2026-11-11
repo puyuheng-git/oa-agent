@@ -85,6 +85,35 @@ def test_reply_stream_extracts_reply_field_incrementally():
     assert leak == [], "英文思考过程默认不向员工流式输出"
 
 
+def test_parse_json_ignores_think_blocks_with_json_snippets():
+    from oa_agent.runtime.llm import _parse_json, _strip_think_blocks
+
+    raw = (
+        '<think>We need respond JSON only. '
+        '{"action":"answer","answer":"谢谢！"} Chinese. Ensure only JSON.</think>\n\n'
+        '{"action":"answer","answer":"谢谢！"}'
+    )
+    assert _parse_json(raw) == {"action": "answer", "answer": "谢谢！"}
+    assert _strip_think_blocks(raw) == '{"action":"answer","answer":"谢谢！"}'
+    # 思考段未闭合时，不把思考正文当 JSON 失败源；闭包外若无对象则回退到段内合法对象
+    assert _parse_json('<think>{"action":"answer","answer":"先答"}') == {
+        "action": "answer",
+        "answer": "先答",
+    }
+
+
+def test_reply_stream_skips_think_before_reply():
+    pieces: list[str] = []
+    s = ReplyStream(pieces.append)
+    raw = (
+        '<think>draft {"action":"chat","reply":"不该流式出来"}</think>'
+        '{"action":"chat","reply":"最终答复"}'
+    )
+    for ch in raw:
+        s.feed(ch)
+    assert "".join(pieces) == "最终答复"
+
+
 def test_text_as_chat_rejects_meta_leak_and_english_reasoning():
     from oa_agent.runtime.graphs.travel_query import _text_as_chat
 
