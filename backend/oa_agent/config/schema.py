@@ -74,6 +74,54 @@ GROUPS: dict[str, GroupDef] = {
                         "切换时把内存中的会话迁移过去，已登录的管理员和员工不受影响。",
         ),
         GroupDef(
+            "oss",
+            "阿里云 OSS（导出与附件）",
+            "热生效",
+            (
+                FieldDef(
+                    "endpoint",
+                    "Endpoint",
+                    "url",
+                    help="如 https://oss-cn-hangzhou.aliyuncs.com。"
+                         "与下方 Bucket、AccessKey ID、Secret 四项齐（Secret 已保存）后，"
+                         "新导出文件与员工上传附件走 OSS；缺任一项则落服务器本地。",
+                ),
+                FieldDef(
+                    "bucket",
+                    "Bucket",
+                    "str",
+                    help="目标 Bucket 名称。须已存在且当前 AccessKey 有读写权限。",
+                    max=255,
+                ),
+                FieldDef(
+                    "prefix",
+                    "对象键前缀",
+                    "str",
+                    "",
+                    "写入对象键的公共前缀（可空），用于同桶内隔离环境或租户，如 exports 或 prod/oa。",
+                    max=255,
+                ),
+                FieldDef(
+                    "access_key_id",
+                    "AccessKey ID",
+                    "str",
+                    help="阿里云 AccessKey ID（非密钥掩码字段，仍勿写入日志或对外展示）。",
+                    max=128,
+                ),
+                FieldDef(
+                    "access_key_secret",
+                    "AccessKey Secret",
+                    "secret",
+                    help="阿里云 AccessKey Secret。只写不读：保存后只显示末 4 位；留空表示不修改。"
+                         "清空密钥后未重新填写则视为未配齐 OSS，新文件回落本地。",
+                ),
+            ),
+            testable=True,
+            description="员工导出文件与对话附件的对象存储。"
+                        "Endpoint、Bucket、AccessKey ID 非空且 Secret 已设置时新文件上传阿里云 OSS；"
+                        "否则落本机 data 目录。保存前可测连接；密钥变更审计只记「已变更」。",
+        ),
+        GroupDef(
             "oa",
             "业务上游 / 连接器（兼容原 OA 对接）",
             "热生效",
