@@ -63,33 +63,22 @@ class ModelCallError(Exception):
 
 
 class ReplyStream:
-    """从模型逐段输出中增量取出给员工看的正文：JSON 输出取 "reply" 字段的字符串值；
-    allow_text 时，不以 { 或 ` 开头的输出视为纯文本回答整体输出。工具调用（没有 reply 字段）不会产生任何片段。
-    `<think>` 思考段不参与模式判断与正文抽取，避免思考里的 JSON 片段污染流式输出。"""
+    """增量输出对话页可见内容：`<think>…</think>`（若有）+ JSON 的 reply/answer 字段。
+    无标签的英文推理不会输出；工具调用（无 reply/answer）不产生片段。"""
 
-    KEY = re.compile(r'"reply"\s*:\s*"')
+    FIELD = re.compile(r'"(?:reply|answer)"\s*:\s*"')
+    THINK_CLOSE = re.compile(r"</think\s*>", re.I)
 
     def __init__(self, on_delta: Callable[[str], None], allow_text: bool = False):
         self._on_delta, self._allow_text = on_delta, allow_text
-        self._buf, self._emitted, self._mode = "", 0, ""
+        self._buf, self._emitted = "", 0
+        self.reply_emitted = False  # 是否已输出 reply/answer 正文（不含纯思考段）
 
     def feed(self, piece: str) -> None:
         if not piece:
             return
         self._buf += piece
-        body = _model_visible_text(self._buf)
-        if not self._mode:
-            head = body.lstrip()
-            if not head:
-                return
-            self._mode = "text" if self._allow_text and head[0] not in "{`" else "json"
-        if self._mode == "text":
-            visible = body.lstrip()
-        else:
-            m = self.KEY.search(body)
-            if not m:
-                return
-            visible = _decode_partial(body[m.end():])
+        visible = self._compose(self._buf)
         if len(visible) > self._emitted:
             self._on_delta(visible[self._emitted:])
             self._emitted = len(visible)
@@ -97,6 +86,35 @@ class ReplyStream:
     @property
     def emitted(self) -> bool:
         return self._emitted > 0
+
+    def _compose(self, buf: str) -> str:
+        think_part, rest = _split_think_for_stream(buf)
+        answer = self._extract_answer(rest)
+        if answer:
+            self.reply_emitted = True
+        if think_part is None and not answer:
+            return ""
+        if think_part is None:
+            return answer
+        if not answer:
+            return think_part
+        return f"{think_part}\n{answer}"
+
+    def _extract_answer(self, text: str) -> str:
+        body = _THINK_BLOCK_RE.sub("", text or "")
+        open_at = _THINK_OPEN_RE.search(body)
+        if open_at:
+            body = body[: open_at.start()]
+        body = re.sub(r"<[^>]*$", "", body)
+        head = body.lstrip()
+        if not head:
+            return ""
+        if self._allow_text and head[0] not in "{`":
+            return head
+        m = self.FIELD.search(body)
+        if not m:
+            return ""
+        return _decode_partial(body[m.end():])
 
 
 ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
@@ -152,12 +170,14 @@ def _call(chat_model, messages: list, on_piece: Callable[[str], None] | None):
 
 def invoke_json(chat_model, cfg: ModelConfig, messages: list, rec: RunRecorder, node_name: str,
                 text_fallback: Callable[[str], dict | None] | None = None,
-                on_delta: Callable[[str], None] | None = None) -> dict:
-    """调用模型并解析 JSON 输出；记录 model_call 事件。只保留最终内容，不展示/记录推理链。
+                on_delta: Callable[[str], None] | None = None,
+                on_reply_emitted: Callable[[], None] | None = None) -> dict:
+    """调用模型并解析 JSON 输出；记录 model_call 事件。
     text_fallback：输出不是 JSON 时把纯文本转成结果（返回 None 仍按无效输出处理）。
-    on_delta：只流式输出 JSON 里 reply 字段；不以纯文本模式边想边推（避免英文思考过程刷屏）。
-    纯文本兜底成功时，若尚未流式输出过，再整段推一次 reply。"""
-    # 故意 allow_text=False：模型先输出英文/思考再 JSON 时，不能整段当员工可见正文
+    on_delta：流式输出 `<think>` 思考段（若有）与 JSON 的 reply/answer；无标签英文推理不推送。
+    on_reply_emitted：当 reply/answer 正文已流式输出时回调（纯思考段不触发），供上层避免重复推送终态。
+    纯文本兜底成功时，若尚未流式输出过，再整段推一次可见正文。"""
+    # 故意 allow_text=False：模型先输出无标签英文推理再 JSON 时，不能整段当员工可见正文
     stream = ReplyStream(on_delta, allow_text=False) if on_delta else None
     call = _LoggedCall(cfg, messages, rec, node_name)
     text, usage = call.run(chat_model, stream.feed if stream else None)
@@ -165,10 +185,15 @@ def invoke_json(chat_model, cfg: ModelConfig, messages: list, rec: RunRecorder, 
     parsed = _parse_json(cleaned)
     if parsed is None and text_fallback is not None:
         parsed = text_fallback(cleaned)
+    parsed = _attach_thinking(parsed, text)
     if on_delta and parsed and stream is not None and not stream.emitted:
-        reply = parsed.get("reply")
-        if isinstance(reply, str) and reply.strip():
-            on_delta(reply.strip())
+        visible = _visible_from_parsed(parsed)
+        if visible:
+            on_delta(visible)
+            if _visible_answer_body(visible):
+                stream.reply_emitted = True
+    if stream is not None and stream.reply_emitted and on_reply_emitted is not None:
+        on_reply_emitted()
     return call.finish(text, usage, parsed)
 
 
@@ -250,6 +275,8 @@ def _final_text(content) -> str:
 
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.I | re.S)
 _THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.I)
+_THINK_CLOSE_RE = re.compile(r"</think\s*>", re.I)
+_THINK_WRAP_RE = re.compile(r"^<think\b[^>]*>(.*?)</think\s*>\s*(.*)$", re.I | re.S)
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -261,13 +288,76 @@ def _strip_think_blocks(text: str) -> str:
     return cleaned.strip()
 
 
-def _model_visible_text(text: str) -> str:
-    """流式缓冲区的可见正文：已完成的思考段删除；未闭合思考段暂不参与抽取。"""
-    cleaned = _THINK_BLOCK_RE.sub("", text or "")
-    open_at = _THINK_OPEN_RE.search(cleaned)
-    if open_at:
-        cleaned = cleaned[: open_at.start()]
-    return cleaned
+def _split_think_for_stream(buf: str) -> tuple[str | None, str]:
+    """流式拆分：返回 (带标签的思考可见段或 None, 剩余文本)。思考未闭合时剩余为空，避免段内 JSON 泄漏。"""
+    open_m = _THINK_OPEN_RE.search(buf or "")
+    if not open_m:
+        return None, re.sub(r"<[^>]*$", "", buf or "")
+    after_open = buf[open_m.end():]
+    close_m = _THINK_CLOSE_RE.search(after_open)
+    if not close_m:
+        inner = re.sub(r"<[^>]*$", "", after_open)
+        return f"<think>{inner}", ""
+    inner = after_open[: close_m.start()]
+    rest = after_open[close_m.end():]
+    before = buf[: open_m.start()]
+    return f"<think>{inner}</think>", before + rest
+
+
+def extract_think_inner(text: str) -> str:
+    """提取已闭合 `<think>` 段正文（多段合并）。"""
+    parts = [m.group(1).strip() for m in re.finditer(
+        r"<think\b[^>]*>(.*?)</think\s*>", text or "", re.I | re.S)]
+    return "\n\n".join(p for p in parts if p)
+
+
+def peel_think_wrap(text: str) -> tuple[str, str]:
+    """若文本以完整 think 包裹开头，返回 (思考正文, 其余)；否则 ("", 原文)。"""
+    m = _THINK_WRAP_RE.match((text or "").lstrip())
+    if not m:
+        return "", text or ""
+    return (m.group(1) or "").strip(), (m.group(2) or "")
+
+
+def wrap_think(thinking: str, body: str) -> str:
+    thinking = (thinking or "").strip()
+    body = body or ""
+    if not thinking:
+        return body
+    if not body:
+        return f"<think>{thinking}</think>"
+    return f"<think>{thinking}</think>\n{body}"
+
+
+def _attach_thinking(parsed: dict | None, raw: str) -> dict | None:
+    """把原文思考段挂到 reply/answer，供终态与历史展示；解析 JSON 仍用去思考后的正文。"""
+    if not parsed:
+        return parsed
+    thinking = extract_think_inner(raw)
+    if not thinking:
+        return parsed
+    out = dict(parsed)
+    for key in ("reply", "answer"):
+        val = out.get(key)
+        if isinstance(val, str) and val.strip():
+            if _THINK_OPEN_RE.match(val.lstrip()):
+                return out
+            out[key] = wrap_think(thinking, val)
+            return out
+    return out
+
+
+def _visible_from_parsed(parsed: dict) -> str:
+    for key in ("reply", "answer"):
+        val = parsed.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _visible_answer_body(visible: str) -> bool:
+    _, body = peel_think_wrap(visible)
+    return bool((body or "").strip())
 
 
 def _iter_json_objects(text: str):
