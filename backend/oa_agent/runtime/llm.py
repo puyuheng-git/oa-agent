@@ -64,7 +64,8 @@ class ModelCallError(Exception):
 
 class ReplyStream:
     """从模型逐段输出中增量取出给员工看的正文：JSON 输出取 "reply" 字段的字符串值；
-    allow_text 时，不以 { 或 ` 开头的输出视为纯文本回答整体输出。工具调用（没有 reply 字段）不会产生任何片段。"""
+    allow_text 时，不以 { 或 ` 开头的输出视为纯文本回答整体输出。工具调用（没有 reply 字段）不会产生任何片段。
+    `<think>` 思考段不参与模式判断与正文抽取，避免思考里的 JSON 片段污染流式输出。"""
 
     KEY = re.compile(r'"reply"\s*:\s*"')
 
@@ -76,18 +77,19 @@ class ReplyStream:
         if not piece:
             return
         self._buf += piece
+        body = _model_visible_text(self._buf)
         if not self._mode:
-            head = self._buf.lstrip()
+            head = body.lstrip()
             if not head:
                 return
             self._mode = "text" if self._allow_text and head[0] not in "{`" else "json"
         if self._mode == "text":
-            visible = self._buf.lstrip()
+            visible = body.lstrip()
         else:
-            m = self.KEY.search(self._buf)
+            m = self.KEY.search(body)
             if not m:
                 return
-            visible = _decode_partial(self._buf[m.end():])
+            visible = _decode_partial(body[m.end():])
         if len(visible) > self._emitted:
             self._on_delta(visible[self._emitted:])
             self._emitted = len(visible)
@@ -159,9 +161,10 @@ def invoke_json(chat_model, cfg: ModelConfig, messages: list, rec: RunRecorder, 
     stream = ReplyStream(on_delta, allow_text=False) if on_delta else None
     call = _LoggedCall(cfg, messages, rec, node_name)
     text, usage = call.run(chat_model, stream.feed if stream else None)
-    parsed = _parse_json(text)
+    cleaned = _strip_think_blocks(text)
+    parsed = _parse_json(cleaned)
     if parsed is None and text_fallback is not None:
-        parsed = text_fallback(text)
+        parsed = text_fallback(cleaned)
     if on_delta and parsed and stream is not None and not stream.emitted:
         reply = parsed.get("reply")
         if isinstance(reply, str) and reply.strip():
@@ -245,12 +248,74 @@ def _final_text(content) -> str:
     return ""
 
 
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.I | re.S)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.I)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """去掉模型泄漏的 `<think>…</think>` 思考段（含未闭合的开标签之后内容）。"""
+    cleaned = _THINK_BLOCK_RE.sub("", text or "")
+    open_at = _THINK_OPEN_RE.search(cleaned)
+    if open_at:
+        cleaned = cleaned[: open_at.start()]
+    return cleaned.strip()
+
+
+def _model_visible_text(text: str) -> str:
+    """流式缓冲区的可见正文：已完成的思考段删除；未闭合思考段暂不参与抽取。"""
+    cleaned = _THINK_BLOCK_RE.sub("", text or "")
+    open_at = _THINK_OPEN_RE.search(cleaned)
+    if open_at:
+        cleaned = cleaned[: open_at.start()]
+    return cleaned
+
+
+def _iter_json_objects(text: str):
+    """按花括号平衡扫描文本中的 JSON 对象候选（忽略字符串内括号）。"""
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth, in_str, esc, j = 0, False, False, i
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    yield text[i : j + 1]
+                    break
+            j += 1
+        i = j + 1 if depth == 0 else i + 1
+
+
+def _parse_json_objects(text: str) -> dict | None:
+    last: dict | None = None
+    for candidate in _iter_json_objects(text or ""):
+        try:
+            value = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            last = value
+    return last
+
+
 def _parse_json(text: str) -> dict | None:
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return None
-    try:
-        value = json.loads(m.group(0))
-    except ValueError:
-        return None
-    return value if isinstance(value, dict) else None
+    """解析模型 JSON：优先取 `</think>` 之外的对象；没有则回退到全文最后一个合法对象。"""
+    without_think = _THINK_BLOCK_RE.sub("", text or "")
+    parsed = _parse_json_objects(without_think)
+    if parsed is not None:
+        return parsed
+    return _parse_json_objects(text)
