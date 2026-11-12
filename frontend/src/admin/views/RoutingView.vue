@@ -330,9 +330,6 @@ onMounted(() => {
             <el-table-column label="connector_id" width="100">
               <template #default="{ row }">{{ routingEventMetadataDisplay(row.metadata).connectorId }}</template>
             </el-table-column>
-            <el-table-column label="pack_id" width="100">
-              <template #default="{ row }">{{ routingEventMetadataDisplay(row.metadata).packId }}</template>
-            </el-table-column>
             <el-table-column label="状态" width="72">
               <template #default="{ row }">{{ row.status || '—' }}</template>
             </el-table-column>
@@ -353,9 +350,6 @@ onMounted(() => {
             <el-table-column prop="event_type" label="类型" />
             <el-table-column label="connector_id" width="120">
               <template #default="{ row }">{{ routingEventMetadataDisplay(row.metadata).connectorId }}</template>
-            </el-table-column>
-            <el-table-column label="pack_id" width="100">
-              <template #default="{ row }">{{ routingEventMetadataDisplay(row.metadata).packId }}</template>
             </el-table-column>
           </el-table>
           <el-empty v-else description="未使用 / 未配置" />

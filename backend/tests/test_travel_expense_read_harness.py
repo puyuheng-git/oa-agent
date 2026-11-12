@@ -1,4 +1,4 @@
-"""行程报销只读 harness：OpenAPI ↔ Skill ↔ Pack ↔ 请求拼装（不扩 bindable/confirm/写接口）。"""
+"""行程报销只读 harness：OpenAPI ↔ Skill ↔ 请求拼装（不扩 bindable/confirm/写接口）。"""
 
 from __future__ import annotations
 
@@ -12,16 +12,17 @@ import yaml
 from oa_agent.executor.catalog import parse_openapi
 from oa_agent.executor.executor import Identity, ToolError, build_request, validate_args
 from oa_agent.executor.registry import ToolRegistry
+from oa_agent.executor.tool_routing import FALLBACK_RULE_TOOLS
 from oa_agent.integrations.office_api import employee_facing_error
-from oa_agent.packs.registry import PackRegistry
 from oa_agent.runtime import intent_rules
 from oa_agent.runtime.graphs import travel_query as tq
+from oa_agent.runtime.intent_rules import DETAIL as INTENT_DETAIL
+from oa_agent.runtime.intent_rules import LIST as INTENT_LIST
 from oa_agent.settings import REPO_ROOT
 from tests.test_chat import DETAIL_URL, LIST_URL, chat, office, open_chat, send  # noqa: F401
 
 OPENAPI = REPO_ROOT / "openapi" / "travel_expense.yaml"
 SKILL = REPO_ROOT / "skills" / "travel_expense_query.yaml"
-PACKS = REPO_ROOT / "packs"
 
 LIST = "query_my_travel_expense_list"
 DETAIL = "query_my_travel_expense_detail"
@@ -44,12 +45,9 @@ def test_skill_wires_same_two_tools():
     assert set(doc["tools"]) == READ_TOOLS
 
 
-def test_oa_travel_pack_aggregates_list_and_detail_rules():
-    registry = PackRegistry.from_disk(PACKS, disabled_ids=[])
-    assert registry.is_enabled("oa_travel")
-    assert set(registry.owned_tool_names("oa_travel")) == READ_TOOLS
-    rules = registry.aggregated_rule_tools()
-    assert rules["list"] == LIST and rules["detail"] == DETAIL
+def test_fallback_rule_tools_map_list_and_detail():
+    assert FALLBACK_RULE_TOOLS[INTENT_LIST] == LIST
+    assert FALLBACK_RULE_TOOLS[INTENT_DETAIL] == DETAIL
 
 
 def test_registry_and_build_request_match_office_api_shape():

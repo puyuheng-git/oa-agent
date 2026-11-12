@@ -16,8 +16,8 @@
 
 - IdP 标识：`demo`；校验 payload 需 `principal_id` + `secret`（与共享口令一致）。
 - 成功后会话 `channel=demo`，`credentials["demo"]` 含 `authorization`（默认 `Bearer demo-token`），**无** `office` 票。
-- 与 **`demo_http`** Pack（`connectors: [demo]`）配合，用于证明「零 OA」路径；Pack 说明见 [`packs/demo_http/README.md`](../../packs/demo_http/README.md)。
+- 可与 `raw_json` Tool + 独立 HTTP 上游配合，验证「零 OA」执行链。
 
 ## 完整接入
 
-Demo 只解决「谁在用助手」；业务接口仍需配置上游、Tool/Skill 或 Pack。步骤见 **[新系统接入手册](integrate-external-system.md)**。
+Demo 只解决「谁在用助手」；业务接口仍需配置上游、Tool/Skill。步骤见 **[新系统接入手册](integrate-external-system.md)**。

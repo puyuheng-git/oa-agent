@@ -55,8 +55,7 @@ from oa_agent.runtime.run_service import (
     CANCEL_REQUESTED, CANCELLED, FAILED, RUNNING, SUCCEEDED, TERMINAL, WAITING_CONFIRMATION, WAITING_HUMAN,
     WAITING_INPUT, StaleState,
 )
-from oa_agent.packs.registry import PackRegistry
-from oa_agent.packs.state import load_disabled_ids
+from oa_agent.executor.tool_routing import FALLBACK_RULE_TOOLS
 from oa_agent.runtime_state import AppRuntime
 
 log = logging.getLogger(__name__)
@@ -139,19 +138,6 @@ def write_workflows_enabled(rt: AppRuntime) -> bool:
     return bool(setting(rt, "runtime", "write_workflows_enabled"))
 
 
-def get_pack_registry(rt: AppRuntime) -> PackRegistry:
-    """取得进程级 PackRegistry；未挂载时惰性创建，并按 settings.packs 刷新 disabled_ids。"""
-    reg = getattr(rt, "pack_registry", None)
-    if reg is None:
-        reg = PackRegistry.from_disk()
-        rt.pack_registry = reg
-    try:
-        reg.reload(settings=load_settings(rt, "packs"))
-    except Exception:  # noqa: BLE001 — 配置暂不可用时保留内存中的启停状态
-        log.exception("刷新 packs 启停失败，沿用内存状态")
-    return reg
-
-
 def _parse_model_id(raw) -> int | None:
     if raw is None or raw == "":
         return None
@@ -217,8 +203,7 @@ def _skills_with_tools(rt: AppRuntime) -> list[SkillState]:
     engine = rt.engine
     if engine is None or not hasattr(engine, "available_skills"):
         return []
-    skills = [s for s in engine.available_skills() if any(engine.registry.get(t) for t in s.tools)]
-    return get_pack_registry(rt).filter_skills(skills)
+    return [s for s in engine.available_skills() if any(engine.registry.get(t) for t in s.tools)]
 
 
 def visible_skills_for(rt: AppRuntime, oa: str, *, office_token: str = "") -> list[SkillState]:
@@ -263,11 +248,8 @@ def skill_menu(rt: AppRuntime, *, oa: str | None = None, office_token: str = "")
 
 
 def workflow_menu(rt: AppRuntime) -> list[dict]:
-    """员工可见的固定 Workflow 目录（写类受 write_workflows_enabled / Pack 启停门禁）。"""
-    return workflow_catalog.list_entries(
-        write_enabled=write_workflows_enabled(rt),
-        pack_registry=get_pack_registry(rt),
-    )
+    """员工可见的固定 Workflow 目录（写类受 write_workflows_enabled 门禁）。"""
+    return workflow_catalog.list_entries(write_enabled=write_workflows_enabled(rt))
 
 
 def start_workflow(rt: AppRuntime, session: ChatSession, workflow_id: str, params: dict,
@@ -616,7 +598,7 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
         domain=domain_name,
         runtime_routing=runtime_routing,
         recent_tool_names=_recent_tool_names(rt, session.thread_id),
-        rule_tool_map=get_pack_registry(rt).aggregated_rule_tools(),
+        rule_tool_map=dict(FALLBACK_RULE_TOOLS),
     )
 
 

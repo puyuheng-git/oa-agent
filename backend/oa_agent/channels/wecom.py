@@ -134,7 +134,11 @@ def message_text(body: dict) -> str:
 
 
 def reply_markdown(reply: dict, pending_suffix: str = PENDING_SUFFIX, truncated_suffix: str = TRUNCATED_SUFFIX) -> str:
-    content = str(reply.get("content") or "")
+    from oa_agent.runtime.llm import peel_think_wrap
+
+    # 企微卡片只展示最终回答，不带对话页的思考折叠标签
+    _, content = peel_think_wrap(str(reply.get("content") or ""))
+    content = content or str(reply.get("content") or "")
     if reply.get("type") == "pending":
         content += pending_suffix
     raw = content.encode("utf-8")

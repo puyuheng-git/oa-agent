@@ -77,16 +77,14 @@ export function metadataDisplayField(
 
 export interface RoutingEventMetadataDisplay {
   connectorId: string
-  packId: string
 }
 
-/** 调用过程页：connector_id / pack_id（仅读 metadata，不编造）。 */
+/** 调用过程页：connector_id（仅读 metadata，不编造）。 */
 export function routingEventMetadataDisplay(
   metadata: Record<string, unknown> | null | undefined,
 ): RoutingEventMetadataDisplay {
   return {
     connectorId: metadataDisplayField(metadata, 'connector_id'),
-    packId: metadataDisplayField(metadata, 'pack_id'),
   }
 }
 

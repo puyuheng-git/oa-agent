@@ -11,12 +11,6 @@ describe('routingEventMetadataDisplay', () => {
     expect(routingEventMetadataDisplay(null).connectorId).toBe(NO_DATA)
     expect(routingEventMetadataDisplay({}).connectorId).toBe(NO_DATA)
     expect(routingEventMetadataDisplay({ path: '/x' }).connectorId).toBe(NO_DATA)
-    expect(routingEventMetadataDisplay(null).packId).toBe(NO_DATA)
-    expect(routingEventMetadataDisplay({ connector_id: 'demo' }).packId).toBe(NO_DATA)
-  })
-
-  it('pack_id 仅在 metadata 存在时展示', () => {
-    expect(routingEventMetadataDisplay({ pack_id: 'oa_travel' }).packId).toBe('oa_travel')
   })
 
   it('metadataDisplayField 不编造非标量', () => {

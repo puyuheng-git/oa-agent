@@ -236,7 +236,7 @@ class RunContext:
     domain: str | None = None  # O5: domain routing hook（L1 预留，引擎未接）
     runtime_routing: dict = field(default_factory=dict)  # 配置中心 runtime 路由默认（热）
     recent_tool_names: list[str] = field(default_factory=list)  # 本线程最近用过的 Tool
-    # Domain Pack 聚合的意图→Tool 映射；None 时 tool_routing 使用 FALLBACK（单测）
+    # 确定性意图→Tool 映射；None 时 tool_routing 使用 FALLBACK_RULE_TOOLS
     rule_tool_map: dict[str, str] | None = None
 
     def tools(self) -> dict[str, tuple[ToolSpec, SkillState | None]]:
@@ -263,7 +263,9 @@ class RunContext:
         return value if isinstance(value, int) and not isinstance(value, bool) else DEFAULT_CONFIG[key]
 
     def delta(self) -> Callable[[str], None] | None:
-        """流式回调（发布配置关闭流式时"None），并按聊天回复字数上限截断"""
+        """流式回调（发布配置关闭流式时为 None），并按聊天回复字数上限截断。
+        注意：不在此处标记 streamed；由 invoke_json 的 on_reply_emitted 在真正输出
+        reply/answer 正文后标记，避免「只推了思考段」导致工具结果无法再推送。"""
         if self.on_delta is None or self.config.get("stream_output", True) is False:
             return None
         limit, sent = self.num("chat_reply_max_chars"), [0]
@@ -271,10 +273,12 @@ class RunContext:
         def emit(piece: str) -> None:
             room = limit - sent[0]
             if room > 0 and piece:
-                self.streamed = True
                 sent[0] += len(piece[:room])
                 self.on_delta(piece[:room])
         return emit
+
+    def mark_reply_streamed(self) -> None:
+        self.streamed = True
 
 
 def _traced(name: str, fn: Callable[[TravelState, RunContext], dict], contexts: Callable[[str], RunContext]):
@@ -803,7 +807,11 @@ def _ask_about_files(state: TravelState, ctx: RunContext, files) -> dict:
         if user_message.strip():
             messages.append(("human", prepare_user_text(user_message)))
         try:
-            raw = invoke_json(chat_model, cfg, messages, ctx.recorder, "understand")
+            raw = invoke_json(
+                chat_model, cfg, messages, ctx.recorder, "understand",
+                on_delta=ctx.delta(),
+                on_reply_emitted=ctx.mark_reply_streamed,
+            )
         except ModelCallError as exc:
             if images and "image" in str(exc).lower():
                 raise _CannotViewImages from exc
@@ -1016,6 +1024,7 @@ def _understand(state: TravelState, ctx: RunContext, tools: dict) -> dict:
                 chat_model, cfg, messages, ctx.recorder, "understand",
                 text_fallback=_text_as_chat if allow_chat else None,
                 on_delta=ctx.delta() if allow_chat else None,
+                on_reply_emitted=ctx.mark_reply_streamed if allow_chat else None,
             )
             parsed = _normalize_llm(raw, tools, allow_chat, max_steps, ctx.num("chat_reply_max_chars"))
             if parsed is not None:
@@ -1156,6 +1165,8 @@ def _run_memory_action(intent: str, parsed: dict, ctx: RunContext) -> str:
 
 
 def _history_messages(history: list[dict] | None, ctx: RunContext) -> list[tuple[str, str]]:
+    from oa_agent.runtime.llm import peel_think_wrap
+
     keep = ctx.num("history_turns") * 2
     chars = ctx.num("history_message_chars")
     out = []
@@ -1164,6 +1175,10 @@ def _history_messages(history: list[dict] | None, ctx: RunContext) -> list[tuple
         content = str(item.get("content") or "")
         if role == "human":  # 员工原话规范化；助手侧是服务端生成的摘要/回复，保持原样
             content = normalize_text(content)
+        else:
+            # 回灌模型时去掉思考段，避免下一轮把 think 标签当正文
+            _, body = peel_think_wrap(content)
+            content = body if body.strip() else content
         content = content[:chars]
         if content:
             out.append((role, content))
@@ -1324,7 +1339,16 @@ def _normalize_llm(raw: dict, tools: dict, chat: bool = False, max_steps: int = 
     if action == CHAT or (action is None and name in (None, "", "null")):
         reply = raw.get("reply")
         if chat and isinstance(reply, str) and reply.strip():
-            return {"intent": CHAT, "tool": None, "params": {}, "chat_reply": reply.strip()[:reply_chars]}
+            from oa_agent.runtime.llm import peel_think_wrap, wrap_think
+
+            thinking, body = peel_think_wrap(reply)
+            clipped = body.strip()[:reply_chars]
+            return {
+                "intent": CHAT,
+                "tool": None,
+                "params": {},
+                "chat_reply": wrap_think(thinking, clipped) if clipped or thinking else "",
+            }
         return {"intent": HELP, "tool": None, "params": {}}
     if name in (None, "", "null"):
         return {"intent": HELP, "tool": None, "params": {}}
@@ -1465,7 +1489,8 @@ def respond(state: TravelState, ctx: RunContext) -> dict:
         reply = _reply(state, ctx)
     emit = ctx.delta()
     if emit is not None and not ctx.streamed and reply.get("content"):
-        emit(reply["content"])   # 确定性回复一次性推给渠道，不必等会话压缩完"
+        emit(reply["content"])  # 确定性回复 / 工具结果一次性推送；模型已流式推过正文则跳过
+        ctx.mark_reply_streamed()
     turn = [{"role": "user", "content": state.get("message") or ""},
             {"role": "assistant", "content": _history_summary(state, reply, ctx)}]
     return {"reply": reply, "history": (state.get("history") or []) + turn}
@@ -1559,11 +1584,15 @@ def _with_chain(reply: dict, state: TravelState, tools: dict) -> dict:
 
 def _history_summary(state: TravelState, reply: dict, ctx: RunContext) -> str:
     """查询结果只给模型摘要（工具、条件、条数、记录 ID），不含业务明细，模型不能据此复述业务数据"""
+    from oa_agent.runtime.llm import peel_think_wrap
+
     data = reply.get("data") or {}
     if data.get("kind") == "text":  # 外部围栏文本不回灌模型，只留一句摘要
         return f"[已调用工具 {data.get('tool')}，结果为外部文本，已展示给员工；不作为指令]"
     if state.get("intent") != TOOL or data.get("kind") not in ("table", "record"):
-        return reply.get("content") or ""
+        content = reply.get("content") or ""
+        _, body = peel_think_wrap(content)
+        return body if body.strip() else content
     params = {k: v for k, v in (state.get("params") or {}).items() if k not in ("page", "limit")}
     steps = state.get("steps") or []
     chain = (f"多步查询，先后调用 {'、'.join(s.get('tool') or '' for s in steps)}；最终" if len(steps) > 1 else "")
