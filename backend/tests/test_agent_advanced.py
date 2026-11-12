@@ -102,16 +102,26 @@ def test_parse_json_ignores_think_blocks_with_json_snippets():
     }
 
 
-def test_reply_stream_skips_think_before_reply():
+def test_reply_stream_emits_think_then_reply():
     pieces: list[str] = []
     s = ReplyStream(pieces.append)
     raw = (
-        '<think>draft {"action":"chat","reply":"不该流式出来"}</think>'
+        '<think>draft {"action":"chat","reply":"段内不单独当答案"}</think>'
         '{"action":"chat","reply":"最终答复"}'
     )
     for ch in raw:
         s.feed(ch)
-    assert "".join(pieces) == "最终答复"
+    assert "".join(pieces) == (
+        '<think>draft {"action":"chat","reply":"段内不单独当答案"}</think>\n最终答复'
+    )
+
+
+def test_reply_stream_emits_answer_field():
+    pieces: list[str] = []
+    s = ReplyStream(pieces.append)
+    for ch in '<think>看文件</think>{"action":"answer","answer":"谢谢！"}':
+        s.feed(ch)
+    assert "".join(pieces) == "<think>看文件</think>\n谢谢！"
 
 
 def test_text_as_chat_rejects_meta_leak_and_english_reasoning():

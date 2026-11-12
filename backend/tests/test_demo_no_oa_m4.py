@@ -1,6 +1,6 @@
-"""M4 Task 5：Demo IdP + demo_http pack，无 office_api_base_url 可建会话并调 raw_json Tool。
+"""M4 Task 5：Demo IdP，无 office_api_base_url 可建会话并调 raw_json Tool。
 
-接入手册与 demo 运行说明：docs/ops/integrate-external-system.md、packs/demo_http/README.md。
+接入手册与 demo 运行说明：docs/ops/integrate-external-system.md、docs/ops/demo-idp.md。
 """
 
 from __future__ import annotations
@@ -16,8 +16,6 @@ from oa_agent.executor.executor import Identity, ToolExecutor
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.identity import IdPContext, IdentityBroker, register_default_idps
 from oa_agent.identity.adapters import DemoIdP
-from oa_agent.packs.loader import discover_packs
-from oa_agent.settings import REPO_ROOT
 
 MOCK_BASE = "https://mock-demo.example"
 DEMO_SECRET = "local-demo-secret"
@@ -36,18 +34,6 @@ def test_idp_schema_defaults():
     assert "idp" in GROUPS
     assert default("idp", "demo_idp_enabled") is False
     assert default("idp", "demo_shared_secret") == ""
-
-
-def test_discover_packs_finds_demo_http():
-    manifests = discover_packs(REPO_ROOT / "packs")
-    ids = {m.id for m in manifests}
-    assert "demo_http" in ids
-    demo = next(m for m in manifests if m.id == "demo_http")
-    assert demo.connectors == ("demo",)
-    assert demo.default_enabled is True
-    assert demo.skills == ()
-    assert demo.tools_openapi == ()
-    assert demo.rules == "rules/intent.yaml"
 
 
 def test_demo_idp_disabled_without_flag():

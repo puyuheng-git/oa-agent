@@ -61,12 +61,12 @@ ROUTING_DEFAULTS: dict[str, Any] = {
     "routing_trace_enabled": True,
 }
 
-# 无 PackRegistry 时的回退映射（单测 / 未注入 registry 场景）
+# 确定性意图 → Tool（行程报销 list/detail）
 FALLBACK_RULE_TOOLS = {
     LIST: "query_my_travel_expense_list",
     DETAIL: "query_my_travel_expense_detail",
 }
-RULE_TOOLS = FALLBACK_RULE_TOOLS  # 兼容旧引用
+RULE_TOOLS = FALLBACK_RULE_TOOLS
 LIST_TOOL = FALLBACK_RULE_TOOLS[LIST]
 DETAIL_TOOL = FALLBACK_RULE_TOOLS[DETAIL]
 _DETAIL_CHAIN = re.compile(r"最近一笔|最新一笔|最后一笔|第一条的详情|最近.*详情")
