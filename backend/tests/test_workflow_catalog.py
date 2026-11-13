@@ -9,7 +9,7 @@ from oa_agent.auth import chat_launch
 from oa_agent.chat.service import start_workflow
 from oa_agent.errors import AppError
 from oa_agent.runtime import workflow_catalog as wc
-from tests.test_chat import DETAIL_URL, OFFICE, ROW, chat, office, open_chat, runtime  # noqa: F401
+from tests.test_chat import INVOKE_URL, OFFICE, ROW, chat, office, open_chat, runtime  # noqa: F401
 from tests.test_write_workflow import DRAFT_URL, SUBMIT_URL, _enable_write, _session
 
 
@@ -38,7 +38,7 @@ def test_session_includes_workflows(admin, chat, office):
 
 def test_start_write_via_catalog_api(admin, chat, office):
     _enable_write(admin)
-    office.get(DETAIL_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": ROW}))
+    office.post(INVOKE_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": ROW}))
     office.post(DRAFT_URL).mock(return_value=httpx.Response(
         200, json={"code": 0, "data": {"draft_id": 9001, "source_expense_id": 101, "total_amount": "120.00",
                                         "status": 0, "status_text": "待确认"}},

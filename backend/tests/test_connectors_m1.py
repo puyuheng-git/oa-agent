@@ -156,12 +156,14 @@ def test_http_json_connector_raw_json_returns_body_without_code_unwrap() -> None
 
 def test_connector_hub_from_legacy_office_base_url() -> None:
     hub = ConnectorHub.from_office_settings({"office_api_base_url": OFFICE_BASE})
-    assert "office" in hub
-    assert hub.names() == frozenset({"office"})
-    conn = hub.get("office")
+    assert "open_oa" in hub
+    assert hub.names() == frozenset({"open_oa"})
+    conn = hub.get("open_oa")
     assert conn is not None
     assert isinstance(conn, HttpJsonConnector)
-    assert conn.id == "office"
+    assert conn.id == "open_oa"
+    # 旧 upstream=office 仍可解析到同一连接
+    assert hub.get("office") is conn
     assert hub.get("missing") is None
 
 

@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from oa_agent.db.models import ExportFile
 from oa_agent.runtime.llm import ModelConfig
 from tests.test_chat import (  # noqa: F401
-    LIST_URL,
+    INVOKE_URL,
     ROW,
     chat,
     office,
@@ -123,7 +123,7 @@ def test_bound_csv_answer_includes_amount_and_read_range(chat, monkeypatch):
 
 
 def test_next_turn_tool_action_reaches_call_tool(chat, office, monkeypatch):
-    route = office.get(LIST_URL).mock(return_value=httpx.Response(
+    route = office.post(INVOKE_URL).mock(return_value=httpx.Response(
         200, json={"code": 0, "data": {"list": [ROW], "total": 1}},
     ))
     calls = _install_model(monkeypatch)

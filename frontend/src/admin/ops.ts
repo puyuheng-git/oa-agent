@@ -48,7 +48,7 @@ export const TASK_KIND: Record<string, string> = {
 
 // ---------------- Tool / Skill ----------------
 
-export type ToolKind = 'office' | 'builtin' | 'mcp'
+export type ToolKind = 'office' | 'open_oa_invoke' | 'builtin' | 'mcp'
 
 export interface ToolItem {
   name: string
@@ -105,7 +105,14 @@ export interface ToolGuide {
   model_params?: Record<string, { type?: string; label?: string; description?: string; required?: boolean; enum?: string[] }>
   identity_params?: Record<string, unknown>
   result?: Record<string, unknown>
-  http?: { method?: string | null; path?: string | null; upstream?: string; timeout_seconds?: number }
+  http?: {
+    method?: string | null
+    path?: string | null
+    upstream?: string
+    timeout_seconds?: number
+    invoke_service?: string | null
+    invoke_method?: string | null
+  }
   mcp_server?: {
     id?: number
     name?: string | null

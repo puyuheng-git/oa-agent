@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from oa_agent.connectors.base import Connector
 from oa_agent.connectors.http_json import HttpJsonConnector
-from oa_agent.integrations.office_api import upstream_clients
+from oa_agent.integrations.open_oa import DEFAULT_UPSTREAM, LEGACY_UPSTREAM, upstream_clients
 
 
 class ConnectorHub:
@@ -12,7 +12,15 @@ class ConnectorHub:
         self._connectors = dict(connectors)
 
     def get(self, connector_id: str) -> Connector | None:
-        return self._connectors.get(connector_id)
+        found = self._connectors.get(connector_id)
+        if found is not None:
+            return found
+        # 旧 Tool upstream=office ↔ 新默认 open_oa 互认（不扩张 names()）
+        if connector_id == LEGACY_UPSTREAM:
+            return self._connectors.get(DEFAULT_UPSTREAM)
+        if connector_id == DEFAULT_UPSTREAM:
+            return self._connectors.get(LEGACY_UPSTREAM)
+        return None
 
     def names(self) -> frozenset[str]:
         return frozenset(self._connectors)

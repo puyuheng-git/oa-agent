@@ -10,16 +10,16 @@ import pytest
 import yaml
 
 from oa_agent.executor.catalog import parse_openapi
-from oa_agent.executor.executor import Identity, ToolError, build_request, validate_args
+from oa_agent.executor.executor import ToolError, validate_args
 from oa_agent.executor.registry import ToolRegistry
 from oa_agent.executor.tool_routing import FALLBACK_RULE_TOOLS
-from oa_agent.integrations.office_api import employee_facing_error
+from oa_agent.integrations.open_oa import employee_facing_error
 from oa_agent.runtime import intent_rules
 from oa_agent.runtime.graphs import travel_query as tq
 from oa_agent.runtime.intent_rules import DETAIL as INTENT_DETAIL
 from oa_agent.runtime.intent_rules import LIST as INTENT_LIST
 from oa_agent.settings import REPO_ROOT
-from tests.test_chat import DETAIL_URL, LIST_URL, chat, office, open_chat, send  # noqa: F401
+from tests.test_chat import INVOKE_URL, chat, office, open_chat, send  # noqa: F401
 
 OPENAPI = REPO_ROOT / "openapi" / "travel_expense.yaml"
 SKILL = REPO_ROOT / "skills" / "travel_expense_query.yaml"
@@ -33,8 +33,11 @@ def test_openapi_exposes_only_two_read_tools():
     _, ops = parse_openapi(OPENAPI)
     enabled = {name for name, spec in ops.items() if spec["spec_enabled"]}
     assert enabled == READ_TOOLS
-    assert ops[LIST]["path"] == "/out_attendance/go_out_travel_expense/index"
-    assert ops[DETAIL]["path"] == "/out_attendance/go_out_travel_expense/detail"
+    assert ops[LIST]["path"] == "/agent/invoke"
+    assert ops[DETAIL]["path"] == "/agent/invoke"
+    assert ops[LIST]["invoke_service"] == "out_attendance/go_out_application"
+    assert ops[LIST]["invoke_method"] == "getTravelExpensePageList"
+    assert ops[DETAIL]["invoke_method"] == "getTravelExpenseOneByParams"
     assert "oa" not in ops[LIST]["model_params"]
     assert "oa" not in ops[DETAIL]["model_params"]
 
@@ -50,21 +53,20 @@ def test_fallback_rule_tools_map_list_and_detail():
     assert FALLBACK_RULE_TOOLS[INTENT_DETAIL] == DETAIL
 
 
-def test_registry_and_build_request_match_office_api_shape():
+def test_registry_loads_open_oa_invoke_tools():
     reg = ToolRegistry.load()
     assert set(reg.names()) == READ_TOOLS
     list_spec = reg.get(LIST)
     detail_spec = reg.get(DETAIL)
+    assert list_spec.kind == "open_oa_invoke"
+    assert detail_spec.kind == "open_oa_invoke"
+    assert list_spec.path == "/agent/invoke"
+    assert list_spec.invoke_service == "out_attendance/go_out_application"
     clean, dropped = validate_args(list_spec, {"oa": "evil", "page": 2, "limit": 5, "date_gte": "2026-09-01"})
     assert "oa" in dropped
-    params = build_request(list_spec, clean, Identity(oa="zhangsan", authorization="tok"))
-    assert params["page"] == 2 and params["limit"] == 5
-    qp = json.loads(params["queryParams"])
-    assert qp == {"date_gte": "2026-09-01", "oa": "zhangsan"}
-
+    assert clean["page"] == 2 and clean["limit"] == 5 and clean["date_gte"] == "2026-09-01"
     detail_clean, _ = validate_args(detail_spec, {"id": 42})
-    detail_params = build_request(detail_spec, detail_clean, Identity(oa="zhangsan", authorization="tok"))
-    assert json.loads(detail_params["queryParams"]) == {"id": 42, "oa": "zhangsan"}
+    assert detail_clean == {"id": 42}
 
 
 def test_skill_instructions_require_id_before_detail():
@@ -78,7 +80,7 @@ def test_intent_detail_without_id_does_not_fall_back_to_list():
 
 
 def test_detail_without_id_asks_instead_of_calling_tool(chat, office):
-    route = office.get(DETAIL_URL)
+    route = office.post(INVOKE_URL)
     h = open_chat(chat)
     body = send(chat, h, "查看报销单的详情").json()
     assert body["run_status"] == "waiting_input"
@@ -112,15 +114,20 @@ def test_understand_overrides_llm_wrong_last_week_dates(monkeypatch, chat, offic
         "tool": LIST,
         "args": {"date_gte": "2026-10-19", "date_lte": "2026-10-25"},
     }
-    route = office.get(LIST_URL).mock(
+    route = office.post(INVOKE_URL).mock(
         return_value=httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}}),
     )
     use_model(monkeypatch, [wrong])
     h = open_chat(chat)
     body = send(chat, h, "查上周的行程报销").json()
     assert body["run_status"] == "succeeded"
-    qp = json.loads(route.calls.last.request.url.params["queryParams"])
-    assert qp["date_gte"] == "2026-10-26" and qp["date_lte"] == "2026-11-01"
+    from tests.test_chat import china_today, last_week
+
+    payload = json.loads(route.calls.last.request.content.decode())
+    assert payload["service"] == "out_attendance/go_out_application"
+    assert payload["method"] == "getTravelExpensePageList"
+    gte, lte = last_week(china_today())
+    assert payload["args"]["date_gte"] == gte and payload["args"]["date_lte"] == lte
 
 
 def test_validate_args_rejects_detail_without_id():
@@ -147,7 +154,7 @@ def test_employee_facing_error_maps_vague_biz_failure():
 
 
 def test_detail_not_found_shows_distinct_copy(chat, office):
-    office.get(DETAIL_URL).mock(
+    office.post(INVOKE_URL).mock(
         return_value=httpx.Response(200, json={"code": 1, "msg": "请求失败", "data": None}),
     )
     h = open_chat(chat)

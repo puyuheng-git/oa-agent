@@ -18,10 +18,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
 from oa_agent.db.models import McpServer, Skill, SkillVersion, Tool, ToolVersion
 from oa_agent.errors import AppError
-from oa_agent.integrations.office_api import DEFAULT_UPSTREAM
+from oa_agent.integrations.open_oa import DEFAULT_UPSTREAM, OpenOaClient, OpenOaError, mint_base_url
 from oa_agent.executor import apipost
 from oa_agent.executor.builtin_catalog import TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_guide
-from oa_agent.executor.catalog import compare, normalize_skill, normalize_tool_form, registration_blockers
+from oa_agent.executor.catalog import (
+    compare, normalize_open_oa_catalog_item, normalize_skill, normalize_tool_form, registration_blockers,
+)
 from oa_agent.executor.contract_test import contract_check, is_activatable
 from oa_agent.executor.visibility import VisibilityService
 from oa_agent.runtime.llm import ModelCallError, build_chat_model, resolve_model
@@ -72,6 +74,14 @@ class ToolIn(ReasonIn):
 class ApipostIn(BaseModel):
     url: str = Field(min_length=10, max_length=500)
     use_llm: bool = True
+
+
+class OpenOaCatalogImportIn(BaseModel):
+    """从 open-oa export-catalog 勾选导入；items 为空则导入清单全部可读条目。"""
+
+    reason: str = Field(min_length=2, max_length=200)
+    items: list[dict[str, str]] = Field(default_factory=list, max_length=100)
+    # items 项：{"service": "...", "method": "..."}；空列表 = 导入全部
 
 
 class SkillIn(ReasonIn):
@@ -194,6 +204,35 @@ def _mcp_guide(ctx: AdminCtx, tool: Tool, schema: dict | None) -> dict:
     }
 
 
+def _open_oa_invoke_guide(tool: Tool, schema: dict | None) -> dict:
+    schema = schema or {}
+    return {
+        "kind": "open_oa_invoke",
+        "summary": tool.summary or schema.get("summary") or "",
+        "how": (
+            "调用时由 ToolExecutor 以员工 token POST open-oa /agent/invoke，"
+            "固定转发 invoke_service / invoke_method 到 Service ANew；身份由 open-oa 从 token 解析并强制本人。"
+        ),
+        "constraints": [
+            "模型不可改 service/method，不可伪造 oa",
+            "参数与返回字段以 catalog 契约为准，可再从清单覆盖导入",
+            "写操作须确认 + Idempotency-Key（高风险默认不启用）",
+        ],
+        "http": {
+            "method": "POST",
+            "path": schema.get("path") or "/agent/invoke",
+            "upstream": schema.get("upstream") or DEFAULT_UPSTREAM,
+            "invoke_service": schema.get("invoke_service"),
+            "invoke_method": schema.get("invoke_method"),
+            "timeout_seconds": schema.get("timeout_seconds"),
+        },
+        "model_params": dict(schema.get("model_params") or {}),
+        "result": dict(schema.get("result") or {}),
+        "runtime": "OpenOaClient POST /agent/invoke",
+        "edit_hint": "参数定义来自 open-oa catalog；请用「从 open-oa 清单导入」覆盖更新，或用启停开关。",
+    }
+
+
 def _tool_guide(ctx: AdminCtx, tool: Tool, schema: dict | None) -> dict | None:
     kind = tool.kind or "office"
     if kind == "builtin":
@@ -214,6 +253,8 @@ def _tool_guide(ctx: AdminCtx, tool: Tool, schema: dict | None) -> dict | None:
         return guide
     if kind == "mcp":
         return _mcp_guide(ctx, tool, schema)
+    if kind == "open_oa_invoke":
+        return _open_oa_invoke_guide(tool, schema)
     return _office_guide(tool, schema)
 
 
@@ -258,7 +299,8 @@ def _upstreams(ctx: AdminCtx) -> list[dict]:
 
 
 @tools_router.get("")
-def list_tools(kind: Literal["office", "builtin", "mcp"] | None = None, ctx: AdminCtx = Depends(admin_read(TOOL))):
+def list_tools(kind: Literal["office", "open_oa_invoke", "builtin", "mcp"] | None = None,
+               ctx: AdminCtx = Depends(admin_read(TOOL))):
     stmt = sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id)
     if kind:
         stmt = stmt.where(Tool.kind == kind)
@@ -398,6 +440,91 @@ def import_apipost(body: ApipostIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
             "issue_id": issue_id, "target_ids": target_ids, "drafts": [d["form"]["name"] for d in drafts],
             "errors": errors, "llm": used_llm})
     return {"drafts": drafts, "errors": errors}
+
+
+def _open_oa_catalog_client(ctx: AdminCtx) -> tuple[OpenOaClient, str]:
+    """用 mint_base_url + gateway_secret 拉 export-catalog。"""
+    from oa_agent.chat import service as chat_service
+
+    oa = chat_service.load_settings(ctx.runtime, "oa")
+    base = mint_base_url(oa)
+    secret = oa.get("gateway_secret")
+    if not base:
+        raise AppError(503, "OPEN_OA_NOT_CONFIGURED", "未配置 open-oa 签发/业务地址（mint_base_url）")
+    if not secret:
+        raise AppError(503, "OPEN_OA_NOT_CONFIGURED", "未配置 AGENT_GATEWAY_SECRET")
+    try:
+        return OpenOaClient(base, oa.get("success_codes")), str(secret)
+    except OpenOaError as exc:
+        raise AppError(503, "OPEN_OA_NOT_CONFIGURED", exc.message) from exc
+
+
+@tools_router.get("/import/open-oa-catalog")
+def list_open_oa_catalog(ctx: AdminCtx = Depends(admin_read(TOOL))):
+    """预览 open-oa 可导入清单（管理端勾选用；只读，用网关密钥拉取）。
+    路径放在 /import/ 下，避免被 GET /{name} 当成 Tool 名。"""
+    client, secret = _open_oa_catalog_client(ctx)
+    ctx.db.rollback()
+    try:
+        items = client.get_export_catalog(gateway_secret=secret)
+    except OpenOaError as exc:
+        raise AppError(502, "IMPORT_FAILED", f"拉取 open-oa catalog 失败：{exc.message}") from exc
+    return {"items": items if isinstance(items, list) else []}
+
+
+@tools_router.post("/import/open-oa-catalog")
+def import_open_oa_catalog(body: OpenOaCatalogImportIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
+    """从 open-oa GET /agent/export-catalog 勾选导入为 open_oa_invoke Tool（立即存版本，默认启用规范）。"""
+    client, secret = _open_oa_catalog_client(ctx)
+    ctx.db.rollback()
+    try:
+        catalog_items = client.get_export_catalog(gateway_secret=secret)
+    except OpenOaError as exc:
+        raise AppError(502, "IMPORT_FAILED", f"拉取 open-oa catalog 失败：{exc.message}") from exc
+
+    wanted = {(str(i.get("service") or "").strip(), str(i.get("method") or "").strip()) for i in body.items}
+    wanted.discard(("", ""))
+    selected = []
+    for item in catalog_items:
+        if not isinstance(item, dict):
+            continue
+        key = (str(item.get("service") or "").strip(), str(item.get("method") or "").strip())
+        if wanted and key not in wanted:
+            continue
+        selected.append(item)
+    if wanted and not selected:
+        raise AppError(422, "IMPORT_FAILED", "未匹配到任何 catalog 条目，请核对 service/method")
+
+    engine = ctx.runtime.engine
+    imported: list[dict] = []
+    errors: list[str] = []
+    with ctx.db.begin():
+        for item in selected:
+            spec, errs = normalize_open_oa_catalog_item(item)
+            if errs or not spec:
+                errors.append(f"{item.get('service')}.{item.get('method')}：" + "；".join(errs or ["无效条目"]))
+                continue
+            upstream = spec.get("upstream", DEFAULT_UPSTREAM)
+            if upstream not in {u["key"] for u in _upstreams(ctx)} and upstream != DEFAULT_UPSTREAM:
+                # 允许默认 open_oa：若目录尚无该 key，仍写入（运行时靠 mint_base_url / 兼容映射）
+                pass
+            result = engine.catalog.save_tool(ctx.db, spec, ctx.user.username)
+            tool = ctx.db.scalar(
+                sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id, Tool.name == spec["name"])
+            )
+            if tool is not None:
+                tool.kind = "open_oa_invoke"
+                tool.updated_by = ctx.user.username
+            imported.append({
+                "name": spec["name"], "result": result.get("result"), "version_no": result.get("version_no"),
+                "service": spec.get("invoke_service"), "method": spec.get("invoke_method"),
+            })
+        engine.catalog.revalidate_skills(ctx.db)
+        ctx.audit("tool.import_open_oa_catalog", "tool", "*", after={
+            "imported": [i["name"] for i in imported], "errors": errors, "selected": len(selected),
+        }, reason=body.reason)
+    engine.reload_catalog()
+    return {"imported": imported, "errors": errors}
 
 
 @tools_router.post("")
