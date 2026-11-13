@@ -18,7 +18,7 @@ from oa_agent.auth import chat_launch
 from oa_agent.auth.chat_launch import ChatSession
 from oa_agent.chat import threads
 from oa_agent.config.schema import GROUPS
-from oa_agent.db.models import Run
+from oa_agent.db.models import ExportFile, Run
 from oa_agent.db.types import utcnow
 from oa_agent.errors import AppError
 from oa_agent.ids import new_run_id
@@ -427,7 +427,17 @@ def start_run(rt: AppRuntime, session: ChatSession, message: str, correlation_id
         "rule": "keyword" if domain.name != multi_agent.GENERAL_DOMAIN else "default_general",
         "clarify": False,
     })
-    conversation.record_user(rt.session, rec, session.channel, message)
+    attachment_data = _attachment_message_data(rt, attachment_ids or [])
+    if attachment_ids:
+        _stamp_upload_run_ids(rt, file_ids=attachment_ids, run_id=rec.run_id, oa=session.oa,
+                              thread_id=session.thread_id)
+    conversation.record_user(
+        rt.session,
+        rec,
+        session.channel,
+        message,
+        data={"attachments": attachment_data} if attachment_data else None,
+    )
     try:
         with rt.session() as db, db.begin():
             threads.touch_on_user_message(
@@ -452,6 +462,64 @@ def start_run(rt: AppRuntime, session: ChatSession, message: str, correlation_id
     return _drive(rt, rec, session, release.config, tracked,
                   lambda ctx: engine.invoke(ctx, message, session.thread_id, attachment_ids=attachment_ids), check=True, on_delta=on_delta,
                   domain=domain)
+
+
+def _attachment_message_data(rt: AppRuntime, file_ids: list[str]) -> list[dict]:
+    ids = [fid for fid in file_ids if fid]
+    if not ids:
+        return []
+    try:
+        with rt.session() as db:
+            rows = db.scalars(
+                sa.select(ExportFile).where(
+                    ExportFile.tenant_id == rt.tenant_id,
+                    ExportFile.file_id.in_(ids),
+                )
+            ).all()
+    except SQLAlchemyError:
+        log.exception("读取附件元数据失败")
+        return []
+    by_id = {row.file_id: row for row in rows}
+    out: list[dict] = []
+    for fid in ids:
+        row = by_id.get(fid)
+        if row is None:
+            continue
+        out.append({
+            "file_id": row.file_id,
+            "filename": row.filename,
+            "size_bytes": row.size_bytes,
+            "media_kind": row.media_kind,
+        })
+    return out
+
+
+def _stamp_upload_run_ids(
+    rt: AppRuntime,
+    *,
+    file_ids: list[str],
+    run_id: str,
+    oa: str,
+    thread_id: str,
+) -> None:
+    ids = [fid for fid in file_ids if fid]
+    if not ids:
+        return
+    try:
+        with rt.session() as db, db.begin():
+            rows = db.scalars(
+                sa.select(ExportFile).where(
+                    ExportFile.tenant_id == rt.tenant_id,
+                    ExportFile.file_id.in_(ids),
+                    ExportFile.oa == oa,
+                    ExportFile.thread_id == thread_id,
+                    ExportFile.origin == "upload",
+                )
+            ).all()
+            for row in rows:
+                row.run_id = run_id
+    except SQLAlchemyError:
+        log.exception("回写附件 run_id 失败：run=%s", run_id)
 
 
 def _load_long_term_memory(rt: AppRuntime, oa: str) -> str:

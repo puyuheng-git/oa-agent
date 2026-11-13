@@ -284,3 +284,24 @@ def test_travel_state_accepts_attachment_ids():
     graph.add_edge("keep", END)
     out = graph.compile().invoke({"message": "", "attachment_ids": ["upl_demo"]})
     assert out["attachment_ids"] == ["upl_demo"]
+
+
+def test_user_message_persists_attachments_and_documents_list(chat, monkeypatch):
+    _fake_chat_model(monkeypatch)
+    h = open_chat(chat)
+    file_id = _upload_csv(chat, h)
+    assert send(chat, h, "请看附件", attachment_ids=[file_id], client_msg_id="att-hist-0001").status_code == 200
+    tid = chat.get("/v1/chat/session", headers=h).json()["thread_id"]
+    msgs = chat.get(f"/v1/chat/threads/{tid}/messages", headers=h).json()
+    user = next(m for m in msgs["items"] if m["role"] == "user")
+    assert user["attachments"]
+    assert user["attachments"][0]["file_id"] == file_id
+    assert user["attachments"][0]["filename"] == "note.csv"
+    assert _upload_row(chat, file_id).run_id
+
+    docs = chat.get("/v1/chat/documents", headers=h, params={"origin": "upload"}).json()
+    assert docs["total"] >= 1
+    assert any(i["file_id"] == file_id for i in docs["items"])
+    dl = chat.get(f"/v1/chat/documents/{file_id}/download", headers=h)
+    assert dl.status_code == 200
+    assert dl.content == CSV

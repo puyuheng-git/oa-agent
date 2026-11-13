@@ -31,10 +31,17 @@ def _clean(value: Any) -> Any:
     return json.loads(redact_secrets(json.dumps(value, ensure_ascii=False, default=str)))
 
 
-def record_user(session_factory: SessionFactory, rec: RunRecorder, channel: str, message: str) -> None:
+def record_user(
+    session_factory: SessionFactory,
+    rec: RunRecorder,
+    channel: str,
+    message: str,
+    *,
+    data: dict | None = None,
+) -> None:
     _add(session_factory, ConversationMessage(
         message_id=new_message_id(), thread_id=rec.thread_id, run_id=rec.run_id, oa=rec.oa, channel=channel,
-        role="user", content=redact_secrets(message), created_at=utcnow()))
+        role="user", content=redact_secrets(message), data_json=_clean(data), created_at=utcnow()))
 
 
 def record_reply(session_factory: SessionFactory, run_id: str, reply: dict) -> None:
