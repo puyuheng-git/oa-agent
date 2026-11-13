@@ -226,6 +226,87 @@ def test_session_defaults_to_new_thread_row(chat, office):
     assert row.status == th.STATUS_ACTIVE
 
 
+def test_session_reuses_empty_thread_instead_of_creating(chat, office):
+    first = chat.post("/v1/chat/launch", json={"assertion": make_assertion()})
+    assert first.status_code == 200, first.text
+    opened = chat.post("/v1/chat/session", json={"launch_code": first.json()["launch_code"]})
+    assert opened.status_code == 200, opened.text
+    tid = opened.json()["thread_id"]
+
+    again_launch = chat.post("/v1/chat/launch", json={"assertion": make_assertion()})
+    assert again_launch.status_code == 200, again_launch.text
+    again = chat.post("/v1/chat/session", json={"launch_code": again_launch.json()["launch_code"]})
+    assert again.status_code == 200, again.text
+    assert again.json()["thread_id"] == tid
+
+    rt = runtime(chat)
+    with rt.session() as db:
+        active = db.scalars(
+            sa.select(ChatThread).where(
+                ChatThread.oa == "zhangsan",
+                ChatThread.status == th.STATUS_ACTIVE,
+            )
+        ).all()
+    assert len(active) == 1
+    assert active[0].thread_id == tid
+
+
+def test_session_reclaims_empty_when_opening_latest_message(chat, office, rt):
+    with rt.session() as db, db.begin():
+        recent = th.create_thread(db, oa="zhangsan", channel="oa_web")
+        th.touch_on_user_message(
+            db, thread_id=recent.thread_id, oa="zhangsan", channel="oa_web", user_text="有内容",
+        )
+        recent_tid = recent.thread_id
+        empty_ids = [
+            th.create_thread(db, oa="zhangsan", channel="oa_web").thread_id
+            for _ in range(2)
+        ]
+
+    r = chat.post("/v1/chat/launch", json={"assertion": make_assertion()})
+    assert r.status_code == 200, r.text
+    opened = chat.post("/v1/chat/session", json={"launch_code": r.json()["launch_code"]})
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["thread_id"] == recent_tid
+
+    with rt.session() as db:
+        active = db.scalars(
+            sa.select(ChatThread).where(
+                ChatThread.oa == "zhangsan",
+                ChatThread.status == th.STATUS_ACTIVE,
+            )
+        ).all()
+        deleted = db.scalars(
+            sa.select(ChatThread).where(
+                ChatThread.oa == "zhangsan",
+                ChatThread.status == th.STATUS_DELETED,
+            )
+        ).all()
+    assert [t.thread_id for t in active] == [recent_tid]
+    assert {t.thread_id for t in deleted} == set(empty_ids)
+
+
+def test_session_opens_latest_message_thread_not_empty(chat, office, rt):
+    with rt.session() as db, db.begin():
+        old = th.create_thread(db, oa="zhangsan", channel="oa_web")
+        th.touch_on_user_message(
+            db, thread_id=old.thread_id, oa="zhangsan", channel="oa_web", user_text="旧会话",
+        )
+        recent = th.create_thread(db, oa="zhangsan", channel="oa_web")
+        th.touch_on_user_message(
+            db, thread_id=recent.thread_id, oa="zhangsan", channel="oa_web", user_text="新会话",
+        )
+        recent_tid = recent.thread_id
+        # 额外空白不应抢占进入时的默认会话
+        th.create_thread(db, oa="zhangsan", channel="oa_web")
+
+    r = chat.post("/v1/chat/launch", json={"assertion": make_assertion()})
+    assert r.status_code == 200, r.text
+    opened = chat.post("/v1/chat/session", json={"launch_code": r.json()["launch_code"]})
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["thread_id"] == recent_tid
+
+
 def test_session_with_foreign_thread_404(chat, office, rt):
     with rt.session() as db, db.begin():
         foreign = th.create_thread(db, oa="lisi", channel="web")

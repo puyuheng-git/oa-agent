@@ -57,12 +57,24 @@ MEMORY_FORGET = "memory_forget"
 # 模型不可用时的内置规则只覆盖行程报销两个 Tool；其"Tool 需要配置模"
 RULE_TOOLS = {LIST: "query_my_travel_expense_list", DETAIL: "query_my_travel_expense_detail"}
 EXPORT_TOOL = "builtin.export"
-_EXPORT_RE = re.compile(r"导出|导出来|存成文件|保存为文件|下载文件|下载表格|生成文件")
-_EXPORT_PREVIOUS_RE = re.compile(r"这条|这个|这份|刚才|上面|上一条")
+_EXPORT_RE = re.compile(
+    r"导出|导出来|存成文件|保存为文件|另存为|保存成|做成文件|生成文件|生成表格|"
+    r"下载文件|下载表格|下载下来|导出文件|输出(?:成)?文件|整理成文件|汇总成文件|"
+    r"发我(?:一份|个)?(?:文件|表格|excel|xlsx|csv)|"
+    r"给我(?:一份|个)?(?:文件|表格|excel|xlsx|csv)|"
+    r"发(?:excel|xlsx|csv)|下[载到]文件",
+    re.I,
+)
+_EXPORT_PREVIOUS_RE = re.compile(r"这条|这个|这份|刚才|上面|上一条|刚才那")
+_EXPORT_BUNDLE_RE = re.compile(r"这些|全部|以上|汇总|所有|一起|合并")
 EXPORT_HINT = (
-    "\n- 员工要求导出、下载文件或保存为文件时，必须调用工具 builtin.export，"
-    "不要只用文字声称已经导出。content 填写要写入文件的正文，filename 可省略；"
-    "用户没指定文件名时不要填「导出.xlsx」，留给服务端按内容命名。\n"
+    "\n- 员工要求导出、下载、保存为文件、发文件/表格时，必须调用工具 builtin.export，"
+    "不要只用文字声称已经导出，也不要回复「还没有可导出的内容」。"
+    "content 必须填写完整可写入文件的正文（按用户要求整理/汇总；表格用 CSV：首行表头）；"
+    "若正文来自查询结果，先调用对应查询工具，再在同轮 steps 里用 "
+    '{"content":{"$from_step":1}} 交给 builtin.export；'
+    "多份结果需要汇总时，把汇总后的完整正文写入 content；"
+    "filename 可省略，用户没指定时不要填「导出.xlsx」。\n"
 )
 
 REPLY_SUMMARY_CHARS = 12000   # 时间线事件摘要上限（事件"TEXT 列），完整回复在对话记录"
@@ -413,10 +425,28 @@ def _step_as_export_text(data) -> str:
     if not isinstance(data, dict) or not data:
         return ""
     if isinstance(data.get("list"), list):
-        return _rows_to_csv([], data["list"])
+        return _rows_to_csv(data.get("columns") or [], data["list"])
+    if isinstance(data.get("items"), list):
+        return _rows_to_csv(data.get("columns") or [], data["items"])
+    if isinstance(data.get("item"), dict):
+        item = data["item"]
+        fields = data.get("fields") or list(item.keys())
+        lines = []
+        for field_def in fields:
+            key = field_def.get("key") if isinstance(field_def, dict) else field_def
+            label = field_def.get("label") if isinstance(field_def, dict) else key
+            lines.append(f"{label},{_csv_cell(item.get(key))}")
+        return "\n".join(lines) if lines else ""
     if isinstance(data.get("text"), str):
         return unwrap_untrusted(data["text"]).strip()
-    return _rows_to_csv([], [data])
+    # 其余结构化结果压成单行/多列表，避免「无可导出」
+    skip = {"ok", "message", "capability", "error", "ticket", "filename", "file_id", "size_bytes", "expires_in"}
+    useful = {k: v for k, v in data.items() if k not in skip and v not in (None, "", [], {})}
+    if not useful:
+        return ""
+    if all(not isinstance(v, (dict, list)) for v in useful.values()):
+        return _rows_to_csv([], [useful])
+    return json.dumps(useful, ensure_ascii=False, indent=2)
 
 
 def _message_as_export_text(data, content: str | None) -> str | None:
@@ -434,10 +464,17 @@ def _message_as_export_text(data, content: str | None) -> str | None:
                 label = field_def.get("label") if isinstance(field_def, dict) else key
                 lines.append(f"{label},{_csv_cell(item.get(key))}")
             return "\n".join(lines) if lines else None
+        if kind == "text":
+            raw = data.get("text")
+            if isinstance(raw, str) and raw.strip():
+                return unwrap_untrusted(raw).strip()
         if kind == "file":
             return None
     text = (content or "").strip()
     if not text or text.startswith("[已调用工具") or text.startswith("[多步查询"):
+        return None
+    # 纯提示/错误不当作可导出正文
+    if text.startswith("还没有可导出") or text.startswith("没能完成"):
         return None
     return text
 
@@ -471,35 +508,63 @@ def _export_subject(tools: dict, name: str) -> str | None:
     return title or None
 
 
-def _last_export_source(ctx: RunContext) -> tuple[str | None, str | None]:
-    """上一轮结果正文，以及表格/记录标题，供导出命名。不拿其他员工的记录。"""
+def _export_title_from_data(data: dict | None) -> str | None:
+    if not data or data.get("kind") not in ("table", "record", "text"):
+        return None
+    raw_title = data.get("title")
+    if isinstance(raw_title, str) and raw_title.strip():
+        return raw_title.strip()
+    return None
+
+
+def _recent_export_sources(ctx: RunContext, *, limit: int = 20) -> list[tuple[str, str | None]]:
+    """本线程最近可导出的助手结果（新→旧），不拿其他员工的记录。"""
     if ctx.session_factory is None or not ctx.thread_id or ctx.identity is None:
-        return None, None
+        return []
     try:
         import sqlalchemy as sa
 
         from oa_agent.db.models import ConversationMessage
 
         with ctx.session_factory() as db:
-            row = db.scalar(
+            rows = db.scalars(
                 sa.select(ConversationMessage).where(
                     ConversationMessage.tenant_id == ctx.tenant_id,
                     ConversationMessage.thread_id == ctx.thread_id,
                     ConversationMessage.oa == ctx.identity.oa,
                     ConversationMessage.role == "assistant",
-                ).order_by(ConversationMessage.id.desc()).limit(1)
-            )
+                ).order_by(ConversationMessage.id.desc()).limit(limit)
+            ).all()
     except SQLAlchemyError:
+        return []
+    out: list[tuple[str, str | None]] = []
+    for row in rows:
+        data = row.data_json if isinstance(row.data_json, dict) else None
+        text = _message_as_export_text(data, row.content)
+        if not text:
+            continue
+        out.append((text, _export_title_from_data(data)))
+    return out
+
+
+def _last_export_source(ctx: RunContext) -> tuple[str | None, str | None]:
+    """最近一条可导出结果正文与标题，供导出命名。"""
+    items = _recent_export_sources(ctx)
+    if not items:
         return None, None
-    if row is None:
-        return None, None
-    data = row.data_json if isinstance(row.data_json, dict) else None
-    title = None
-    if data and data.get("kind") in ("table", "record", "text"):
-        raw_title = data.get("title")
-        if isinstance(raw_title, str) and raw_title.strip():
-            title = raw_title.strip()
-    return _message_as_export_text(data, row.content), title
+    return items[0][0], items[0][1]
+
+
+def _export_bundle_text(sources: list[tuple[str, str | None]]) -> str | None:
+    if not sources:
+        return None
+    if len(sources) == 1:
+        return sources[0][0]
+    parts: list[str] = []
+    for text, title in reversed(sources):  # 旧→新，便于阅读
+        head = (title or "数据").strip()
+        parts.append(f"## {head}\n{text}")
+    return "\n\n".join(parts)
 
 
 def _last_export_text(ctx: RunContext) -> str | None:
@@ -508,11 +573,19 @@ def _last_export_text(ctx: RunContext) -> str | None:
 
 
 def _inline_export_body(message: str) -> str | None:
-    matched = re.search(r"(?:导出|存成文件|保存为文件)\s*[:：]\s*(.+)", message or "", re.S)
+    matched = re.search(
+        r"(?:导出|存成文件|保存为文件|另存为|保存成|做成文件|生成文件)\s*[:：]\s*(.+)",
+        message or "",
+        re.S,
+    )
     if not matched:
         return None
     body = matched.group(1).strip()
     return body or None
+
+
+def _wants_export(message: str) -> bool:
+    return bool(_EXPORT_RE.search(message or ""))
 
 
 def _named_export_args(content, message: str, *, title: str | None = None) -> dict:
@@ -530,29 +603,168 @@ def _named_export_args(content, message: str, *, title: str | None = None) -> di
     return args
 
 
+_WEAK_EXPORT_CHAT = re.compile(
+    r"^(好的|收到|嗯|行|可以|了解|明白|暂不支持|还没有可导出|没能完成|上一步没有|"
+    r"正在|我来|我帮你|稍等|好哒|ok|okay)\b",
+    re.I,
+)
+
+
+def _is_substantive_export_text(text: str | None) -> bool:
+    """过滤口头应承/错误提示，避免盖过真实表格数据。"""
+    body = (text or "").strip()
+    if not body:
+        return False
+    if body.startswith(("还没有可导出", "没能完成", "上一步没有", "暂不支持")):
+        return False
+    if "," in body or "\n" in body or len(body) >= 40:
+        return True
+    if _WEAK_EXPORT_CHAT.match(body):
+        return False
+    return len(body) >= 12
+
+
+def _pick_export_body(
+    message: str,
+    *,
+    last_text: str | None = None,
+    bundle_text: str | None = None,
+    chat_body: str | None = None,
+    attachment_text: str | None = None,
+) -> str | None:
+    """按优先级汇总可导出正文：冒号正文 > 数据源汇总 > 实质整理稿 > 附件。"""
+    inline = _inline_export_body(message)
+    if inline:
+        return inline
+    want_one = bool(_EXPORT_PREVIOUS_RE.search(message or ""))
+    want_bundle = bool(_EXPORT_BUNDLE_RE.search(message or "")) or not want_one
+    ordered: list[str] = []
+
+    def add(value: str | None) -> None:
+        text = (value or "").strip()
+        if text and text not in ordered:
+            ordered.append(text)
+
+    if want_one:
+        add(last_text)
+        if _is_substantive_export_text(chat_body):
+            add(chat_body)
+        add(attachment_text)
+        add(bundle_text)
+    else:
+        add(bundle_text)
+        add(last_text)
+        if _is_substantive_export_text(chat_body):
+            add(chat_body)
+        add(attachment_text)
+    return ordered[0] if ordered else None
+
+
+def _fill_export_step_args(
+    args: dict,
+    message: str,
+    *,
+    last_text: str | None,
+    last_title: str | None,
+    bundle_text: str | None,
+    chat_body: str | None,
+    attachment_text: str | None = None,
+) -> tuple[dict, bool]:
+    """若 export 步缺少可写 content，用可汇总正文回填。返回 (args, changed)。"""
+    content = args.get("content")
+    if isinstance(content, str) and content.strip():
+        return args, False
+    if isinstance(content, dict) and "$from_step" in content:
+        return args, False
+    body = _pick_export_body(
+        message,
+        last_text=last_text,
+        bundle_text=bundle_text,
+        chat_body=chat_body,
+        attachment_text=attachment_text,
+    )
+    if not body:
+        return args, False
+    return {**args, **_named_export_args(body, message, title=last_title)}, True
+
+
 def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
                    rule_tool_map: dict | None, last_text: str | None,
-                   last_title: str | None = None) -> dict:
-    """员工要导出时调用 builtin.export。能对上查询工具则先查再导出，否则用上一轮结果或冒号后的正文。"""
-    if EXPORT_TOOL not in tools or not _EXPORT_RE.search(message or ""):
+                   last_title: str | None = None,
+                   bundle_text: str | None = None,
+                   attachment_text: str | None = None) -> dict:
+    """员工要导出时调用 builtin.export。自动汇总可用来源，尽量不落到「无可导出」。"""
+    if EXPORT_TOOL not in tools or not _wants_export(message):
         return parsed
     if parsed.get("intent") in (MEMORY_WRITE, MEMORY_FORGET):
         return parsed
-    params = parsed.get("params") or {}
-    if (parsed.get("intent") == TOOL and parsed.get("tool") == EXPORT_TOOL
-            and isinstance(params.get("content"), str) and params.get("content").strip()):
-        named = _user_export_filename(message)
-        filename = str(params.get("filename") or "")
-        generic = not filename.strip() or filename.strip().lower() in {"导出.xlsx", "导出.csv", "导出.txt", "export.xlsx"}
-        if named or generic:
-            return {**parsed, "params": {**params, **_named_export_args(params["content"], message, title=last_title)}}
-        return parsed
+    params = dict(parsed.get("params") or {})
+    steps = list(parsed.get("steps") or [])
+    chat_body = (parsed.get("chat_reply") or "").strip() or None
+    fill_kw = dict(
+        last_text=last_text, last_title=last_title, bundle_text=bundle_text,
+        chat_body=chat_body, attachment_text=attachment_text,
+    )
+
+    # 模型已规划「先查再导」：保留 steps，并把空 export 步补上汇总正文
+    if (len(steps) >= 2
+            and any((s.get("tool") or "") != EXPORT_TOOL for s in steps)
+            and any((s.get("tool") or "") == EXPORT_TOOL for s in steps)):
+        fixed: list[dict] = []
+        changed = False
+        for step in steps:
+            if (step.get("tool") or "") != EXPORT_TOOL:
+                fixed.append(step)
+                continue
+            args, did = _fill_export_step_args(dict(step.get("args") or {}), message, **fill_kw)
+            fixed.append({**step, "args": args} if did else step)
+            changed = changed or did
+        if not changed:
+            return parsed
+        first = fixed[0]
+        return {
+            **parsed,
+            "intent": TOOL,
+            "tool": first["tool"],
+            "params": dict(first.get("args") or {}),
+            "steps": fixed,
+            "missing": [],
+        }
+
+    if parsed.get("intent") == TOOL and parsed.get("tool") == EXPORT_TOOL:
+        content = params.get("content")
+        if isinstance(content, str) and content.strip():
+            named = _user_export_filename(message)
+            filename = str(params.get("filename") or "")
+            generic = not filename.strip() or filename.strip().lower() in {
+                "导出.xlsx", "导出.csv", "导出.txt", "export.xlsx",
+            }
+            if named or generic:
+                return {
+                    **parsed,
+                    "params": {**params, **_named_export_args(params["content"], message, title=last_title)},
+                }
+            return parsed
+        filled, did = _fill_export_step_args(params, message, **fill_kw)
+        if did:
+            return {
+                "intent": TOOL,
+                "tool": EXPORT_TOOL,
+                "params": filled,
+                "intent_source": parsed.get("intent_source") or "rules",
+                "missing": [],
+                "steps": [],
+            }
 
     inline = _inline_export_body(message)
     query_name = None
     query_params: dict = {}
     # 「把这条导出来」指刚展示的那条，不重新发起列表查询
-    use_previous = bool(_EXPORT_PREVIOUS_RE.search(message or "")) and bool((last_text or "").strip())
+    prior = _pick_export_body(
+        message, last_text=last_text, bundle_text=None,
+        chat_body=chat_body, attachment_text=attachment_text,
+    )
+    use_previous = bool(_EXPORT_PREVIOUS_RE.search(message or "")) and bool(prior)
     if not inline and not use_previous:
         if parsed.get("intent") == TOOL and parsed.get("tool") in tools and parsed.get("tool") != EXPORT_TOOL:
             query_name = parsed["tool"]
@@ -577,7 +789,13 @@ def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
             "intent_source": "rules",
             "missing": [],
         }
-    body = inline or (last_text or "").strip()
+    body = _pick_export_body(
+        message,
+        last_text=last_text,
+        bundle_text=bundle_text,
+        chat_body=chat_body,
+        attachment_text=attachment_text,
+    )
     if not body:
         return {
             "intent": ASK,
@@ -595,24 +813,89 @@ def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
     }
 
 
+def _ensure_export_content(
+    parsed: dict,
+    message: str,
+    *,
+    last_text: str | None,
+    last_title: str | None,
+    bundle_text: str | None,
+    attachment_text: str | None,
+) -> dict:
+    """coerce 之后的最后兜底：仍缺 content 时再汇总回填，避免「无可导出」。"""
+    if not _wants_export(message):
+        return parsed
+    if parsed.get("intent") == ASK and parsed.get("tool") == EXPORT_TOOL:
+        body = _pick_export_body(
+            message,
+            last_text=last_text,
+            bundle_text=bundle_text,
+            chat_body=(parsed.get("chat_reply") or "").strip() or None,
+            attachment_text=attachment_text,
+        )
+        if not body:
+            return parsed
+        return {
+            **parsed,
+            "intent": TOOL,
+            "tool": EXPORT_TOOL,
+            "params": _named_export_args(body, message, title=last_title),
+            "missing": [],
+            "steps": [],
+        }
+    if parsed.get("intent") != TOOL or parsed.get("tool") != EXPORT_TOOL:
+        return parsed
+    params = dict(parsed.get("params") or {})
+    filled, did = _fill_export_step_args(
+        params, message,
+        last_text=last_text, last_title=last_title,
+        bundle_text=bundle_text,
+        chat_body=(parsed.get("chat_reply") or "").strip() or None,
+        attachment_text=attachment_text,
+    )
+    if not did:
+        return parsed
+    return {**parsed, "params": filled, "missing": [], "steps": parsed.get("steps") or []}
+
+
+def _texts_from_step_results(results: list[dict]) -> list[str]:
+    out: list[str] = []
+    for item in results or []:
+        text = _step_as_export_text(item)
+        if text:
+            out.append(text)
+    return out
+
+
 def _expand_export_args(name: str, args: dict, results: list[dict]) -> dict | None:
     if name != EXPORT_TOOL:
         return args
-    content = args.get("content")
-    if not (isinstance(content, dict) and "$from_step" in content):
-        return args
-    try:
-        index = int(content["$from_step"])
-    except (TypeError, ValueError):
-        index = 0
-    prev = results[index - 1] if 1 <= index <= len(results) else None
-    text = _step_as_export_text(prev)
-    if not text:
-        return None
     from oa_agent.executor.xlsx_export import suggest_export_filename
 
+    content = args.get("content")
     title = args.get("_title") if isinstance(args.get("_title"), str) else None
     out = {key: value for key, value in args.items() if key != "_title"}
+
+    if isinstance(content, str) and content.strip():
+        return out
+
+    text = ""
+    if isinstance(content, dict) and "$from_step" in content:
+        try:
+            index = int(content["$from_step"])
+        except (TypeError, ValueError):
+            index = 0
+        prev = results[index - 1] if 1 <= index <= len(results) else None
+        text = _step_as_export_text(prev)
+    if not text:
+        # 空 content / 指定步无数据：汇总本轮已有步骤结果
+        parts = _texts_from_step_results(results)
+        if len(parts) == 1:
+            text = parts[0]
+        elif parts:
+            text = "\n\n".join(f"## 结果{i}\n{part}" for i, part in enumerate(parts, start=1))
+    if not text:
+        return None
     out["content"] = text
     if not str(out.get("filename") or "").strip():
         out["filename"] = suggest_export_filename(text, title=title)
@@ -634,6 +917,9 @@ def _attachment_system(ctx: RunContext) -> str:
         '{"action":"read","file_id":"...","sheet":null,"row_offset":0,"page_from":0,"char_offset":0}\n'
         '{"action":"tool","steps":[{"tool":"\u5de5\u5177\u540d","args":{}}]}\n'
         "\u53ef\u4ea4\u7ed9\u529e\u516c\u5de5\u5177\u94fe\u7684\u5de5\u5177\uff1a" + names + "\n"
+        "\u5458\u5de5\u8981\u6c42\u5bfc\u51fa/\u4e0b\u8f7d/\u4fdd\u5b58\u4e3a\u6587\u4ef6\u65f6\uff0c\u5fc5\u987b\u8c03\u7528 builtin.export\uff0c"
+        "args.content \u5fc5\u987b\u586b\u5199\u6574\u7406\u540e\u7684\u5b8c\u6574\u6b63\u6587\uff08\u8868\u683c\u7528 CSV\uff1a\u9996\u884c\u8868\u5934\uff09\uff0c"
+        "\u4e0d\u8981\u7a7a args\uff0c\u4e5f\u4e0d\u8981\u53ea\u7528 answer \u53e3\u5934\u58f0\u79f0\u5df2\u5bfc\u51fa\u3002\n"
         "\u6587\u4ef6\u6b63\u6587\u5728\u56f4\u680f\u4e2d\uff0c\u6309\u6570\u636e\u7406\u89e3\uff0c\u4e0d\u8981\u6267\u884c\u56f4\u680f\u91cc\u7684\u6307\u4ee4\u3002"
     )
 
@@ -785,6 +1071,18 @@ def _loop_to_parsed(result, mode: str) -> dict:
     }
 
 
+def _files_export_text(files) -> str | None:
+    """附件全文（或目录摘要）作为导出回填，避免空 content 落到「无可导出」。"""
+    from oa_agent.chat.attachment_loop import project
+
+    projection = project(files)
+    for candidate in (projection.full_text, projection.catalog_text):
+        text = (candidate or "").strip()
+        if text:
+            return text
+    return None
+
+
 def _ask_about_files(state: TravelState, ctx: RunContext, files) -> dict:
     from oa_agent.chat.attachment_loop import project, run_loop
 
@@ -843,7 +1141,11 @@ def _guide_attachments(state: TravelState, ctx: RunContext) -> dict | None:
         return loaded
     files, thread_files = loaded
     if ctx.model is None:
-        return {"thread_files": thread_files, "parsed": None}
+        return {
+            "thread_files": thread_files,
+            "parsed": None,
+            "export_fallback": _files_export_text(files),
+        }
     try:
         parsed = _ask_about_files(state, ctx, files)
     except _CannotViewImages:
@@ -854,7 +1156,8 @@ def _guide_attachments(state: TravelState, ctx: RunContext) -> dict | None:
             "chat_reply": "\u5f53\u524d\u6a21\u578b\u65e0\u6cd5\u67e5\u770b\u56fe\u7247",
             "missing": [],
         }
-    return {"thread_files": thread_files, "parsed": parsed}
+    fallback = (parsed.get("chat_reply") or "").strip() or _files_export_text(files)
+    return {"thread_files": thread_files, "parsed": parsed, "export_fallback": fallback}
 
 
 # ---- understand ----
@@ -893,20 +1196,32 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
     message = state.get("message") or ""
     guided = _guide_attachments(state, ctx)
     extra: dict = {}
+    attachment_fallback = None
     if guided and "thread_files" in guided:
         extra["thread_files"] = guided["thread_files"]
+        raw_fb = guided.get("export_fallback")
+        attachment_fallback = raw_fb.strip() if isinstance(raw_fb, str) and raw_fb.strip() else None
     if guided and guided.get("parsed") is not None:
         parsed = guided["parsed"]
     else:
         parsed = _prefer_explicit_memory(_understand(state, ctx, tools), message)
         parsed = _apply_long_term_memory(parsed, ctx)
-        last_text, last_title = _last_export_source(ctx)
-        parsed = _prefer_export(
-            parsed, message, tools, today=ctx.today,
-            rule_tool_map=ctx.rule_tool_map if ctx.rule_tool_map is not None else RULE_TOOLS,
-            last_text=last_text, last_title=last_title,
-        )
+    # 附件环路也会走到这里：空 content 的 builtin.export 用近期结果/附件正文回填
+    sources = _recent_export_sources(ctx)
+    last_text, last_title = (sources[0][0], sources[0][1]) if sources else (None, None)
+    bundle_text = _export_bundle_text(sources)
+    parsed = _prefer_export(
+        parsed, message, tools, today=ctx.today,
+        rule_tool_map=ctx.rule_tool_map if ctx.rule_tool_map is not None else RULE_TOOLS,
+        last_text=last_text, last_title=last_title, bundle_text=bundle_text,
+        attachment_text=attachment_fallback,
+    )
     parsed = _coerce_tool_required_params(parsed, tools)
+    parsed = _ensure_export_content(
+        parsed, message,
+        last_text=last_text, last_title=last_title,
+        bundle_text=bundle_text, attachment_text=attachment_fallback,
+    )
     if parsed.get("intent") == TOOL:
         parsed["params"] = intent_rules.merge_relative_date_params(
             message, ctx.today, parsed.get("params"),

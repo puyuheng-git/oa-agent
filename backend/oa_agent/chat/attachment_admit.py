@@ -11,7 +11,7 @@ MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_ZIP_ENTRIES = 2000
 MAX_ZIP_UNCOMPRESSED = 50 * 1024 * 1024
 
-MSG_TYPE = '只能上传 Excel、Word、PDF、Markdown、CSV，以及 png、jpeg、webp、gif 图片'
+MSG_TYPE = '只能上传 Excel、Word、PDF、Markdown、TXT、CSV，以及 png、jpeg、webp、gif 图片'
 MSG_TOO_MANY = '一次最多 5 个文件'
 MSG_TOO_LARGE = '单个文件不能超过 20MB'
 MSG_EMPTY = '文件是空的'
@@ -35,6 +35,7 @@ _EXTENSION_META: dict[str, tuple[MediaKind, str]] = {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ),
     "csv": ("document", "text/csv"),
+    "txt": ("document", "text/plain"),
     "md": ("document", "text/markdown"),
     "markdown": ("document", "text/markdown"),
 }
@@ -118,7 +119,7 @@ def _validate_payload(ext: str, data: bytes) -> None:
         _validate_office_zip(data, "xl/")
     elif ext == "docx":
         _validate_office_zip(data, "word/")
-    elif ext in ("csv", "md", "markdown"):
+    elif ext in ("csv", "txt", "md", "markdown"):
         _validate_text(data)
     else:
         raise AdmitError(MSG_TYPE)
