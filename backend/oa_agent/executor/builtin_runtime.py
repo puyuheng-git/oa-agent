@@ -14,6 +14,10 @@ import logging
 import operator
 import re
 import secrets
+import shlex
+import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +64,16 @@ _CRON_FIELDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
 _CRON_PART = re.compile(r"^(\*|\d{1,2}(?:-\d{1,2})?)(?:/(\d{1,2}))?$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _WORKFLOW_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+SKILL_EXEC_DEFAULT_TIMEOUT = 60
+SKILL_EXEC_HARD_TIMEOUT = 180
+SKILL_EXEC_DEFAULT_OUTPUT = 262144
+SKILL_EXEC_SCRIPT_RE = re.compile(r"^[A-Za-z0-9_./\-]+$")
+SKILL_EXEC_INTERPRETERS = {
+    ".py": "python",
+    ".js": "node",
+    ".mjs": "node",
+    ".cjs": "node",
+}
 
 _BIN_OPS: dict[type, Callable[[Any, Any], Any]] = {
     ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
@@ -137,7 +151,9 @@ class BuiltinRuntime:
     global_setting（http 全局白名单默认）。
     """
 
-    HIGH_RISK = frozenset({"sys.http", "sys.web_search", "sys.fs_read", "sys.fs_write", "sys.cron"})
+    HIGH_RISK = frozenset({
+        "sys.http", "sys.web_search", "sys.fs_read", "sys.fs_write", "sys.cron", "sys.skill_exec",
+    })
 
     def __init__(self, *, tenant_id: str = "dscpa", session_factory: Callable[[], Any] | None = None,
                  data_dir: Path | str | None = None, kv: Any | None = None, vault: Any | None = None,
@@ -153,7 +169,8 @@ class BuiltinRuntime:
         self._handlers: dict[str, Callable[[ToolSpec, dict, Identity], dict]] = {
             "sys.time": self._time, "sys.calc": self._calc, "sys.export": self._export, "sys.memory": self._memory,
             "sys.http": self._http, "sys.web_search": self._web_search, "sys.fs_read": self._fs_read,
-            "sys.fs_write": self._fs_write, "sys.cron": self._cron,
+            "sys.fs_write": self._fs_write, "sys.cron": self._cron, "sys.skill_exec": self._skill_exec,
+            "sys.skill_create": self._skill_create,
         }
 
     def call(self, spec: ToolSpec, args: dict, *, identity: Identity) -> dict:
@@ -422,6 +439,174 @@ class BuiltinRuntime:
             raise ToolError("PATH_NOT_ALLOWED", "路径越出沙箱", user_message="该路径不被允许")
         target.write_bytes(data)
         return {"path": norm, "written": True, "size_bytes": len(data)}
+
+    # ---- sys.skill_create
+    def _skill_create(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
+        if self.data_dir is None or self.session_factory is None:
+            raise _not_available()
+        skill_md = args.get("skill_md")
+        if not isinstance(skill_md, str) or len(skill_md.strip()) < 10:
+            raise _invalid("缺少参数 skill_md（完整 SKILL.md 文本）")
+        from oa_agent.skills import service as skill_packs
+
+        try:
+            with self.session_factory() as db, db.begin():
+                pack = skill_packs.create_user_pack(
+                    db,
+                    tenant_id=self.tenant_id,
+                    oa=identity.oa,
+                    data_dir=self.data_dir,
+                    skill_md=skill_md,
+                )
+                pack_id = pack.id
+                name = pack.name
+                display_name = pack.display_name or pack.name
+            with self.session_factory() as db:
+                body = skill_packs.load_skill_body(db, self.data_dir, pack_id)
+        except AppError as exc:
+            raise ToolError(exc.code, exc.message, user_message=exc.message) from exc
+        return {
+            "ok": True,
+            "id": pack_id,
+            "name": name,
+            "display_name": display_name,
+            "skill_md_chars": len(body),
+            "text": f"已创建个人 Skill「{display_name}」（{name}），可在工作空间「我的 Skill」中查看与启停。",
+        }
+
+    # ---- sys.skill_exec
+    def _skill_exec(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
+        if self.data_dir is None or self.session_factory is None:
+            raise _not_available()
+        skill_name = str(args.get("skill") or "").strip().lower()
+        script = str(args.get("script") or "").strip().replace("\\", "/")
+        if not skill_name or not script:
+            raise _invalid("缺少参数 skill 或 script")
+        if ".." in script.split("/") or not SKILL_EXEC_SCRIPT_RE.fullmatch(script):
+            raise _invalid("script 路径无效")
+        suffix = Path(script).suffix.lower()
+        interpreter = SKILL_EXEC_INTERPRETERS.get(suffix)
+        allowed = spec.sandbox_policy.get("skill_exec_interpreters") or ["python", "node"]
+        if interpreter is None or interpreter not in allowed:
+            raise _invalid(f"不支持的脚本类型：{suffix or '(无扩展名)'}")
+        from oa_agent.db.models import SkillPack, SkillPackVersion
+        from oa_agent.skills.service import bump_invoke, pack_bundle_dir
+
+        with self.session_factory() as db:
+            pack = db.scalar(
+                sa.select(SkillPack).where(
+                    SkillPack.tenant_id == self.tenant_id, SkillPack.name == skill_name,
+                )
+            )
+            if pack is None or not pack.current_version_id:
+                raise ToolError("NOT_FOUND", "Skill 包不存在", user_message="Skill 不可用")
+            version = db.get(SkillPackVersion, pack.current_version_id)
+            if version is None or not version.storage_path:
+                raise ToolError("NOT_FOUND", "Skill 包无版本", user_message="Skill 不可用")
+            bundle = pack_bundle_dir(self.data_dir, version.storage_path)
+            pack_id = pack.id
+
+        script_src = (bundle / script).resolve()
+        if not str(script_src).startswith(str(bundle.resolve())) or not script_src.is_file():
+            raise ToolError("NOT_FOUND", "脚本不存在", user_message="Skill 脚本不存在")
+
+        run_id = secrets.token_hex(8)
+        work = (
+            self.data_dir / "sandbox" / _safe_segment(self.tenant_id) / _safe_segment(identity.oa)
+            / "runs" / run_id
+        ).resolve()
+        work.mkdir(parents=True, exist_ok=True)
+        skill_copy = work / "skill"
+        if skill_copy.exists():
+            shutil.rmtree(skill_copy)
+        shutil.copytree(bundle, skill_copy)
+        script_in_run = (skill_copy / script).resolve()
+        if not str(script_in_run).startswith(str(skill_copy.resolve())):
+            raise ToolError("PATH_NOT_ALLOWED", "脚本路径越界", user_message="该路径不被允许")
+
+        argv_raw = args.get("argv")
+        argv: list[str] = []
+        if isinstance(argv_raw, list):
+            argv = [str(a) for a in argv_raw][:40]
+        elif isinstance(argv_raw, str) and argv_raw.strip():
+            argv = shlex.split(argv_raw.strip())[:40]
+        stdin_text = args.get("stdin") if isinstance(args.get("stdin"), str) else None
+        timeout = _bounded_int(
+            spec.sandbox_policy.get("skill_exec_timeout_seconds"),
+            SKILL_EXEC_DEFAULT_TIMEOUT, 1, SKILL_EXEC_HARD_TIMEOUT,
+        )
+        out_limit = _bounded_int(
+            spec.sandbox_policy.get("skill_exec_max_output_bytes"),
+            SKILL_EXEC_DEFAULT_OUTPUT, 1024, HTTP_HARD_MAX_BYTES,
+        )
+        exe = sys.executable if interpreter == "python" else shutil.which("node")
+        if not exe:
+            raise ToolError("TOOL_NOT_AVAILABLE", f"未找到解释器 {interpreter}", user_message="执行环境未就绪")
+        cmd = [exe, str(script_in_run), *argv]
+        env = {
+            "PATH": "",
+            "LANG": "C.UTF-8",
+            "HOME": str(work),
+            "TMPDIR": str(work),
+            "SKILL_ROOT": str(skill_copy),
+            "WORKDIR": str(work),
+            "PYTHONNOUSERSITE": "1",
+        }
+        if interpreter == "python":
+            env["PATH"] = str(Path(sys.executable).parent)
+            env["PYTHONPATH"] = str(skill_copy)
+        else:
+            node_dir = str(Path(exe).parent)
+            env["PATH"] = node_dir
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(work),
+                input=stdin_text,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ToolError("TIMEOUT", f"脚本超时（>{timeout}s）", user_message="Skill 脚本执行超时") from exc
+        except OSError as exc:
+            raise ToolError("TOOL_NOT_AVAILABLE", f"无法启动脚本：{exc}", user_message="Skill 脚本无法执行") from exc
+
+        def _clip(text: str) -> tuple[str, bool]:
+            raw = (text or "").encode("utf-8", errors="replace")
+            if len(raw) <= out_limit:
+                return text or "", False
+            return raw[:out_limit].decode("utf-8", errors="replace"), True
+
+        stdout, out_trunc = _clip(completed.stdout or "")
+        stderr, err_trunc = _clip(completed.stderr or "")
+        artifacts: list[str] = []
+        for path in work.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(work).as_posix()
+            if rel.startswith("skill/"):
+                continue
+            artifacts.append(rel)
+        try:
+            with self.session_factory() as db, db.begin():
+                bump_invoke(db, pack_id)
+        except Exception:  # noqa: BLE001
+            log.exception("skill_exec 调用计数失败 pack_id=%s", pack_id)
+        return {
+            "skill": skill_name,
+            "script": script,
+            "exit_code": completed.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": out_trunc,
+            "stderr_truncated": err_trunc,
+            "workdir": f"sandbox/{_safe_segment(self.tenant_id)}/{_safe_segment(identity.oa)}/runs/{run_id}",
+            "artifacts": artifacts[:50],
+            "ok": completed.returncode == 0,
+        }
 
     # ---- sys.cron（只登记，不执行任何命令）
     def _cron_kv(self) -> Any:

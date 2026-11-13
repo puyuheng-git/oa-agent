@@ -155,9 +155,17 @@ class OpenOaClient:
                 json_decode_ok=json_decode_ok,
             )
         except ConnectorError as exc:
+            message = exc.message
+            if not json_decode_ok and resp.status_code < 400:
+                ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                snippet = " ".join((resp.text or "").split())[:180]
+                message = (
+                    f"open-oa 返回非 JSON（HTTP {resp.status_code}，"
+                    f"Content-Type={ct or '未知'}，URL={resp.url}，正文摘要：{snippet or '（空）'}）"
+                )
             raise OpenOaError(
                 exc.code,
-                exc.message,
+                message,
                 exc.http_status,
                 user_message=exc.user_message,
             ) from exc
@@ -213,12 +221,16 @@ class OpenOaClient:
         return OpenOaResponse(data, resp.status_code, ms, hint)
 
     def get_export_catalog(self, *, gateway_secret: str, timeout: float | None = None) -> list:
-        """管理端导入：用网关密钥拉清单（不经员工 Bearer）。"""
+        """管理端导入：用网关密钥拉清单（不经员工 Bearer）。
+
+        同时带 Header 与 query（open-oa AuthAgentBearer 二者其一即可），避免部分网关剥 Header。
+        """
         if not gateway_secret:
             raise OpenOaError("OFFICE_API_NOT_CONFIGURED", "未配置 AGENT_GATEWAY_SECRET")
         resp, _ = self._send(
             "GET", CATALOG_PATH,
             headers={"X-Agent-Gateway-Secret": gateway_secret},
+            params={"gateway_secret": gateway_secret},
             timeout=timeout or 10.0,
         )
         data, _ = self._unwrap(resp)

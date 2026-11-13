@@ -468,7 +468,12 @@ def list_open_oa_catalog(ctx: AdminCtx = Depends(admin_read(TOOL))):
     try:
         items = client.get_export_catalog(gateway_secret=secret)
     except OpenOaError as exc:
-        raise AppError(502, "IMPORT_FAILED", f"拉取 open-oa catalog 失败：{exc.message}") from exc
+        raise AppError(
+            502,
+            "IMPORT_FAILED",
+            f"拉取 open-oa catalog 失败：{exc.message}。"
+            "请核对连接配置里的 mint_base_url（须指向 open-oa）与 AGENT_GATEWAY_SECRET 是否与 open-oa 环境变量一致。",
+        ) from exc
     return {"items": items if isinstance(items, list) else []}
 
 
@@ -480,7 +485,12 @@ def import_open_oa_catalog(body: OpenOaCatalogImportIn, ctx: AdminCtx = Depends(
     try:
         catalog_items = client.get_export_catalog(gateway_secret=secret)
     except OpenOaError as exc:
-        raise AppError(502, "IMPORT_FAILED", f"拉取 open-oa catalog 失败：{exc.message}") from exc
+        raise AppError(
+            502,
+            "IMPORT_FAILED",
+            f"拉取 open-oa catalog 失败：{exc.message}。"
+            "请核对连接配置里的 mint_base_url（须指向 open-oa）与 AGENT_GATEWAY_SECRET 是否与 open-oa 环境变量一致。",
+        ) from exc
 
     wanted = {(str(i.get("service") or "").strip(), str(i.get("method") or "").strip()) for i in body.items}
     wanted.discard(("", ""))

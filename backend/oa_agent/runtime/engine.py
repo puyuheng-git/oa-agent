@@ -49,6 +49,8 @@ class AgentEngine:
                  setting: Callable[[str, str], object] | None = None):
         self._sf = session_factory
         self._setting = setting
+        self._data_dir = settings.data_dir
+        self.tenant_id = tenant_id
         self.sink = EventSink(session_factory, settings.data_dir / "event_spool")
         self.runs = RunService(session_factory, self.sink, tenant_id)
         self.interventions = InterventionService(session_factory, tenant_id, self.runs)
@@ -95,6 +97,15 @@ class AgentEngine:
             self.catalog.bootstrap()
         except SQLAlchemyError:
             log.exception("Tool/Skill 首次同步失败")
+        try:
+            from oa_agent.skills.service import ensure_system_skill_packs
+
+            with self._sf() as db, db.begin():
+                n = ensure_system_skill_packs(db, tenant_id=self.tenant_id, data_dir=self._data_dir)
+                if n:
+                    log.info("已补齐系统 Skill 包 %d 个", n)
+        except Exception:  # noqa: BLE001
+            log.exception("系统 Skill 包种子写入失败")
         self.reload_catalog()
         try:
             self.release_provider.seed()

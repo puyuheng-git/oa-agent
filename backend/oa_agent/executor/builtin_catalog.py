@@ -90,6 +90,21 @@ BUILTIN_CATALOG: list[BuiltinDef] = [
         how="只写 data/sandbox/{tenant}/ 下相对路径；同样做路径规范化与沙箱根校验。",
         constraints=("默认停用", "须有 sandbox_policy", "写入体积有上限"),
     ),
+    BuiltinDef(
+        "sys.skill_exec", "执行 Agent Skill 包脚本", "high", True, True,
+        {
+            "skill_exec_timeout_seconds": 60,
+            "skill_exec_max_output_bytes": 262144,
+            "skill_exec_interpreters": ["python", "node"],
+        },
+        how="在租户/员工沙箱 run 目录中执行已启用 Skill 包内 scripts（python/node 白名单）；包目录只读拷贝，默认禁网。",
+        constraints=("须有 sandbox_policy", "仅允许包内相对脚本路径", "超时与输出有上限"),
+    ),
+    BuiltinDef(
+        "sys.skill_create", "创建员工个人 Agent Skill", "medium", True,
+        how="把完整 SKILL.md 写入当前员工的个人 Skill 库（kind=user）；配合系统包 skill-creator 由自然语言创建。",
+        constraints=("仅创建本人 Skill", "name 不可与系统包/他人冲突", "内容经 SKILL.md 校验"),
+    ),
 ]
 
 
@@ -119,6 +134,19 @@ BUILTIN_MODEL_PARAMS: dict[str, dict[str, dict[str, Any]]] = {
     "sys.web_search": {"query": _p("搜索词", required=True)},
     "sys.fs_read": {"path": _p("沙箱内路径", required=True)},
     "sys.fs_write": {"path": _p("沙箱内路径", required=True), "content": _p("内容", required=True)},
+    "sys.skill_exec": {
+        "skill": _p("Skill 包名", "如 xlsx / pdf", required=True),
+        "script": _p("脚本相对路径", "相对 Skill 包根，如 scripts/recalc.py", required=True),
+        "argv": _p("参数", "空格分隔的命令行参数，可选"),
+        "stdin": _p("标准输入", "可选文本"),
+    },
+    "sys.skill_create": {
+        "skill_md": _p(
+            "SKILL.md 全文",
+            "含 YAML frontmatter（name/description）与 Markdown 正文；创建当前员工的个人 Skill",
+            required=True,
+        ),
+    },
 }
 
 # builtin / mcp 的结果统一为 {"text": <围栏文本>}，回复层按 text 渲染，不走 office 的字段白名单

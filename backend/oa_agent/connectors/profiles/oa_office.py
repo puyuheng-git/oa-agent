@@ -30,7 +30,7 @@ def parse_oa_office(
             user_message=hint,
         )
     if not json_decode_ok:
-        raise ConnectorError("UPSTREAM_BAD_RESPONSE", "office-api 返回非 JSON", status_code)
+        raise ConnectorError("UPSTREAM_BAD_RESPONSE", "上游返回非 JSON", status_code)
     if not isinstance(body, dict):
         return body, ""
     code = next((body[k] for k in ("code", "errCode", "err_code") if k in body), None)

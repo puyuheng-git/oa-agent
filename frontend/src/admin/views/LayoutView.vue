@@ -191,6 +191,11 @@ onBeforeUnmount(() => {
   clearTimeout(typeTimer)
   window.removeEventListener('keydown', onKey)
   setBrainNodeClick(null)
+  // 离开指挥舱（如退登录、异常路由）时清卫星，避免残留 focus 隐身节点
+  brainStage.mode = 'dormant'
+  brainStage.paused = false
+  brainStage.layouts = []
+  brainStage.views = {}
 })
 const pwdOpen = ref(false)
 const pwd = reactive({ old_password: '', new_password: '', confirm: '' })

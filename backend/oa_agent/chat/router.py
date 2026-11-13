@@ -267,7 +267,10 @@ def _document_item(row: ExportFile) -> dict:
 
 def _session_extras(rt, *, oa: str, office_token: str = "") -> dict:
     """员工页面需要的能力与参数：可用功能、能否聊天、消息长度上限、转人工结果轮询参数。"""
+    from oa_agent.chat.service import skill_pack_menu
+
     return {"skills": skill_menu(rt, oa=oa, office_token=office_token),
+            "skill_packs": skill_pack_menu(rt, oa=oa),
             "workflows": workflow_menu(rt),
             "chat": chat_available(rt),
             "message_max_chars": int(setting(rt, "chat", "message_max_chars")),
@@ -746,3 +749,156 @@ def get_run(run_id: str, request: Request, auth: ChatAuth = Depends(chat_auth)):
         reply = user_reply_for(rt, run.error_code) if run.error_code else {
             "type": "text", "content": "结果已过期，请重新提问。", "data": None}
     return {"run_id": run_id, "run_status": run.run_status, "done": done, "reply": reply}
+
+
+# ---- Agent Skill 包（个人库 / 市场）----
+
+class SkillPackCreateIn(BaseModel):
+    skill_md: str = Field(min_length=10, max_length=200_000)
+
+
+class SkillPackUpdateIn(BaseModel):
+    skill_md: str | None = Field(default=None, max_length=200_000)
+
+
+class SkillPackEnableIn(BaseModel):
+    enabled: bool
+
+
+@router.get("/skill-packs")
+def list_my_skill_packs(request: Request, auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db:
+        return {"items": skill_packs.list_user_library(db, tenant_id=rt.tenant_id, oa=auth.session.oa)}
+
+
+@router.post("/skill-packs")
+def create_my_skill_pack(body: SkillPackCreateIn, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db, db.begin():
+        pack = skill_packs.create_user_pack(
+            db, tenant_id=rt.tenant_id, oa=auth.session.oa,
+            data_dir=rt.settings.data_dir, skill_md=body.skill_md,
+        )
+        pack_id = pack.id
+    with rt.session() as db:
+        items = skill_packs.list_user_library(db, tenant_id=rt.tenant_id, oa=auth.session.oa)
+    return next(i for i in items if i["id"] == pack_id)
+
+
+@router.put("/skill-packs/{pack_id}")
+def update_my_skill_pack(pack_id: int, body: SkillPackUpdateIn, request: Request,
+                         auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db, db.begin():
+        skill_packs.update_user_pack(
+            db, tenant_id=rt.tenant_id, oa=auth.session.oa, pack_id=pack_id,
+            data_dir=rt.settings.data_dir, skill_md=body.skill_md,
+        )
+    with rt.session() as db:
+        items = skill_packs.list_user_library(db, tenant_id=rt.tenant_id, oa=auth.session.oa)
+    item = next((i for i in items if i["id"] == pack_id), None)
+    if item is None:
+        raise AppError(404, "NOT_FOUND", "Skill 包不存在")
+    return item
+
+
+@router.patch("/skill-packs/{pack_id}/enabled")
+def enable_my_skill_pack(pack_id: int, body: SkillPackEnableIn, request: Request,
+                         auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db, db.begin():
+        skill_packs.set_pack_enabled(
+            db, tenant_id=rt.tenant_id, oa=auth.session.oa, pack_id=pack_id, enabled=body.enabled,
+        )
+    return {"id": pack_id, "enabled": body.enabled}
+
+
+@router.delete("/skill-packs/{pack_id}")
+def delete_my_skill_pack(pack_id: int, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db, db.begin():
+        skill_packs.delete_user_pack(
+            db, tenant_id=rt.tenant_id, oa=auth.session.oa, pack_id=pack_id,
+            data_dir=rt.settings.data_dir,
+        )
+    return {"ok": True}
+
+
+@router.get("/skill-packs/{pack_id}/content")
+def get_my_skill_pack_content(pack_id: int, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db:
+        items = skill_packs.list_user_library(db, tenant_id=rt.tenant_id, oa=auth.session.oa)
+        if not any(i["id"] == pack_id for i in items):
+            raise AppError(404, "NOT_FOUND", "Skill 包不在你的库中")
+        body = skill_packs.load_skill_body(db, rt.settings.data_dir, pack_id)
+    return {"id": pack_id, "skill_md": body}
+
+
+class SkillPackPublishIn(BaseModel):
+    description: str = Field(default="", max_length=1024)
+
+
+@router.post("/skill-packs/{pack_id}/publish")
+def publish_my_skill_pack(pack_id: int, body: SkillPackPublishIn, request: Request,
+                          auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db, db.begin():
+        listing = skill_packs.publish_to_market(
+            db, tenant_id=rt.tenant_id, oa=auth.session.oa, pack_id=pack_id,
+            description=body.description,
+        )
+        return {
+            "pack_id": listing.pack_id,
+            "status": listing.status,
+            "description": listing.description or "",
+        }
+
+
+@router.post("/skill-packs/{pack_id}/withdraw")
+def withdraw_my_skill_pack(pack_id: int, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db, db.begin():
+        skill_packs.withdraw_from_market(
+            db, tenant_id=rt.tenant_id, oa=auth.session.oa, pack_id=pack_id,
+        )
+    return {"ok": True}
+
+
+@router.get("/skill-market")
+def list_skill_market(request: Request, auth: ChatAuth = Depends(chat_auth),
+                      q: str = Query("", max_length=64)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db:
+        return {"items": skill_packs.list_market(db, tenant_id=rt.tenant_id, oa=auth.session.oa, q=q)}
+
+
+@router.post("/skill-market/{pack_id}/install")
+def install_skill_market(pack_id: int, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    from oa_agent.skills import service as skill_packs
+
+    rt = get_runtime(request)
+    with rt.session() as db, db.begin():
+        row = skill_packs.install_from_market(
+            db, tenant_id=rt.tenant_id, oa=auth.session.oa, pack_id=pack_id,
+        )
+        return {"pack_id": row.pack_id, "enabled": row.enabled, "origin": row.origin}

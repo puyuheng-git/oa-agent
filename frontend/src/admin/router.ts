@@ -85,6 +85,9 @@ export const router = createRouter({
           component: () => import('./views/EmployeeDetailView.vue'),
           meta: { perm: 'ops.employee.view', title: '员工详情', code: 'EMPLOYEE', icon: User, menuPath: '/employees' },
         },
+        // Skill 包已并入 Skill 管理；旧链接 / 登录 redirect 不得落到无 Layout 的空路由（否则卫星隐身、菜单消失）
+        { path: 'skill-packs', redirect: '/skills' },
+        { path: ':pathMatch(.*)*', redirect: '/' },
       ],
     },
   ],

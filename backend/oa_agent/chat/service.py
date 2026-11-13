@@ -632,11 +632,43 @@ def _recent_tool_names(rt: AppRuntime, thread_id: str | None, limit: int = 8) ->
         return []
 
 
+def _load_skill_packs(rt: AppRuntime, oa: str):
+    from oa_agent.skills import service as skill_packs
+
+    try:
+        with rt.session() as db:
+            packs = skill_packs.enabled_packs_for(db, tenant_id=rt.tenant_id, oa=oa)
+            # 预读 SKILL.md，供渐进披露命中时注入
+            for pack in packs:
+                try:
+                    pack.skill_md = skill_packs.load_skill_body(db, rt.settings.data_dir, pack.id)
+                    pack.loaded_body = True
+                except Exception:  # noqa: BLE001
+                    pack.skill_md = ""
+            return packs
+    except Exception:  # noqa: BLE001
+        log.exception("加载 Agent Skill 包失败 oa=%s", oa)
+        return []
+
+
+def skill_pack_menu(rt: AppRuntime, *, oa: str) -> list[dict]:
+    packs = _load_skill_packs(rt, oa)
+    return [{
+        "name": p.name,
+        "display_name": p.display_name,
+        "description": p.description,
+        "kind": p.kind,
+        "origin": p.origin,
+        "invoke_count": p.invoke_count,
+    } for p in packs]
+
+
 def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
                    on_delta: Callable[[str], None] | None = None,
                    domain: DomainSpec | None = None) -> travel_query.RunContext:
     runtime_routing = _runtime_routing_defaults(rt)
     skills = visible_skills_for(rt, session.oa, office_token=session.office_token)
+    skill_packs = _load_skill_packs(rt, session.oa)
     cfg = dict(config)
     domain_name = None
     if domain is not None:
@@ -659,6 +691,7 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
         router_model=_router_model(rt, cfg, runtime_routing),
         config=cfg,
         skills=skills,
+        skill_packs=skill_packs,
         long_term_memory=_load_long_term_memory(rt, session.oa),
         tenant_id=rt.tenant_id,
         thread_id=session.thread_id,

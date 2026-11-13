@@ -33,6 +33,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from oa_agent.executor.catalog import SkillState
+from oa_agent.skills.service import SkillPackState
 from oa_agent.executor.executor import Identity, ToolError, ToolExecutor, validate_args
 from oa_agent.executor.registry import ToolSpec
 from oa_agent.executor.tool_routing import route as route_tools
@@ -57,6 +58,8 @@ MEMORY_FORGET = "memory_forget"
 # 模型不可用时的内置规则只覆盖行程报销两个 Tool；其"Tool 需要配置模"
 RULE_TOOLS = {LIST: "query_my_travel_expense_list", DETAIL: "query_my_travel_expense_detail"}
 EXPORT_TOOL = "builtin.export"
+SKILL_EXEC_TOOL = "builtin.skill_exec"
+SKILL_CREATE_TOOL = "builtin.skill_create"
 _EXPORT_RE = re.compile(
     r"导出|导出来|存成文件|保存为文件|另存为|保存成|做成文件|生成文件|生成表格|"
     r"下载文件|下载表格|下载下来|导出文件|输出(?:成)?文件|整理成文件|汇总成文件|"
@@ -239,6 +242,7 @@ class RunContext:
     config: dict = field(default_factory=lambda: dict(DEFAULT_CONFIG))
     should_cancel: Callable[[], bool] = lambda: False
     skills: list[SkillState] | None = None   # None：不"Skill 过滤（注册表内全"Tool"
+    skill_packs: list[SkillPackState] = field(default_factory=list)  # Agent Skill 包（SKILL.md）
     on_delta: Callable[[str], None] | None = None   # 流式：回复正文的新增片段
     streamed: bool = False                          # 本次回复正文是否已经流式输出"
     long_term_memory: str = ""                      # 员工长期记忆注入块（"Checkpoint memory 分开"
@@ -267,6 +271,15 @@ class RunContext:
         export_spec = registry.get(EXPORT_TOOL)
         if export_spec is not None and EXPORT_TOOL not in out:
             out[EXPORT_TOOL] = (export_spec, _export_skill())
+        if self.skill_packs:
+            exec_spec = registry.get(SKILL_EXEC_TOOL)
+            if exec_spec is not None and SKILL_EXEC_TOOL not in out:
+                out[SKILL_EXEC_TOOL] = (exec_spec, _skill_exec_skill())
+            # 有系统包 skill-creator（或任意系统包）时暴露创建个人 Skill 工具
+            if any(p.kind == "system" for p in self.skill_packs):
+                create_spec = registry.get(SKILL_CREATE_TOOL)
+                if create_spec is not None and SKILL_CREATE_TOOL not in out:
+                    out[SKILL_CREATE_TOOL] = (create_spec, _skill_create_skill())
         return out
 
     def num(self, key: str) -> int:
@@ -379,6 +392,71 @@ def _export_skill() -> SkillState:
         examples=["把数据导出", "导出本月的报销"],
         tools=[EXPORT_TOOL],
     )
+
+
+def _skill_exec_skill() -> SkillState:
+    return SkillState(
+        name="agent_skill_exec", enabled=True, valid=True,
+        display_name="Skill 脚本执行",
+        description="执行已启用 Agent Skill 包中的脚本（xlsx/pdf/docx/pptx 等）",
+        instructions=(
+            "当员工需求匹配某 Agent Skill 包时，先按其 SKILL.md 指引操作；"
+            "需要跑包内脚本时调用 builtin.skill_exec，skill=包名，script=相对路径。"
+        ),
+        examples=["生成一张 Excel 汇总表", "把内容做成 Word 文档"],
+        tools=[SKILL_EXEC_TOOL],
+    )
+
+
+def _skill_create_skill() -> SkillState:
+    return SkillState(
+        name="agent_skill_create", enabled=True, valid=True,
+        display_name="创建个人 Skill",
+        description="按员工自然语言需求创建个人 Agent Skill（SKILL.md）",
+        instructions=(
+            "员工要创建/保存自己的 Skill 时，遵循系统 Skill「skill-creator」；"
+            "确认内容后调用 builtin.skill_create，参数 skill_md 为完整 SKILL.md。"
+        ),
+        examples=["帮我创建一个请假提醒的 Skill", "把刚才的流程存成我的 Skill"],
+        tools=[SKILL_CREATE_TOOL],
+    )
+
+
+def _describe_skill_packs(packs: list[SkillPackState], message: str = "") -> str:
+    if not packs:
+        return ""
+    system_packs = [p for p in packs if p.kind == "system"]
+    user_packs = [p for p in packs if p.kind != "system"]
+    lines: list[str] = []
+    if system_packs:
+        lines.append("## 系统内置 Skill（系统提示）")
+        lines.append(
+            "以下由管理员配置，始终生效；不要在「我的 Skill」里展示。"
+            "创建个人 Skill 时遵循 skill-creator，并调用 builtin.skill_create。"
+        )
+        for pack in system_packs:
+            lines.append(f"\n### 系统 Skill：{pack.name}（{pack.display_name}）")
+            lines.append(pack.description or "")
+            # 系统包全文注入系统提示（截断防爆）
+            if pack.skill_md:
+                lines.append(pack.skill_md[:16000])
+    if user_packs:
+        lines.append("\n## 员工个人 Skill 包")
+        lines.append("以下为员工自己的 Skill。匹配时按其说明工作；跑脚本用 builtin.skill_exec。")
+        msg = (message or "").lower()
+        loaded = 0
+        for pack in user_packs:
+            lines.append(f"- **{pack.name}**（{pack.display_name}）：{pack.description}")
+            if loaded < 2 and pack.skill_md and (
+                pack.name in msg
+                or any(
+                    tok and tok in msg
+                    for tok in re.findall(r"[a-zA-Z\u4e00-\u9fff]{2,}", pack.description.lower())[:12]
+                )
+            ):
+                lines.append(f"\n### Skill 正文：{pack.name}\n{pack.skill_md[:12000]}")
+                loaded += 1
+    return ("\n".join(lines) + "\n") if lines else ""
 
 
 def _with_export_hint(prompt: str, tools: dict) -> str:
@@ -1310,11 +1388,14 @@ def _understand(state: TravelState, ctx: RunContext, tools: dict) -> dict:
                 return None
 
         visible = narrowed if narrowed else tools
+        tools_block = ("## 可用工具\n\n" + _describe_tools(visible, max_steps > 1)) if visible else NO_TOOLS
+        packs_block = _describe_skill_packs(ctx.skill_packs or [], message)
+        skills_block = (tools_block + ("\n" + packs_block if packs_block else "")).strip() or NO_TOOLS
         fmt = {
             "today": ctx.today.isoformat(),
             "weekday": "" + WEEKDAYS[ctx.today.weekday()],
             "memory": "".join(memory_blocks),
-            "skills": ("## 可用工具\n\n" + _describe_tools(visible, max_steps > 1)) if visible else NO_TOOLS,
+            "skills": skills_block,
         }
         if allow_chat:
             extra = (ctx.config.get("chat_instructions") or "").strip()

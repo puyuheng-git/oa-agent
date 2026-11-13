@@ -499,6 +499,86 @@ class SkillVisibilityRule(Base):
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
 
+# ---------------- Agent Skill 包（SKILL.md，与目录 Skill 并行） ----------------
+
+class SkillPack(Base):
+    """Agent Skill 包元数据（system / user）；与 agent_skill 目录能力并行。"""
+
+    __tablename__ = "agent_skill_pack"
+    __table_args__ = (sa.UniqueConstraint("tenant_id", "name", name="uk_skill_pack_name"),)
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(sa.String(32), default=DEFAULT_TENANT)
+    name: Mapped[str] = mapped_column(sa.String(64))
+    display_name: Mapped[str] = mapped_column(sa.String(128), default="")
+    description: Mapped[str] = mapped_column(sa.String(1024), default="")
+    kind: Mapped[str] = mapped_column(sa.String(16), default="user")  # system|user
+    source: Mapped[str] = mapped_column(sa.String(16), default="editor")  # github|editor|market
+    source_url: Mapped[str] = mapped_column(sa.String(512), default="")
+    owner_oa: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    enabled_default: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    current_version_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    bundle_hash: Mapped[str] = mapped_column(sa.String(64), default="")
+    invoke_count: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    created_by: Mapped[str] = mapped_column(sa.String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+
+class SkillPackVersion(Base):
+    __tablename__ = "agent_skill_pack_version"
+    __table_args__ = (sa.UniqueConstraint("pack_id", "version_no", name="uk_skill_pack_version_no"),)
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    pack_id: Mapped[int] = mapped_column(sa.BigInteger)
+    version_no: Mapped[int] = mapped_column(sa.Integer)
+    skill_md: Mapped[str] = mapped_column(sa.Text)
+    bundle_meta: Mapped[Any] = mapped_column(sa.JSON, nullable=True)  # {files:[{path,size,sha256}]}
+    content_hash: Mapped[str] = mapped_column(sa.String(64))
+    storage_path: Mapped[str] = mapped_column(sa.String(512), default="")  # 相对 data_dir
+    created_by: Mapped[str] = mapped_column(sa.String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+
+
+class UserSkillPack(Base):
+    """员工个人库：启停系统包 / 自建 / 市场安装。"""
+
+    __tablename__ = "agent_user_skill"
+    __table_args__ = (
+        sa.UniqueConstraint("tenant_id", "oa", "pack_id", name="uk_user_skill_pack"),
+        sa.Index("ix_user_skill_oa", "tenant_id", "oa"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(sa.String(32), default=DEFAULT_TENANT)
+    oa: Mapped[str] = mapped_column(sa.String(64))
+    pack_id: Mapped[int] = mapped_column(sa.BigInteger)
+    enabled: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    origin: Mapped[str] = mapped_column(sa.String(16), default="created")  # system|created|market_install
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+
+class SkillMarketListing(Base):
+    """租户内 Skill 市场上架。"""
+
+    __tablename__ = "agent_skill_market_listing"
+    __table_args__ = (
+        sa.UniqueConstraint("tenant_id", "pack_id", name="uk_skill_market_pack"),
+        sa.Index("ix_skill_market_hot", "tenant_id", "status", "invoke_count"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(sa.String(32), default=DEFAULT_TENANT)
+    pack_id: Mapped[int] = mapped_column(sa.BigInteger)
+    publisher_oa: Mapped[str] = mapped_column(sa.String(64))
+    description: Mapped[str] = mapped_column(sa.String(1024), default="", server_default="")
+    status: Mapped[str] = mapped_column(sa.String(16), default="published")  # published|withdrawn
+    invoke_count: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+
 # ---------------- P5 配置版本 ----------------
 
 class AgentDefinition(Base):

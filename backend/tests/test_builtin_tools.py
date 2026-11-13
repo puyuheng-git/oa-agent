@@ -11,6 +11,7 @@ EXPECTED = {
     "sys.time": ("low", True), "sys.calc": ("low", True), "sys.export": ("medium", True),
     "sys.memory": ("medium", True), "sys.cron": ("high", False), "sys.http": ("high", False),
     "sys.web_search": ("high", False), "sys.fs_read": ("high", False), "sys.fs_write": ("high", False),
+    "sys.skill_exec": ("high", True), "sys.skill_create": ("medium", True),
 }
 
 
