@@ -33,7 +33,7 @@ from oa_agent.chat.threads import (
     soft_delete,
     thread_view,
 )
-from oa_agent.db.models import ConversationMessage, Run
+from oa_agent.db.models import ConversationMessage, ExportFile, Run
 from oa_agent.errors import AppError
 from oa_agent.runtime.run_service import TERMINAL
 from oa_agent.runtime_state import get_runtime
@@ -150,16 +150,114 @@ def _iso_utc(value) -> str | None:
     return value.isoformat()
 
 
+def _attachments_from_data(data) -> list[dict] | None:
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("attachments")
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        file_id = str(item.get("file_id") or "").strip()
+        if not file_id:
+            continue
+        out.append({
+            "file_id": file_id,
+            "filename": str(item.get("filename") or ""),
+            "size_bytes": int(item.get("size_bytes") or 0),
+            "media_kind": str(item.get("media_kind") or "") or None,
+        })
+    return out or None
+
+
 def _message_item(m: ConversationMessage) -> dict:
+    attachments = _attachments_from_data(m.data_json)
     return {
         "message_id": m.message_id,
         "role": m.role,
         "content": m.content,
         "reply_type": m.reply_type,
         "data": m.data_json,
+        "attachments": attachments,
         "error_code": m.error_code,
         "created_at": _iso_utc(m.created_at),
         "run_id": m.run_id,
+    }
+
+
+def _referenced_upload_ids(items: list[dict]) -> set[str]:
+    ids: set[str] = set()
+    for item in items:
+        for att in item.get("attachments") or []:
+            fid = str(att.get("file_id") or "").strip()
+            if fid:
+                ids.add(fid)
+    return ids
+
+
+def _orphan_upload_messages(
+    db,
+    *,
+    tenant_id: str,
+    thread_id: str,
+    oa: str,
+    referenced: set[str],
+) -> list[dict]:
+    rows = db.scalars(
+        sa.select(ExportFile).where(
+            ExportFile.tenant_id == tenant_id,
+            ExportFile.thread_id == thread_id,
+            ExportFile.oa == oa,
+            ExportFile.origin == "upload",
+            ExportFile.in_message.is_(True),
+        ).order_by(ExportFile.created_at.asc(), ExportFile.id.asc())
+    ).all()
+    out: list[dict] = []
+    for row in rows:
+        if row.file_id in referenced:
+            continue
+        att = {
+            "file_id": row.file_id,
+            "filename": row.filename,
+            "size_bytes": row.size_bytes,
+            "media_kind": row.media_kind,
+        }
+        out.append({
+            "message_id": f"att_{row.file_id}",
+            "role": "user",
+            "content": "",
+            "reply_type": None,
+            "data": {"attachments": [att]},
+            "attachments": [att],
+            "error_code": None,
+            "created_at": _iso_utc(row.created_at),
+            "run_id": row.run_id,
+        })
+    return out
+
+
+def _merge_messages_by_time(messages: list[dict], orphans: list[dict]) -> list[dict]:
+    if not orphans:
+        return messages
+
+    def key(item: dict):
+        return (item.get("created_at") or "", item.get("message_id") or "")
+
+    return sorted([*messages, *orphans], key=key)
+
+
+def _document_item(row: ExportFile) -> dict:
+    return {
+        "file_id": row.file_id,
+        "filename": row.filename,
+        "size_bytes": row.size_bytes,
+        "origin": row.origin,
+        "media_kind": row.media_kind,
+        "thread_id": row.thread_id,
+        "created_at": _iso_utc(row.created_at),
+        "ticket": row.ticket if row.origin == "export" else None,
     }
 
 
@@ -246,17 +344,26 @@ def list_thread_messages(
     with rt.session() as db:
         if get_owned(db, thread_id=thread_id, oa=auth.session.oa, tenant_id=rt.tenant_id) is None:
             raise AppError(404, "THREAD_NOT_FOUND", "会话不存在")
-        base = sa.select(ConversationMessage).where(
-            ConversationMessage.tenant_id == rt.tenant_id,
-            ConversationMessage.thread_id == thread_id,
-            ConversationMessage.oa == auth.session.oa,
-        )
-        total = db.scalar(sa.select(sa.func.count()).select_from(base.subquery())) or 0
         rows = db.scalars(
-            base.order_by(ConversationMessage.id.asc()).offset(offset).limit(page_size)
+            sa.select(ConversationMessage).where(
+                ConversationMessage.tenant_id == rt.tenant_id,
+                ConversationMessage.thread_id == thread_id,
+                ConversationMessage.oa == auth.session.oa,
+            ).order_by(ConversationMessage.id.asc())
         ).all()
+        items = [_message_item(m) for m in rows]
+        orphans = _orphan_upload_messages(
+            db,
+            tenant_id=rt.tenant_id,
+            thread_id=thread_id,
+            oa=auth.session.oa,
+            referenced=_referenced_upload_ids(items),
+        )
+        merged = _merge_messages_by_time(items, orphans)
+        total = len(merged)
+        page_items = merged[offset: offset + page_size]
     return {
-        "items": [_message_item(m) for m in rows],
+        "items": page_items,
         "page": page,
         "page_size": page_size,
         "total": int(total),
@@ -393,6 +500,97 @@ def download_owned_file(file_id: str, request: Request, auth: ChatAuth = Depends
         )
         filename = row.filename or "file"
         media = row.content_type or "application/octet-stream"
+    return Response(
+        content=data,
+        media_type=media,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+@router.get("/documents")
+def list_documents(
+    request: Request,
+    auth: ChatAuth = Depends(chat_auth),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    origin: Literal["upload", "export"] | None = None,
+):
+    """员工文档中心：本人已发送上传 + 导出文件。"""
+    rt = get_runtime(request)
+    F = ExportFile
+    cond = [
+        F.tenant_id == rt.tenant_id,
+        F.oa == auth.session.oa,
+    ]
+    if origin == "upload":
+        cond.append(F.origin == "upload")
+        cond.append(F.in_message.is_(True))
+    elif origin == "export":
+        cond.append(F.origin == "export")
+    else:
+        cond.append(
+            sa.or_(
+                F.origin == "export",
+                sa.and_(F.origin == "upload", F.in_message.is_(True)),
+            )
+        )
+    offset = (page - 1) * page_size
+    with rt.session() as db:
+        total = db.scalar(sa.select(sa.func.count()).select_from(F).where(*cond)) or 0
+        rows = db.scalars(
+            sa.select(F).where(*cond).order_by(F.created_at.desc(), F.id.desc()).offset(offset).limit(page_size)
+        ).all()
+    return {
+        "items": [_document_item(r) for r in rows],
+        "page": page,
+        "page_size": page_size,
+        "total": int(total),
+    }
+
+
+@router.get("/documents/{file_id}/download")
+def download_document(file_id: str, request: Request, auth: ChatAuth = Depends(chat_auth)):
+    """下载本人文档（上传或导出），非一次性消费。"""
+    from oa_agent.chat.attachment_files import read_owned
+    from oa_agent.executor.builtin_runtime import build_export_store
+    from oa_agent.executor.executor import ToolError
+
+    rt = get_runtime(request)
+    with rt.session() as db:
+        row = db.scalar(
+            sa.select(ExportFile).where(
+                ExportFile.tenant_id == rt.tenant_id,
+                ExportFile.file_id == file_id,
+                ExportFile.oa == auth.session.oa,
+            )
+        )
+        if row is None:
+            raise AppError(404, "NOT_FOUND", "文件不存在")
+        if row.origin == "upload":
+            if row.in_message is not True:
+                raise AppError(404, "NOT_FOUND", "文件不存在")
+            try:
+                _, data = read_owned(
+                    db,
+                    build_export_store(rt),
+                    tenant_id=rt.tenant_id,
+                    oa=auth.session.oa,
+                    file_id=file_id,
+                )
+            except AppError:
+                raise
+            filename = row.filename or "附件"
+            media = row.content_type or "application/octet-stream"
+        elif row.origin == "export":
+            store = build_export_store(rt)
+            try:
+                data = store.get(row.storage, row.object_key)
+            except ToolError:
+                raise AppError(404, "NOT_FOUND", "文件不存在") from None
+            filename = row.filename or "导出.xlsx"
+            media = row.content_type or "application/octet-stream"
+        else:
+            raise AppError(404, "NOT_FOUND", "文件不存在")
     return Response(
         content=data,
         media_type=media,
