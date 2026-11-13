@@ -163,6 +163,30 @@ export function resolveToolGuide(detail: ToolDetail | null): ToolGuide | null {
     }
   }
   const schema = detail.current_schema || {}
+  if (kind === 'open_oa_invoke') {
+    return {
+      kind: 'open_oa_invoke',
+      summary: detail.summary || String(schema.summary || ''),
+      runtime: 'OpenOaClient POST /agent/invoke',
+      how: '调用时由 ToolExecutor 以员工 token POST open-oa /agent/invoke，固定转发 invoke_service / invoke_method 到 Service ANew；身份由 open-oa 从 token 解析并强制本人。',
+      constraints: [
+        '模型不可改 service/method，不可伪造 oa',
+        '参数与返回字段以 catalog 契约为准，可再从清单覆盖导入',
+        '写操作须确认 + Idempotency-Key（高风险默认不启用）',
+      ],
+      http: {
+        method: 'POST',
+        path: (schema.path as string) || '/agent/invoke',
+        upstream: (schema.upstream as string) || 'open_oa',
+        timeout_seconds: schema.timeout_seconds as number | undefined,
+        invoke_service: (schema.invoke_service as string) || null,
+        invoke_method: (schema.invoke_method as string) || null,
+      },
+      model_params: (schema.model_params as ToolGuide['model_params']) || {},
+      result: (schema.result as Record<string, unknown>) || {},
+      edit_hint: '参数定义来自 open-oa catalog；请用「从 open-oa 清单导入」覆盖更新，或用启停开关。',
+    }
+  }
   return {
     kind: 'office',
     summary: detail.summary || String(schema.summary || ''),

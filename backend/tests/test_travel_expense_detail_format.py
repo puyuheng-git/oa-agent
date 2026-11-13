@@ -11,7 +11,7 @@ from oa_agent.executor.display_format import (
 )
 from oa_agent.executor.registry import ToolRegistry
 from oa_agent.runtime.graphs import oa_assistant as tq
-from tests.test_chat import DETAIL_URL, ROW, chat, office, open_chat, send  # noqa: F401
+from tests.test_chat import INVOKE_URL, ROW, chat, office, open_chat, send  # noqa: F401
 
 
 def test_format_travel_route_list_as_chinese_path():
@@ -50,7 +50,7 @@ def test_record_reply_body_not_markdown_bullets():
 
 
 def test_detail_query_chat_body_shows_human_fields(chat, office):
-    route = office.get(DETAIL_URL).mock(
+    route = office.post(INVOKE_URL).mock(
         return_value=httpx.Response(
             200,
             json={
@@ -82,7 +82,7 @@ def test_detail_query_chat_body_shows_human_fields(chat, office):
 
 
 def test_detail_missing_id_still_asks(chat, office):
-    route = office.get(DETAIL_URL)
+    route = office.post(INVOKE_URL)
     h = open_chat(chat)
     body = send(chat, h, "查看报销单的详情").json()
     assert body["run_status"] == "waiting_input"

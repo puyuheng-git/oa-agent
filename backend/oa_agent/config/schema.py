@@ -127,14 +127,14 @@ GROUPS: dict[str, GroupDef] = {
             "热生效",
             (
                 FieldDef("mint_base_url", "员工 token 签发地址", "url",
-                         help="OA 宿主页 / 企微入口换员工 Authorization 的 HTTP 基址（调用 /agent/token/mint）。"
-                              "与业务上游分离；未配置时兼容读取旧「office-api 主地址」。"),
+                         help="OA 宿主页 / 企微入口换员工 Authorization 的 HTTP 基址（open-oa /agent/token/mint）。"
+                              "与业务上游分离；未配置时兼容读取旧主地址字段。"),
                 FieldDef("upstreams", "业务上游地址", "upstreams", [],
-                         "认同同一员工 Authorization 的业务 HTTP 面（名称自定，勿写死域名）。"
+                         "认同同一员工 Authorization 的业务 HTTP 面（主面为 open-oa）。"
                          "每项标识 + 名称 + 基址；Tool 只引用标识与相对路径。"
                          "入口建权后可带 token 调用目录内上游上已声明的接口；各接口仍须 OA 侧业务授权。"),
-                FieldDef("default_upstream_key", "新建 Tool 默认上游", "str", "office",
-                         help="仅影响新建 Tool 的默认上游标识，无协议特权；须存在于上方列表中（有列表时）。"),
+                FieldDef("default_upstream_key", "新建 Tool 默认上游", "str", "open_oa",
+                         help="仅影响新建 Tool 的默认上游标识，无协议特权；须存在于上方列表中（有列表时）。建议 open_oa。"),
                 FieldDef("gateway_secret", "AGENT_GATEWAY_SECRET（mint 用）", "secret",
                          help="向签发入口换员工 token 时使用的网关密钥，须与 OA 侧配置一致。只写不读。"),
                 FieldDef("assertion_hmac_secret", "OA assertion HMAC 密钥", "secret",
@@ -215,7 +215,7 @@ GROUPS: dict[str, GroupDef] = {
                 _text("office_token_expired", "登录过期", "登录已过期，请重新打开 OA 助手页。",
                       "员工 token 失效（OA 端登出或过期）时给员工的提示"),
                 _text("office_api_not_configured", "助手未配置", "助手尚未完成配置，请联系管理员。",
-                      "未配置 office-api 地址时给员工的提示"),
+                      "未配置 open-oa 地址时给员工的提示"),
                 _text("upstream_not_configured", "查询地址未配置", "该查询功能尚未完成配置，请联系管理员。",
                       "Tool 指向的 office-api 地址不存在时给员工的提示"),
                 _text("invalid_argument", "查询条件有误", "查询条件有误：{message}",

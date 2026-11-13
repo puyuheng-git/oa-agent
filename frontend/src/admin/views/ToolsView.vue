@@ -26,7 +26,12 @@ const items = ref<ToolItem[]>([])
 const upstreams = ref<Upstream[]>([])
 const defaultUpstreamKey = ref('office')
 const kindFilter = ref<'' | ToolKind>('')
-const KIND_LABEL: Record<ToolKind, string> = { office: 'OA 接口', builtin: '内置', mcp: 'MCP' }
+const KIND_LABEL: Record<ToolKind, string> = {
+  office: 'OA 接口',
+  open_oa_invoke: 'open-oa 调用',
+  builtin: '内置',
+  mcp: 'MCP',
+}
 const loading = ref(false)
 const loadError = ref('')
 const syncing = ref(false)
@@ -223,6 +228,87 @@ function useDraft(d: ApipostDraft) {
   editor.value = true
 }
 
+// ---- 从 open-oa 清单导入（勾选后直接落库为 open_oa_invoke） ----
+interface OpenOaCatalogItem {
+  service: string
+  method: string
+  op?: string
+  risk?: string
+  tool_name?: string
+  summary?: string
+}
+const openOaDialog = ref(false)
+const openOaLoading = ref(false)
+const openOaImporting = ref(false)
+const openOaItems = ref<OpenOaCatalogItem[]>([])
+const openOaSelected = ref<OpenOaCatalogItem[]>([])
+const openOaErrors = ref<string[]>([])
+const openOaLoadError = ref('')
+const openOaReason = ref('')
+
+async function openOpenOaImporter() {
+  openOaDialog.value = true
+  openOaItems.value = []
+  openOaSelected.value = []
+  openOaErrors.value = []
+  openOaLoadError.value = ''
+  openOaReason.value = ''
+  openOaLoading.value = true
+  try {
+    const r = await http.get<{ items: OpenOaCatalogItem[] }>('/v1/admin/tools/import/open-oa-catalog')
+    openOaItems.value = Array.isArray(r.items) ? r.items : []
+    if (!openOaItems.value.length) openOaLoadError.value = '清单为空：请确认 Service 已注册 Export 且 open-oa 可访问'
+  } catch (e) {
+    openOaLoadError.value = errorMessage(e)
+  } finally {
+    openOaLoading.value = false
+  }
+}
+
+function openOaRowKey(row: OpenOaCatalogItem) {
+  return `${row.service}::${row.method}`
+}
+
+function onOpenOaSelectionChange(rows: OpenOaCatalogItem[]) {
+  openOaSelected.value = rows
+}
+
+async function runOpenOaImport() {
+  if (!openOaSelected.value.length) {
+    ElMessage.warning('请先勾选要导入的条目')
+    return
+  }
+  const reasonText = openOaReason.value.trim() || `从 open-oa 清单导入 ${openOaSelected.value.length} 项`
+  if (reasonText.length < 2) {
+    ElMessage.warning('原因至少 2 个字')
+    return
+  }
+  openOaImporting.value = true
+  openOaErrors.value = []
+  try {
+    const r = await http.post<{ imported: { name: string; result: string; version_no?: number }[]; errors: string[] }>(
+      '/v1/admin/tools/import/open-oa-catalog',
+      {
+        reason: reasonText,
+        items: openOaSelected.value.map((i) => ({ service: i.service, method: i.method })),
+      },
+    )
+    openOaErrors.value = r.errors || []
+    const n = r.imported?.length || 0
+    if (n) ElMessage.success(`已导入 ${n} 个 Tool`)
+    if (r.errors?.length) ElMessage.warning(`${r.errors.length} 条失败，见对话框列表`)
+    if (n) {
+      openOaDialog.value = false
+      kindFilter.value = 'open_oa_invoke'
+      await load()
+    }
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    openOaImporting.value = false
+  }
+}
+
 async function createSkill(draft: SkillDraft, toolName: string) {
   try {
     await http.post('/v1/admin/skills', { ...draft, tools: [toolName], reason: reason.value.trim() })
@@ -238,6 +324,9 @@ function isOfficeTool(tool: { kind?: string | null } | null | undefined): boolea
 
 function editBlockedReason(tool: { kind?: string | null; current_schema?: unknown } | null): string | null {
   if (!tool) return 'Tool 不存在'
+  if (tool.kind === 'open_oa_invoke') {
+    return 'open-oa 调用 Tool 的契约来自清单；请用「从 open-oa 清单导入」覆盖更新，或用启停开关。'
+  }
   if (!isOfficeTool(tool)) {
     if (tool.kind === 'builtin') {
       return '内置 Tool 由系统提供，不能用此表单改路径/参数；请用列表里的启停开关。'
@@ -307,13 +396,16 @@ onMounted(load)
       type="info"
       :closable="false"
       show-icon
-      title="「编辑」只适用于 OA 接口 Tool（路径/参数/返回字段）。内置与 MCP Tool 没有这套版本定义：请用启停开关；MCP 定义请到「MCP 连接」页同步。保存时兼容变更立即生效，不兼容变更需激活。员工身份由服务端注入。"
+      title="「编辑」只适用于 OA 接口 Tool（路径/参数/返回字段）。open-oa 调用请用「从 open-oa 清单导入」覆盖；内置与 MCP 用启停；MCP 定义到「MCP 连接」同步。保存时兼容变更立即生效，不兼容变更需激活。员工身份由服务端注入。"
       style="margin-bottom: 12px"
     />
     <div style="margin-bottom: 12px">
       <el-button type="primary" @click="create">新建 Tool</el-button>
       <el-tooltip content="粘贴 Apipost 接口文档分享链接，自动生成 Tool 草稿（检查后再保存）">
         <el-button @click="openImporter">从 Apipost 导入</el-button>
+      </el-tooltip>
+      <el-tooltip content="从 open-oa export-catalog 勾选导入为 open_oa_invoke Tool（直接落库）">
+        <el-button @click="openOpenOaImporter">从 open-oa 清单导入</el-button>
       </el-tooltip>
       <el-tooltip content="从仓库 openapi/*.yaml 批量导入；同名 Tool 会被文件中的定义覆盖（按版本规则）">
         <el-button :loading="syncing" @click="sync">从文件导入</el-button>
@@ -322,6 +414,7 @@ onMounted(load)
       <el-radio-group v-model="kindFilter" style="margin-left: 12px" @change="load">
         <el-radio-button value="">全部</el-radio-button>
         <el-radio-button value="office">OA 接口</el-radio-button>
+        <el-radio-button value="open_oa_invoke">open-oa 调用</el-radio-button>
         <el-radio-button value="builtin">内置</el-radio-button>
         <el-radio-button value="mcp">MCP</el-radio-button>
       </el-radio-group>
@@ -601,6 +694,57 @@ onMounted(load)
       </template>
     </el-dialog>
 
+    <el-dialog v-model="openOaDialog" title="从 open-oa 清单导入" width="860px" :close-on-click-modal="false">
+      <div class="hint" style="margin-bottom: 8px">
+        拉取 open-oa <code>GET /agent/export-catalog</code>，勾选后导入为 <code>open_oa_invoke</code> Tool（直接落库并按版本规则覆盖同名）。需已配置 mint_base_url 与 AGENT_GATEWAY_SECRET。
+      </div>
+      <el-form label-width="80px" style="margin-bottom: 8px">
+        <el-form-item label="原因">
+          <el-input v-model="openOaReason" placeholder="写入审计，缺省为「从 open-oa 清单导入 N 项」" maxlength="200" show-word-limit />
+        </el-form-item>
+      </el-form>
+      <el-alert v-if="openOaLoadError" type="error" :closable="false" :title="openOaLoadError" style="margin-bottom: 8px" />
+      <el-alert v-for="(e, i) in openOaErrors" :key="`oe${i}`" type="error" :closable="false" :title="e" style="margin-bottom: 6px" />
+      <el-table
+        v-loading="openOaLoading"
+        :data="openOaItems"
+        size="small"
+        border
+        max-height="420"
+        :row-key="openOaRowKey"
+        @selection-change="onOpenOaSelectionChange"
+      >
+        <el-table-column type="selection" width="42" :reserve-selection="false" />
+        <el-table-column label="Tool 名" min-width="180">
+          <template #default="{ row }"><code>{{ row.tool_name || '—' }}</code></template>
+        </el-table-column>
+        <el-table-column label="service" min-width="200" show-overflow-tooltip>
+          <template #default="{ row }"><code>{{ row.service }}</code></template>
+        </el-table-column>
+        <el-table-column label="method" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }"><code>{{ row.method }}</code></template>
+        </el-table-column>
+        <el-table-column label="op" width="70">
+          <template #default="{ row }">{{ row.op || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="风险" width="70">
+          <template #default="{ row }">{{ row.risk || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="说明" min-width="160" show-overflow-tooltip prop="summary" />
+      </el-table>
+      <div class="hint" style="margin-top: 8px">已选 {{ openOaSelected.length }} / {{ openOaItems.length }}</div>
+      <template #footer>
+        <el-button :loading="openOaLoading" @click="openOpenOaImporter">重新拉取</el-button>
+        <el-button @click="openOaDialog = false">关闭</el-button>
+        <el-button
+          type="primary"
+          :loading="openOaImporting"
+          :disabled="!openOaSelected.length || openOaLoading"
+          @click="runOpenOaImport"
+        >导入所选</el-button>
+      </template>
+    </el-dialog>
+
     <el-drawer v-model="drawer" :title="detail?.name || 'Tool'" size="720px">
       <el-skeleton v-if="!detail" :rows="6" />
       <template v-else>
@@ -642,6 +786,12 @@ onMounted(load)
               <dd>
                 <code>{{ guide.http.method || '—' }} {{ guide.http.path || '—' }}</code>
                 <span v-if="guide.http.upstream" class="muted">· 上游 {{ guide.http.upstream }}</span>
+              </dd>
+            </div>
+            <div v-if="guide.http?.invoke_service">
+              <dt>ANew</dt>
+              <dd>
+                <code>{{ guide.http.invoke_service }}.{{ guide.http.invoke_method || '—' }}</code>
               </dd>
             </div>
             <div v-if="guide.risk_level"><dt>风险等级</dt><dd>{{ guide.risk_level }}</dd></div>

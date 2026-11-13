@@ -31,8 +31,8 @@ class ToolSpec:
     result_labels: dict = field(default_factory=dict)
     list_columns: tuple[str, ...] = ()
     identity_params: dict = field(default_factory=dict)  # 普通查询参数名 → 身份字段，由服务端注入
-    upstream: str = "office"  # office-api 地址标识（「OA 对接」中配置）
-    kind: str = "office"  # office | builtin | mcp：Executor 据此分派
+    upstream: str = "open_oa"  # 业务上游标识（连接配置；主面为 open-oa）
+    kind: str = "office"  # office | open_oa_invoke | builtin | mcp：Executor 据此分派
     builtin_id: str | None = None
     mcp_server_id: int | None = None
     mcp_tool_name: str | None = None
@@ -41,6 +41,9 @@ class ToolSpec:
     identity_bindings: tuple[dict, ...] = ()
     # 响应信封：oa_office（现网 code/msg/data）| raw_json（整段 JSON 即 data）；实际解析以 Connector 配置为准
     envelope_profile: str = "oa_office"
+    # open_oa_invoke：固定转发到 /agent/invoke 的 ANew 目标（模型不可改）
+    invoke_service: str = ""
+    invoke_method: str = ""
 
     def label(self, key: str) -> str:
         return self.result_labels.get(key) or key
@@ -69,10 +72,12 @@ class ToolRegistry:
             for name, spec in ops.items():
                 if not spec["spec_enabled"] or spec["risk_level"] != "low" or spec["requires_confirmation"]:
                     continue
-                if registration_blockers(_FileTool(), True, spec["method"]):
-                    continue
                 schema = schema_part(spec)
-                tools[name] = to_tool_spec(schema, spec_version, 1, canonical_hash(schema))
+                kind = "open_oa_invoke" if schema.get("invoke_service") and schema.get("invoke_method") else "office"
+                tool_row = _FileTool(kind=kind)
+                if registration_blockers(tool_row, True, spec["method"], schema=schema):
+                    continue
+                tools[name] = to_tool_spec(schema, spec_version, 1, canonical_hash(schema), kind=kind)
         return cls(tools)
 
 
@@ -80,3 +85,10 @@ class _FileTool:
     enabled = spec_enabled = True
     risk_level = "low"
     requires_confirmation = False
+    kind = "office"
+    builtin_id = None
+    mcp_server_id = None
+    mcp_tool_name = None
+
+    def __init__(self, *, kind: str = "office"):
+        self.kind = kind

@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from oa_agent.db.models import Skill, SkillVersion, Tool, ToolVersion
 from oa_agent.db.types import utcnow
-from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, UPSTREAM_KEY_RE
+from oa_agent.integrations.open_oa import DEFAULT_UPSTREAM, INVOKE_PATH, LEGACY_UPSTREAM, UPSTREAM_KEY_RE
 from oa_agent.executor.builtin_catalog import (
     TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_model_params, ensure_builtin_tools,
 )
@@ -230,6 +230,87 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
         spec["identity_bindings"] = bindings
     if upstream != DEFAULT_UPSTREAM:  # 默认值不写入，已有版本的哈希保持不变
         spec["upstream"] = upstream
+    inv_s = str(xa.get("invoke_service") or "").strip()
+    inv_m = str(xa.get("invoke_method") or "").strip()
+    if inv_s or inv_m:
+        if not inv_s or not inv_m:
+            errors.append(f"{name}.invoke_service / invoke_method 须成对出现")
+        else:
+            spec["invoke_service"] = inv_s
+            spec["invoke_method"] = inv_m
+            spec["path"] = INVOKE_PATH
+            if method.upper() != "POST":
+                errors.append(f"{name} 声明 invoke_* 时 method 须为 POST")
+    return spec, errors
+
+
+def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
+    """open-oa export-catalog 单条 → Tool 规范化 schema（kind 由调用方写入 Tool 行）。"""
+    from oa_agent.integrations.open_oa import INVOKE_PATH
+
+    errors: list[str] = []
+    if not isinstance(item, dict):
+        return {}, ["catalog 条目必须是对象"]
+    service = str(item.get("service") or "").strip()
+    method = str(item.get("method") or "").strip()
+    if not service or not method:
+        errors.append("catalog 条目缺少 service / method")
+    name = str(item.get("tool_name") or "").strip()
+    if not name:
+        raw = re.sub(r"[^a-z0-9]+", "_", f"{service}_{method}".lower()).strip("_")
+        name = raw[:64] if raw else ""
+    if not NAME_RE.match(name):
+        errors.append(f"无法从 {service}.{method} 生成合法 Tool 名")
+    model_params: dict = {}
+    for raw in item.get("params") or []:
+        if not isinstance(raw, dict):
+            errors.append(f"{name}.params 项必须是对象")
+            continue
+        pname = str(raw.get("name") or "").strip()
+        if not pname or not FIELD_RE.match(pname):
+            errors.append(f"{name}.params 含无效字段名")
+            continue
+        rule: dict[str, Any] = {
+            "type": raw.get("type") or "string",
+            "label": raw.get("label") or pname,
+            "required": bool(raw.get("required")),
+        }
+        for key in ("format", "enum", "minimum", "maximum", "default", "description", "enum_labels"):
+            if raw.get(key) not in (None, "", [], {}):
+                rule[key] = raw[key]
+        model_params[pname] = rule
+    returns = item.get("returns") if isinstance(item.get("returns"), dict) else {}
+    risk = str(item.get("risk") or "low")
+    op_kind = str(item.get("op") or "read")
+    requires_confirmation = op_kind == "write" or risk != "low"
+    xa = {
+        "enabled": True,
+        "description": str(item.get("summary") or "")[:MAX_TEXT],
+        "upstream": DEFAULT_UPSTREAM,
+        "risk_level": risk if risk in RISK_LEVELS else "low",
+        "requires_confirmation": requires_confirmation,
+        "timeout_seconds": 10,
+        "inject_identity_fields": [],
+        "model_params": model_params,
+        "result": {
+            "kind": returns.get("kind") or "object",
+            "fields": list(returns.get("fields") or []),
+            "labels": dict(returns.get("labels") or {}),
+            "list_columns": list(returns.get("list_columns") or []),
+        },
+    }
+    if risk not in RISK_LEVELS:
+        errors.append(f"{name}.risk 取值无效")
+    spec, errs = normalize_operation(
+        INVOKE_PATH, "POST",
+        {"operationId": name, "summary": str(item.get("summary") or name)[:255], "x-agent": xa},
+    )
+    errors += errs
+    if spec:
+        spec["invoke_service"] = service
+        spec["invoke_method"] = method
+        if item.get("extensions") is not None:
+            spec["extensions"] = item.get("extensions")
     return spec, errors
 
 
@@ -435,15 +516,16 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
                  builtin_id: str | None = None, mcp_server_id: int | None = None,
                  mcp_tool_name: str | None = None, sandbox_policy: dict | None = None) -> ToolSpec:
     result = schema["result"]
-    text_result = (kind or "office") != "office"  # mcp / builtin：结果统一为围栏文本 {"text": ...}
     inject = tuple(schema.get("inject_identity_fields") or ())
     raw_bindings = schema.get("identity_bindings")
     if raw_bindings:
         bindings = tuple(dict(b) for b in raw_bindings if isinstance(b, dict))
     else:
         bindings = tuple(synthesize_identity_bindings(inject))
+    effective_kind = kind or "office"
+    text_result = effective_kind in ("mcp", "builtin")  # open_oa_invoke 与 office 一样返回结构化 data
     return ToolSpec(
-        kind=kind or "office",
+        kind=effective_kind,
         builtin_id=builtin_id,
         mcp_server_id=mcp_server_id,
         mcp_tool_name=mcp_tool_name,
@@ -461,18 +543,21 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
         requires_confirmation=schema["requires_confirmation"],
         timeout_seconds=float(schema["timeout_seconds"]),
         inject_identity_fields=inject,
-        top_level_fields=tuple(schema["top_level_fields"]),
+        top_level_fields=tuple(schema.get("top_level_fields") or ()),
         query_params_field=schema.get("query_params_field"),
         identity_params=dict(schema.get("identity_params") or {}),
         upstream=schema.get("upstream") or DEFAULT_UPSTREAM,
-        model_params=dict(schema["model_params"]),
+        model_params=dict(schema.get("model_params") or {}),
         result_kind=TEXT_RESULT_KIND if text_result else schema["result"]["kind"],
         result_fields=TEXT_RESULT_FIELDS if text_result else tuple(schema["result"]["fields"]),
         identity_bindings=bindings,
+        invoke_service=str(schema.get("invoke_service") or ""),
+        invoke_method=str(schema.get("invoke_method") or ""),
     )
 
 
-TOOL_KINDS = ("office", "builtin", "mcp")
+TOOL_KINDS = ("office", "open_oa_invoke", "builtin", "mcp")
+HTTP_TOOL_KINDS = frozenset({"office", "open_oa_invoke"})
 
 
 def _extension_tool_spec(tool: Tool) -> ToolSpec:
@@ -487,11 +572,12 @@ def _extension_tool_spec(tool: Tool) -> ToolSpec:
         mcp_tool_name=tool.mcp_tool_name, sandbox_policy=dict(tool.sandbox_policy_json or {}))
 
 
-def registration_blockers(tool: Tool, has_version: bool, method: str | None = None) -> list[str]:
+def registration_blockers(tool: Tool, has_version: bool, method: str | None = None,
+                          *, schema: dict | None = None) -> list[str]:
     kind = getattr(tool, "kind", None) or "office"
     if kind not in TOOL_KINDS:
         return [f"未知 Tool 类型：{kind}"]
-    if kind != "office":
+    if kind not in HTTP_TOOL_KINDS:
         reasons = []
         if not tool.enabled:
             reasons.append("管理员已停用")
@@ -509,9 +595,16 @@ def registration_blockers(tool: Tool, has_version: bool, method: str | None = No
     if not tool.spec_enabled:
         reasons.append("规范未启用（x-agent.enabled 不为 true 或已从规范移除）")
     if tool.risk_level != "low" or tool.requires_confirmation:
-        reasons.append("非低风险或需员工确认（一期只开放低风险只读，确认流待 OA 写操作 API）")
-    if method and method.upper() != "GET":
-        reasons.append("一期只执行 GET 只读接口")
+        reasons.append("非低风险或需员工确认（写操作须确认流程）")
+    if kind == "office" and method and method.upper() != "GET":
+        reasons.append("office 类型一期只执行 GET 只读接口")
+    if kind == "open_oa_invoke":
+        if method and method.upper() != "POST":
+            reasons.append("open_oa_invoke 须为 POST /agent/invoke")
+        inv_s = str((schema or {}).get("invoke_service") or "").strip()
+        inv_m = str((schema or {}).get("invoke_method") or "").strip()
+        if not inv_s or not inv_m:
+            reasons.append("open_oa_invoke 缺少 invoke_service / invoke_method")
     if not has_version:
         reasons.append("没有有效版本")
     return reasons
@@ -585,6 +678,10 @@ class Catalog:
         current = db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
         pending = db.get(ToolVersion, tool.pending_version_id) if tool.pending_version_id else None
         tool.source_file, tool.summary, tool.spec_enabled = source, spec["summary"], spec["spec_enabled"]
+        # schema 含 invoke_service/method → open_oa_invoke；否则保持既有 kind（勿把 builtin/mcp 冲掉）
+        if spec.get("invoke_service") and spec.get("invoke_method"):
+            if (tool.kind or "office") in ("office", "open_oa_invoke", None, ""):
+                tool.kind = "open_oa_invoke"
         tool.last_sync_at, tool.last_sync_error = now, None
         level, diff = compare(current.schema_json if current else None, schema)
         if level == UNCHANGED:
@@ -715,9 +812,21 @@ class Catalog:
         for tool in db.scalars(sa.select(Tool).where(Tool.tenant_id == self.tenant).order_by(Tool.name)):
             for vid in {tool.current_version_id, tool.pending_version_id} - {None}:
                 upstream = (db.get(ToolVersion, vid).schema_json or {}).get("upstream", DEFAULT_UPSTREAM)
-                if upstream not in keep:
-                    used.append(f"{tool.name}（{upstream}）")
+                if self._upstream_kept(upstream, keep):
+                    continue
+                used.append(f"{tool.name}（{upstream}）")
         return list(dict.fromkeys(used))
+
+    @staticmethod
+    def _upstream_kept(upstream: str, keep: set[str]) -> bool:
+        if upstream in keep:
+            return True
+        # open_oa ↔ office 迁移期互认，避免改默认上游标识时误拦配置保存
+        if upstream == DEFAULT_UPSTREAM and LEGACY_UPSTREAM in keep:
+            return True
+        if upstream == LEGACY_UPSTREAM and DEFAULT_UPSTREAM in keep:
+            return True
+        return False
 
     # ---- 运行时 ----
     def load_registry(self, db: Session) -> ToolRegistry:
@@ -727,8 +836,11 @@ class Catalog:
             .where(Tool.tenant_id == self.tenant)).all()
         for tool, version in rows:
             kind = tool.kind or "office"
-            if kind == "office":
-                if version is None or registration_blockers(tool, True, version.schema_json.get("method")):
+            if kind in HTTP_TOOL_KINDS:
+                if version is None:
+                    continue
+                schema = version.schema_json or {}
+                if registration_blockers(tool, True, schema.get("method"), schema=schema):
                     continue
             elif registration_blockers(tool, version is not None):
                 continue

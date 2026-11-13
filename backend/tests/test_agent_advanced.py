@@ -12,7 +12,7 @@ from oa_agent.runtime.graphs import travel_query as tq
 from oa_agent.runtime.llm import ReplyStream
 from tests.test_agent_chat import CFG, ScriptedModel, use_model
 from tests.test_chat import (  # noqa: F401
-    DETAIL_URL, LIST_URL, ROW, chat, office, open_chat, run_and_events, runtime, send,
+    INVOKE_URL, ROW, chat, office, open_chat, run_and_events, runtime, send,
 )
 from tests.workflow_helpers import WF, publish_config
 
@@ -146,7 +146,7 @@ def test_sse_streams_chat_reply(chat, office, monkeypatch):
 
 
 def test_sse_tool_reply_sent_once_without_model_json(chat, office, monkeypatch):
-    office.get(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": [ROW], "total": 1}}))
+    office.post(INVOKE_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": [ROW], "total": 1}}))
     use_streaming(monkeypatch, [{"action": "tool", "tool": "query_my_travel_expense_list", "args": {}}])
     events = send_stream(chat, open_chat(chat), "我的报销")
     deltas = [d["text"] for e, d in events if e == "delta"]
@@ -178,9 +178,9 @@ CHAIN = {"action": "tool", "steps": [
 
 
 def test_chain_resolves_ref_on_server(chat, office, monkeypatch):
-    office.get(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {
+    office.post(INVOKE_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {
         "list": [{**ROW, "id": 205}], "total": 9}}))
-    detail = office.get(DETAIL_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {
+    detail = office.post(INVOKE_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {
         "info": {**ROW, "id": 205}}}))
     model = use_model(monkeypatch, [CHAIN])
     body = send(chat, open_chat(chat), "我最近一笔报销的详情").json()
@@ -199,8 +199,8 @@ def test_chain_resolves_ref_on_server(chat, office, monkeypatch):
 
 
 def test_chain_stops_when_ref_has_no_value(chat, office, monkeypatch):
-    office.get(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}}))
-    detail = office.get(DETAIL_URL)
+    office.post(INVOKE_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}}))
+    detail = office.post(INVOKE_URL)
     use_model(monkeypatch, [CHAIN])
     body = send(chat, open_chat(chat), "我最近一笔报销的详情").json()
     assert body["run_status"] == "succeeded" and not detail.called

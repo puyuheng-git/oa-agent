@@ -10,7 +10,13 @@ from datetime import date
 
 from oa_agent.connectors.base import ConnectorError
 from oa_agent.connectors.hub import ConnectorHub
-from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, OfficeApiClient, OfficeApiError
+from oa_agent.integrations.open_oa import (
+    DEFAULT_UPSTREAM,
+    INVOKE_PATH,
+    LEGACY_UPSTREAM,
+    OfficeApiClient,
+    OfficeApiError,
+)
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.events import RunRecorder
 
@@ -69,12 +75,13 @@ def authorization_for(
     entry = (identity.credentials or {}).get(cid)
     if isinstance(entry, dict) and entry.get("authorization"):
         return str(entry["authorization"])
-    if cid == DEFAULT_UPSTREAM or allow_office_fallback:
+    if cid == DEFAULT_UPSTREAM or cid == LEGACY_UPSTREAM or allow_office_fallback:
         if identity.authorization:
             return identity.authorization
-        office = (identity.credentials or {}).get(DEFAULT_UPSTREAM)
-        if isinstance(office, dict) and office.get("authorization"):
-            return str(office["authorization"])
+        for key in (DEFAULT_UPSTREAM, LEGACY_UPSTREAM):
+            office = (identity.credentials or {}).get(key)
+            if isinstance(office, dict) and office.get("authorization"):
+                return str(office["authorization"])
     raise ToolError("CONNECTOR_CREDENTIAL_MISSING", f"会话缺少连接器凭证：{cid}")
 
 
@@ -295,6 +302,91 @@ class ToolExecutor:
         return {"ok": True, "capability": name, "data": {"text": text, "truncated": bool(raw.get("truncated"))},
                 "message": ""}
 
+    def _resolve_client(self, upstream: str | None):
+        connector = self.hub.get(upstream) if self.hub is not None else None
+        client = None if connector is not None else self.clients.get(upstream or "")
+        if client is None and connector is None:
+            alt = LEGACY_UPSTREAM if (upstream or "") == DEFAULT_UPSTREAM else (
+                DEFAULT_UPSTREAM if (upstream or "") == LEGACY_UPSTREAM else None
+            )
+            if alt:
+                client = self.clients.get(alt)
+        return connector, client
+
+    def _execute_open_oa_invoke(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder,
+                                node_name: str) -> dict:
+        """kind=open_oa_invoke：POST /agent/invoke，body 含固定 service/method + 已校验 args。"""
+        clean, dropped = validate_args(spec, args)
+        for key in list(clean):
+            if key in MCP_DROPPED_ARGS or key in _bound_param_names(spec):
+                clean.pop(key, None)
+        connector_id = spec.upstream or DEFAULT_UPSTREAM
+        service = (spec.invoke_service or "").strip()
+        method = (spec.invoke_method or "").strip()
+        if not service or not method:
+            raise ToolError("TOOL_NOT_AVAILABLE", f"open_oa_invoke 未配置 service/method：{spec.name}",
+                            user_message=MSG_NOT_AVAILABLE)
+        rec.tool_call_count += 1
+        rec.event(
+            "tool_call_start", node_name=node_name, tool_name=spec.name, tool_version=spec.version,
+            input_summary=clean,
+            metadata={
+                "path": spec.path or INVOKE_PATH, "upstream": spec.upstream, "connector_id": connector_id,
+                "kind": "open_oa_invoke", "invoke_service": service, "invoke_method": method,
+                **({"dropped_fields": dropped} if dropped else {}),
+            },
+        )
+        started = time.perf_counter()
+        body = {"service": service, "method": method, "args": clean}
+        try:
+            connector, client = self._resolve_client(spec.upstream)
+            if connector is None and client is None:
+                raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 open-oa 地址：{spec.upstream}")
+            share_office = client is not None or bool(getattr(connector, "shares_employee_token", False))
+            auth = authorization_for(identity, connector_id, allow_office_fallback=share_office)
+            path = (spec.path or INVOKE_PATH).strip() or INVOKE_PATH
+            idem = None
+            if (spec.risk_level or "low") != "low" or spec.requires_confirmation:
+                # 写路径幂等键由上层确认流注入；此处预留 header 位（Task 7）
+                idem = (args or {}).get("_idempotency_key") or None
+                if isinstance(idem, str):
+                    idem = idem.strip() or None
+                else:
+                    idem = None
+            if connector is not None:
+                resp = connector.invoke(
+                    "POST", path, params=None, json_body=body, authorization=auth,
+                    timeout=spec.timeout_seconds, idempotency_key=idem,
+                )
+            else:
+                resp = client.post(path, body, auth, timeout=spec.timeout_seconds, idempotency_key=idem)
+            result = compact(spec, resp.data, clean, self.remark_limit)
+        except (OfficeApiError, ConnectorError, ToolError) as exc:
+            rec.event(
+                "tool_call_end", node_name=node_name, tool_name=spec.name, tool_version=spec.version,
+                status="error", duration_ms=int((time.perf_counter() - started) * 1000),
+                error_code=exc.code, error_summary=exc.message,
+                metadata={"http_status": getattr(exc, "http_status", None), "connector_id": connector_id,
+                          "kind": "open_oa_invoke"},
+            )
+            raise ToolError(exc.code, exc.message, getattr(exc, "http_status", None),
+                            getattr(exc, "user_message", "")) from exc
+        count = len(result.get("list", [])) if spec.result_kind == "list" else (1 if result else 0)
+        summary = {"result_count": count, "total": result.get("total")}
+        rec.event(
+            "tool_call_end", node_name=node_name, tool_name=spec.name, tool_version=spec.version, status="ok",
+            duration_ms=resp.duration_ms,
+            output_summary={**summary, "message": resp.message} if resp.message else summary,
+            metadata={"http_status": resp.http_status, "connector_id": connector_id, "kind": "open_oa_invoke"},
+        )
+        out: dict = {"ok": True, "capability": spec.name, "data": result, "message": resp.message}
+        if spec.result_kind == "object" and result:
+            from oa_agent.executor.display_format import record_human_summary
+
+            title = (spec.summary or spec.name or "").strip() or spec.name
+            out["human_summary"] = record_human_summary(spec, title, result)
+        return out
+
     def execute(self, name: str, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
         spec = self.registry.get(name)
         if spec is None:
@@ -303,6 +395,8 @@ class ToolExecutor:
             return self._execute_mcp(spec, args, identity, rec, node_name)
         if spec.kind == "builtin":
             return self._execute_builtin(spec, args, identity, rec, node_name)
+        if spec.kind == "open_oa_invoke":
+            return self._execute_open_oa_invoke(spec, args, identity, rec, node_name)
         clean, dropped = validate_args(spec, args)
         connector_id = spec.upstream or DEFAULT_UPSTREAM
         rec.tool_call_count += 1
@@ -313,10 +407,9 @@ class ToolExecutor:
         started = time.perf_counter()
         try:
             params = build_request(spec, clean, identity)
-            connector = self.hub.get(spec.upstream) if self.hub is not None else None
-            client = None if connector is not None else self.clients.get(spec.upstream)
+            connector, client = self._resolve_client(spec.upstream)
             if connector is None and client is None:
-                raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 office-api 地址：{spec.upstream}")
+                raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 open-oa 地址：{spec.upstream}")
             # OA upstreams 目录 peer 共享 mint 员工票；其它 connector（如 raw_json demo）须显式凭证
             share_office = client is not None or bool(
                 getattr(connector, "shares_employee_token", False)
