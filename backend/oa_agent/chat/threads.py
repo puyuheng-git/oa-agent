@@ -82,6 +82,72 @@ def create_thread(
     return ensure_thread(db, thread_id=new_thread_id(), oa=oa, channel=channel, tenant_id=tenant_id)
 
 
+def _active_threads(*, oa: str, tenant_id: str):
+    return sa.select(ChatThread).where(
+        ChatThread.tenant_id == tenant_id,
+        ChatThread.oa == oa,
+        ChatThread.status == STATUS_ACTIVE,
+    )
+
+
+def soft_delete_other_empty_threads(
+    db: Session,
+    *,
+    oa: str,
+    keep_thread_id: str,
+    tenant_id: str = DEFAULT_TENANT,
+) -> int:
+    """进入助手时回收其它空白会话，避免每次打开都堆积「新会话」。"""
+    rows = db.scalars(
+        _active_threads(oa=oa, tenant_id=tenant_id).where(
+            ChatThread.last_message_at.is_(None),
+            ChatThread.thread_id != keep_thread_id,
+        )
+    ).all()
+    for row in rows:
+        soft_delete(db, row)
+    return len(rows)
+
+
+def pick_entry_thread(
+    db: Session,
+    *,
+    oa: str,
+    channel: str,
+    tenant_id: str = DEFAULT_TENANT,
+) -> ChatThread:
+    """进入助手默认会话：优先最近有消息的；没有则复用空白；都没有才新建。
+
+    有历史消息时会清掉其它空白会话，避免每次进入都停在底部「新会话」。
+    """
+    latest = db.scalar(
+        _active_threads(oa=oa, tenant_id=tenant_id)
+        .where(ChatThread.last_message_at.is_not(None))
+        .order_by(ChatThread.last_message_at.desc(), ChatThread.updated_at.desc(), ChatThread.id.desc())
+        .limit(1)
+    )
+    if latest is not None:
+        # keep=latest → 清空全部空白会话
+        soft_delete_other_empty_threads(
+            db, oa=oa, keep_thread_id=latest.thread_id, tenant_id=tenant_id,
+        )
+        return latest
+
+    empty = db.scalar(
+        _active_threads(oa=oa, tenant_id=tenant_id)
+        .where(ChatThread.last_message_at.is_(None))
+        .order_by(ChatThread.updated_at.desc(), ChatThread.id.desc())
+        .limit(1)
+    )
+    if empty is not None:
+        soft_delete_other_empty_threads(
+            db, oa=oa, keep_thread_id=empty.thread_id, tenant_id=tenant_id,
+        )
+        return empty
+
+    return ensure_thread(db, thread_id=new_thread_id(), oa=oa, channel=channel, tenant_id=tenant_id)
+
+
 def get_owned(
     db: Session,
     *,

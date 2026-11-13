@@ -54,6 +54,8 @@ def extract_upload(filename: str, data: bytes) -> Extracted:
         return _extract_image(data)
     if extension == "csv":
         return _extract_csv(data)
+    if extension == "txt":
+        return _extract_plain_text(data)
     if extension in {"md", "markdown"}:
         return _extract_markdown(data)
     if extension == "xlsx":
@@ -263,6 +265,21 @@ def _extract_csv(data: bytes) -> Extracted:
         text=text,
         profile=extracted.profile,
         sheets=extracted.sheets,
+        pages=[],
+        width=0,
+        height=0,
+        image_png=None,
+        unreadable=None,
+    )
+
+
+def _extract_plain_text(data: bytes) -> Extracted:
+    text = _decode_text(data)
+    preview = "\n".join(text.splitlines()[:8])
+    return Extracted(
+        text=text,
+        profile=_cap_profile(preview),
+        sheets=[],
         pages=[],
         width=0,
         height=0,

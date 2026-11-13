@@ -30,6 +30,7 @@ from oa_agent.chat.threads import (
     get_owned,
     list_threads,
     patch_thread,
+    pick_entry_thread,
     soft_delete,
     thread_view,
 )
@@ -128,7 +129,10 @@ def create_session(body: SessionIn, request: Request):
     else:
         channel = session.channel or "oa_web"
         with rt.session() as db, db.begin():
-            ensure_thread(db, thread_id=session.thread_id, oa=session.oa, channel=channel)
+            # 复用空白/最近会话，避免每次从 OA 进入都新建一条空会话
+            row = pick_entry_thread(db, oa=session.oa, channel=channel, tenant_id=rt.tenant_id)
+            session.thread_id = row.thread_id
+        chat_launch.store_session(rt.kv.current, ticket, session, policy)
     expires_in = min(policy.ticket_ttl, session.token_expires_at - int(time.time()))
     return {"ticket": ticket, "expires_in": expires_in, "display_name": session.display_name,
             "thread_id": session.thread_id,

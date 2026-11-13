@@ -22,6 +22,8 @@
   var height = cfg.height || '40rem'
   var right = cfg.right || '1.5rem'
   var bottom = cfg.bottom || '1.5rem'
+  /** 重新进入最短间隔，避免连点并发换码导致「助手暂不可用」 */
+  var RELAUNCH_COOLDOWN_MS = 2000
 
   var css =
     '#oa-agent-bubble-button{position:fixed;right:' + right + ';bottom:' + bottom + ';width:52px;height:52px;' +
@@ -36,6 +38,7 @@
     'padding:8px 12px;background:' + color + ';color:#fff;font:600 14px system-ui,"Microsoft YaHei",sans-serif}' +
     '#oa-agent-bubble-window .oa-agent-head button{background:transparent;border:0;color:#fff;cursor:pointer;' +
     'font-size:16px;margin-left:8px;padding:0 4px}' +
+    '#oa-agent-bubble-window .oa-agent-head button:disabled{opacity:.45;cursor:default}' +
     '#oa-agent-bubble-window iframe{flex:1;width:100%;border:0}' +
     '@media (max-width:640px){#oa-agent-bubble-window{right:0;bottom:0;width:100vw;height:100vh;max-height:none;' +
     'max-width:none;border-radius:0}}'
@@ -61,15 +64,31 @@
     var win = el('div', { id: 'oa-agent-bubble-window', role: 'dialog', 'aria-label': title })
     var head = el('div', { 'class': 'oa-agent-head' })
     var actions = el('span', {})
-    var reload = el('button', { type: 'button', title: '重新连接' }, '\u21BB')
+    var reload = el('button', { type: 'button', title: '重新进入' }, '\u21BB')
     var close = el('button', { type: 'button', title: '关闭' }, '\u00D7')
     var frame = null
+    var reloading = false
+    var cooldownTimer = null
 
     head.appendChild(el('span', {}, title))
     actions.appendChild(reload)
     actions.appendChild(close)
     head.appendChild(actions)
     win.appendChild(head)
+
+    function setReloadBusy(busy) {
+      reloading = !!busy
+      reload.disabled = !!busy
+      reload.title = busy ? '正在重新进入…' : '重新进入'
+    }
+
+    function endReloadSoon() {
+      if (cooldownTimer) window.clearTimeout(cooldownTimer)
+      cooldownTimer = window.setTimeout(function () {
+        setReloadBusy(false)
+        cooldownTimer = null
+      }, RELAUNCH_COOLDOWN_MS)
+    }
 
     function open() {
       if (!frame) {
@@ -82,15 +101,37 @@
       win.className = ''
     }
 
+    function relaunch() {
+      if (reloading) return
+      setReloadBusy(true)
+      if (!frame) {
+        open()
+        endReloadSoon()
+        return
+      }
+      var done = false
+      function finish() {
+        if (done) return
+        done = true
+        if (frame) {
+          if (frame.removeEventListener) frame.removeEventListener('load', finish)
+          else frame.onload = null
+        }
+        endReloadSoon()
+      }
+      if (frame.addEventListener) frame.addEventListener('load', finish)
+      else frame.onload = finish
+      // 超时也解锁，避免宿主页卡住时按钮永久禁用
+      window.setTimeout(finish, Math.max(RELAUNCH_COOLDOWN_MS, 8000))
+      frame.src = launchUrl()
+    }
+
     button.onclick = function () {
       if (win.className === 'oa-agent-open') hide()
       else open()
     }
     close.onclick = hide
-    reload.onclick = function () {
-      if (frame) frame.src = launchUrl()
-      else open()
-    }
+    reload.onclick = relaunch
 
     document.body.appendChild(win)
     document.body.appendChild(button)

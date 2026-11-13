@@ -12,7 +12,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from oa_agent.chat.attachment_admit import AdmitError
 from oa_agent.chat.attachment_extract import extract_upload
 
-MSG_TYPE = "\u53ea\u80fd\u4e0a\u4f20 Excel\u3001Word\u3001PDF\u3001Markdown\u3001CSV\uff0c\u4ee5\u53ca png\u3001jpeg\u3001webp\u3001gif \u56fe\u7247"
+MSG_TYPE = "\u53ea\u80fd\u4e0a\u4f20 Excel\u3001Word\u3001PDF\u3001Markdown\u3001TXT\u3001CSV\uff0c\u4ee5\u53ca png\u3001jpeg\u3001webp\u3001gif \u56fe\u7247"
 UNREADABLE = "\u5df2\u52a0\u5bc6\uff0c\u65e0\u6cd5\u8bfb\u53d6"
 NO_PAGE_TEXT = "\u6ca1\u6709\u53ef\u63d0\u53d6\u7684\u6587\u5b57"
 

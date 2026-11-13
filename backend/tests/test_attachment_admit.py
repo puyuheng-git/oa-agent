@@ -7,6 +7,8 @@ import pytest
 
 from oa_agent.chat.attachment_admit import MSG_TYPE, AdmitError, admit_batch
 
+# MSG_TYPE 含 TXT；断言仍用「只能上传」前缀匹配
+
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"
 
@@ -68,6 +70,15 @@ def test_utf8_markdown_passes():
     assert len(rows) == 1
     assert rows[0].media_kind == "document"
     assert rows[0].extension == "md"
+
+
+def test_utf8_txt_passes():
+    rows = admit_batch([("memo.txt", "你好\n第二行".encode("utf-8"))])
+    assert len(rows) == 1
+    assert rows[0].media_kind == "document"
+    assert rows[0].extension == "txt"
+    assert rows[0].content_type == "text/plain"
+    assert "TXT" in MSG_TYPE
 
 
 def _xlsx_zip_with_entry_count(count: int) -> bytes:

@@ -87,6 +87,161 @@ def test_export_utterance_calls_export_tool_with_previous_text():
     assert out["params"]["filename"] == "张三.xlsx"
 
 
+def test_export_with_empty_model_content_fills_from_last_text():
+    tools = {"builtin.export": (_export_spec(), None)}
+    parsed = {"intent": "tool", "tool": "builtin.export", "params": {"content": ""}}
+    out = oa_assistant._prefer_export(
+        parsed, "导出", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text="id,amount\n1,2", last_title="列表",
+    )
+    assert out["intent"] == "tool"
+    assert out["params"]["content"] == "id,amount\n1,2"
+
+
+def test_export_with_empty_content_fills_from_attachment_chat_reply():
+    """附件环路：模型调了 builtin.export 但没填 content，用本轮整理正文回填。"""
+    tools = {"builtin.export": (_export_spec(), None)}
+    parsed = {
+        "intent": "tool",
+        "tool": "builtin.export",
+        "params": {},
+        "chat_reply": "姓名,部门\n李四,财务",
+    }
+    out = oa_assistant._prefer_export(
+        parsed, "整理后导出", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text=None,
+    )
+    assert out["intent"] == "tool"
+    assert out["tool"] == "builtin.export"
+    assert "李四,财务" in out["params"]["content"]
+
+
+def test_export_request_uses_chat_reply_when_model_only_answered():
+    """附件环路：模型只 answer 整理结果，员工要求导出时仍应落到 builtin.export。"""
+    tools = {"builtin.export": (_export_spec(), None)}
+    parsed = {
+        "intent": "chat",
+        "tool": None,
+        "params": {},
+        "chat_reply": "项目,金额\n差旅,1200",
+    }
+    out = oa_assistant._prefer_export(
+        parsed, "把文件整理后导出给我", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text=None,
+    )
+    assert out["intent"] == "tool"
+    assert out["tool"] == "builtin.export"
+    assert "差旅,1200" in out["params"]["content"]
+
+
+def test_attachment_empty_export_step_filled_in_chain():
+    tools = {
+        "query_my_travel_expense_list": (_list_spec(), None),
+        "builtin.export": (_export_spec(), None),
+    }
+    parsed = {
+        "intent": "tool",
+        "tool": "query_my_travel_expense_list",
+        "params": {},
+        "steps": [
+            {"tool": "query_my_travel_expense_list", "args": {}},
+            {"tool": "builtin.export", "args": {}},
+        ],
+        "chat_reply": "备用正文",
+    }
+    out = oa_assistant._prefer_export(
+        parsed, "导出", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text="姓名,金额\n张三,10",
+    )
+    assert out["steps"][1]["tool"] == "builtin.export"
+    assert "张三,10" in out["steps"][1]["args"]["content"]
+
+
+def test_export_these_uses_bundle_text():
+    tools = {"builtin.export": (_export_spec(), None)}
+    parsed = {"intent": "chat", "tool": None, "params": {}}
+    out = oa_assistant._prefer_export(
+        parsed, "把这些数据导出", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text="a,1", bundle_text="## A\na,1\n\n## B\nb,2",
+    )
+    assert out["intent"] == "tool"
+    assert "## B" in out["params"]["content"]
+    assert "b,2" in out["params"]["content"]
+
+
+def test_generic_export_defaults_to_bundle_summary():
+    """未指定「这条」时，自动汇总近期多份结果再导出。"""
+    tools = {"builtin.export": (_export_spec(), None)}
+    parsed = {"intent": "chat", "tool": None, "params": {}}
+    out = oa_assistant._prefer_export(
+        parsed, "导出给我", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text="a,1", bundle_text="## A\na,1\n\n## B\nb,2",
+    )
+    assert out["intent"] == "tool"
+    assert "b,2" in out["params"]["content"]
+
+
+def test_send_me_a_file_triggers_export():
+    tools = {"builtin.export": (_export_spec(), None)}
+    parsed = {"intent": "chat", "tool": None, "params": {}}
+    out = oa_assistant._prefer_export(
+        parsed, "给我一份表格", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text="姓名,金额\n张三,10",
+    )
+    assert out["tool"] == "builtin.export"
+    assert "张三,10" in out["params"]["content"]
+
+
+def test_ensure_export_content_rescues_ask_with_attachment():
+    parsed = {
+        "intent": "ask",
+        "tool": "builtin.export",
+        "params": {},
+        "missing": ["content"],
+    }
+    out = oa_assistant._ensure_export_content(
+        parsed, "整理后导出",
+        last_text=None, last_title=None, bundle_text=None,
+        attachment_text="项目,金额\n差旅,88",
+    )
+    assert out["intent"] == "tool"
+    assert "差旅,88" in out["params"]["content"]
+
+
+def test_expand_export_args_fills_empty_from_all_steps():
+    args = {"content": ""}
+    results = [
+        {"list": [{"姓名": "甲"}], "columns": [{"key": "姓名", "label": "姓名"}]},
+        {"text": "备注一行"},
+    ]
+    out = oa_assistant._expand_export_args("builtin.export", args, results)
+    assert out is not None
+    assert "甲" in out["content"]
+    assert "备注一行" in out["content"]
+
+
+def test_export_keeps_model_query_then_export_steps():
+    tools = {
+        "query_my_travel_expense_list": (_list_spec(), None),
+        "builtin.export": (_export_spec(), None),
+    }
+    parsed = {
+        "intent": "tool",
+        "tool": "query_my_travel_expense_list",
+        "params": {},
+        "steps": [
+            {"tool": "query_my_travel_expense_list", "args": {}},
+            {"tool": "builtin.export", "args": {"content": {"$from_step": 1}}},
+        ],
+    }
+    out = oa_assistant._prefer_export(
+        parsed, "导出报销", tools, today=date(2026, 11, 5), rule_tool_map={},
+        last_text=None,
+    )
+    assert out["steps"][1]["tool"] == "builtin.export"
+    assert out["steps"][1]["args"]["content"]["$from_step"] == 1
+
+
 def test_export_this_record_uses_previous_result_not_a_new_query():
     """「将这条……导出来」指上一轮已经展示的那条，不要重新查列表。"""
     tools = {
