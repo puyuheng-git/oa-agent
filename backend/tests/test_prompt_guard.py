@@ -80,11 +80,11 @@ def _capture_understand(monkeypatch, message, history=None):
 
     seen = {}
 
-    def fake_invoke(model, cfg, messages, rec, node, **kw):
+    def fake_invoke(pairs, messages, rec, node, **kw):
         seen["messages"] = messages
         return {"action": "chat", "reply": "ok"}
 
-    monkeypatch.setattr(oa, "invoke_json", fake_invoke)
+    monkeypatch.setattr(oa, "invoke_json_failover", fake_invoke)
     ctx = oa.RunContext(
         recorder=SimpleNamespace(), identity=None,
         executor=SimpleNamespace(registry=SimpleNamespace(names=lambda: [], get=lambda n: None)),

@@ -23,6 +23,7 @@ HELP = "help"
 ASK = "ask"
 CHAT = "chat"
 CLARIFY = "clarify"
+META_CONTINUE = "meta_continue"  # 单步 meta：回主图 understand 再 Tick（并入 ReAct）
 
 MODES = (
     "legacy_prompt",
@@ -111,6 +112,18 @@ class RoutingDecision:
                 if k != "intent":
                     out[k] = v
             return out
+        if self.action == META_CONTINUE:
+            return {
+                "intent": META_CONTINUE,
+                "tool": None,
+                "params": {},
+                "intent_source": self.intent_source,
+                "routing_mode": self.mode,
+                "routing_fallback_from": self.fallback_from,
+                "meta_continue": True,
+                "meta_state": dict(self.extra.get("meta_state") or {}),
+                "chat_reply": None,
+            }
         out: dict[str, Any] = {
             "intent": HELP,
             "tool": self.chosen_tool,
@@ -175,10 +188,14 @@ def route(
     rules_select: RulesSelectFn | None = None,
     chat_enabled: bool = False,
     rule_tool_map: dict[str, str] | None = None,
+    meta_state: dict | None = None,
+    meta_single_tick: bool = False,
 ) -> dict:
     """统一路由入口。返回与 _understand 兼容的 dict。
 
     ``rule_tool_map``：意图 key → Tool 名；为 None 时使用 FALLBACK_RULE_TOOLS（无 registry 的单测）。
+    ``meta_single_tick``：meta_search 每轮只推进一拍，未收敛时返回 meta_continue（主图 ReAct）。
+    ``meta_state``：跨 Tick 的 hits/schemas/round 持久化。
     """
     cfg = resolve_routing_config(config, runtime_defaults)
     mode = cfg["tool_routing_mode"]
@@ -189,6 +206,7 @@ def route(
         "mode": mode,
         "message_chars": len(message or ""),
         "candidate_tool_count": len(tools),
+        "meta_single_tick": bool(meta_single_tick),
     })
 
     decision = _dispatch(
@@ -206,6 +224,8 @@ def route(
         fallback_from=None,
         depth=0,
         rule_tool_map=resolved_map,
+        meta_state=meta_state,
+        meta_single_tick=meta_single_tick,
     )
     duration_ms = int((time.perf_counter() - t0) * 1000)
     _emit(
@@ -246,6 +266,8 @@ def _dispatch(
     fallback_from: str | None,
     depth: int,
     rule_tool_map: dict[str, str],
+    meta_state: dict | None = None,
+    meta_single_tick: bool = False,
 ) -> RoutingDecision:
     if depth > 2:
         return _help_decision(mode, fallback_from, "routing_depth_exceeded")
@@ -274,6 +296,7 @@ def _dispatch(
         return _meta_search(
             message, tools, today, cfg, recent_tool_names, llm_select, rules_select,
             chat_enabled, recorder, trace, fallback_from, rule_tool_map,
+            persisted_state=meta_state, single_tick=meta_single_tick,
         )
     if mode == "router_then_fill":
         return _router_then_fill(
@@ -477,14 +500,34 @@ def get_tool_schema(tool_name: str, tools: dict) -> dict | None:
 def _meta_search(
     message, tools, today, cfg, recent_tool_names, llm_select, rules_select,
     chat_enabled, recorder, trace, fallback_from, rule_tool_map,
+    *,
+    persisted_state: dict | None = None,
+    single_tick: bool = False,
 ) -> RoutingDecision:
-    """元工具渐进披露：search_capabilities / get_tool_schema，受 meta_max_rounds 限制后再填参。"""
+    """元工具渐进披露。single_tick=True 时每拍只推进一轮，未收敛返回 META_CONTINUE。"""
     max_rounds = max(1, int(cfg.get("meta_max_rounds") or 3))
     top_k = int(cfg.get("retrieve_topk") or 8)
-    state: dict[str, Any] = {"hits": None, "schemas": {}, "recent": list(recent_tool_names or [])}
-    last_meta_error: str | None = None
+    if persisted_state and isinstance(persisted_state, dict):
+        state: dict[str, Any] = {
+            "hits": persisted_state.get("hits"),
+            "schemas": dict(persisted_state.get("schemas") or {}),
+            "recent": list(persisted_state.get("recent") or recent_tool_names or []),
+            "round": int(persisted_state.get("round") or 0),
+            "last_meta_error": persisted_state.get("last_meta_error"),
+        }
+    else:
+        state = {
+            "hits": None, "schemas": {}, "recent": list(recent_tool_names or []),
+            "round": 0, "last_meta_error": None,
+        }
+    last_meta_error: str | None = state.get("last_meta_error")
+    start_round = int(state.get("round") or 0) + 1
+    end_round = start_round if single_tick else max_rounds
 
-    for round_i in range(1, max_rounds + 1):
+    for round_i in range(start_round, max_rounds + 1):
+        if round_i > end_round:
+            break
+        state["round"] = round_i
         t0 = time.perf_counter()
         parsed = None
         if llm_select is not None:
@@ -503,6 +546,9 @@ def _meta_search(
             except Exception:  # noqa: BLE001
                 parsed = None
 
+        decided: RoutingDecision | None = None
+        cont = False
+
         if parsed and parsed.get("intent") == "meta":
             call = parsed.get("meta_call") or {}
             name = call.get("name")
@@ -516,8 +562,8 @@ def _meta_search(
                        candidates=[h["name"] for h in hits],
                        metadata={"round": round_i, "meta_call": "search_capabilities",
                                  "max_rounds": max_rounds, "via": "llm"})
-                continue
-            if name == "get_tool_schema":
+                cont = True
+            elif name == "get_tool_schema":
                 tool_name = str(args.get("tool_name") or "")
                 schema = get_tool_schema(tool_name, tools)
                 if schema:
@@ -531,17 +577,18 @@ def _meta_search(
                                      "max_rounds": max_rounds, "via": "llm"})
                 else:
                     last_meta_error = f"unknown_tool:{tool_name}"
+                    state["last_meta_error"] = last_meta_error
                     _stage(recorder, trace, "meta_search",
                            duration_ms=int((time.perf_counter() - t0) * 1000),
                            candidates=[],
                            metadata={"round": round_i, "meta_call": "get_tool_schema",
                                      "error": last_meta_error, "max_rounds": max_rounds})
-                continue
-            last_meta_error = f"unknown_meta:{name}"
-            continue
-
-        if parsed and parsed.get("intent") in (TOOL, ASK, CHAT, "memory_write", "memory_forget"):
-            # 仅当目标 Tool 已加载 schema（或无参）时接受业务决定
+                cont = True
+            else:
+                last_meta_error = f"unknown_meta:{name}"
+                state["last_meta_error"] = last_meta_error
+                cont = True
+        elif parsed and parsed.get("intent") in (TOOL, ASK, CHAT, "memory_write", "memory_forget"):
             chosen = parsed.get("tool")
             if parsed.get("intent") == TOOL and chosen and chosen not in state["schemas"]:
                 schema = get_tool_schema(chosen, tools)
@@ -552,59 +599,81 @@ def _meta_search(
                            candidates=[chosen],
                            metadata={"round": round_i, "meta_call": "get_tool_schema",
                                      "max_rounds": max_rounds, "via": "auto_before_tool"})
-                    continue
-            if parsed.get("intent") == TOOL and chosen and chosen not in tools:
-                continue
-            if state["schemas"] or parsed.get("intent") != TOOL:
-                _stage(recorder, trace, "fill_args", duration_ms=0,
-                       candidates=list(state["schemas"]) or ([chosen] if chosen else []),
-                       metadata={"schema_count": len(state["schemas"]), "via": "llm_meta"})
-                return _decision_from_parsed(
-                    "meta_search", parsed, list(state["schemas"]) or list(tools.keys()),
-                    fallback_from=fallback_from, tools=tools,
-                )
+                    cont = True
+            if not cont:
+                if parsed.get("intent") == TOOL and chosen and chosen not in tools:
+                    cont = True
+                elif state["schemas"] or parsed.get("intent") != TOOL:
+                    _stage(recorder, trace, "fill_args", duration_ms=0,
+                           candidates=list(state["schemas"]) or ([chosen] if chosen else []),
+                           metadata={"schema_count": len(state["schemas"]), "via": "llm_meta"})
+                    decided = _decision_from_parsed(
+                        "meta_search", parsed, list(state["schemas"]) or list(tools.keys()),
+                        fallback_from=fallback_from, tools=tools,
+                    )
+        else:
+            # 服务端默认推进
+            if state["hits"] is None:
+                hits = search_capabilities(message, tools, top_k=top_k)
+                if recent_tool_names:
+                    for name in recent_tool_names:
+                        if name in tools and name not in {h["name"] for h in hits}:
+                            hits.insert(0, {
+                                "name": name,
+                                "summary": getattr(tools[name][0], "summary", "") or name,
+                                "skill": tools[name][1].name if tools[name][1] else None,
+                            })
+                    hits = hits[: max(top_k, len(recent_tool_names))]
+                state["hits"] = hits
+                _stage(recorder, trace, "meta_search",
+                       duration_ms=int((time.perf_counter() - t0) * 1000),
+                       candidates=[h["name"] for h in hits],
+                       metadata={"round": round_i, "meta_call": "search_capabilities",
+                                 "max_rounds": max_rounds, "via": "server"})
+                cont = True
+            elif not state["schemas"]:
+                remaining = max_rounds - round_i + 1
+                to_load = [h["name"] for h in state["hits"] if h["name"] in tools][:remaining]
+                loaded = []
+                for name in to_load:
+                    schema = get_tool_schema(name, tools)
+                    if schema:
+                        state["schemas"][name] = schema
+                        loaded.append(name)
+                _stage(recorder, trace, "meta_search",
+                       duration_ms=int((time.perf_counter() - t0) * 1000),
+                       candidates=loaded,
+                       metadata={"round": round_i, "meta_call": "get_tool_schema",
+                                 "max_rounds": max_rounds, "via": "server", "batch": len(loaded)})
+                if state["schemas"] and round_i < max_rounds and llm_select is not None:
+                    cont = True
+                elif not state["schemas"]:
+                    cont = False
+                else:
+                    cont = False
+            else:
+                cont = False
 
-        # 服务端默认推进：尚无 hits → search；有 hits 无 schema → 批量拉 schema；否则填参
-        if state["hits"] is None:
-            hits = search_capabilities(message, tools, top_k=top_k)
-            if recent_tool_names:
-                for name in recent_tool_names:
-                    if name in tools and name not in {h["name"] for h in hits}:
-                        hits.insert(0, {
-                            "name": name,
-                            "summary": getattr(tools[name][0], "summary", "") or name,
-                            "skill": tools[name][1].name if tools[name][1] else None,
-                        })
-                hits = hits[: max(top_k, len(recent_tool_names))]
-            state["hits"] = hits
-            _stage(recorder, trace, "meta_search",
-                   duration_ms=int((time.perf_counter() - t0) * 1000),
-                   candidates=[h["name"] for h in hits],
-                   metadata={"round": round_i, "meta_call": "search_capabilities",
-                             "max_rounds": max_rounds, "via": "server"})
+        if decided is not None:
+            return decided
+
+        if single_tick and cont and round_i < max_rounds:
+            return RoutingDecision(
+                mode="meta_search",
+                action=META_CONTINUE,
+                fallback_from=fallback_from,
+                intent_source="rules",
+                candidate_tools=[h["name"] for h in (state["hits"] or [])][:32],
+                extra={"meta_state": {
+                    "hits": state["hits"],
+                    "schemas": dict(state["schemas"]),
+                    "recent": state["recent"],
+                    "round": round_i,
+                    "last_meta_error": last_meta_error,
+                }},
+            )
+        if cont:
             continue
-
-        if not state["schemas"]:
-            remaining = max_rounds - round_i + 1
-            to_load = [h["name"] for h in state["hits"] if h["name"] in tools][:remaining]
-            loaded = []
-            for name in to_load:
-                schema = get_tool_schema(name, tools)
-                if schema:
-                    state["schemas"][name] = schema
-                    loaded.append(name)
-            _stage(recorder, trace, "meta_search",
-                   duration_ms=int((time.perf_counter() - t0) * 1000),
-                   candidates=loaded,
-                   metadata={"round": round_i, "meta_call": "get_tool_schema",
-                             "max_rounds": max_rounds, "via": "server", "batch": len(loaded)})
-            if not state["schemas"]:
-                break
-            # 本轮已用于拉 schema；若还有轮次留给 LLM 填参则 continue，否则立刻填参
-            if round_i < max_rounds and llm_select is not None:
-                continue
-            break
-
         break
 
     if not state["schemas"]:
@@ -623,11 +692,9 @@ def _meta_search(
     _stage(recorder, trace, "fill_args", duration_ms=0,
            candidates=list(narrowed.keys()),
            metadata={"schema_count": len(narrowed), "via": "meta_search"})
-    # 填参轮：给 llm_select 业务 schema（非 meta 模式）
     fill_select = llm_select
     if llm_select is not None:
         def fill_select(message, narrowed_tools, opts):  # noqa: ANN001
-            # 若模型仍只懂 meta，避免死循环：去掉 meta 标记
             clean = {k: v for k, v in (opts or {}).items() if k not in ("meta", "meta_state")}
             return llm_select(message, narrowed_tools, clean)
 

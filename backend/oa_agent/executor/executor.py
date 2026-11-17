@@ -286,14 +286,26 @@ class ToolExecutor:
             raise
         raw = dict(raw)
         flags = {str(f) for f in (raw.pop("guard_flags", None) or [])}  # 运行时清洗阶段的标志；不回给模型
+        # Skill 确认卡：结构化字段留给回复层渲染；围栏文本仍给模型看
+        pending = bool(raw.get("pending_confirmation") and raw.get("confirm_kind") == "skill_pack")
         body = json.dumps(raw, ensure_ascii=False, default=str)
         flags |= scan_flags(body)
         text = wrap_untrusted(body, source="builtin", name=name)
+        data: dict = {"text": text}
+        if pending:
+            data.update({
+                "pending_confirmation": True,
+                "confirm_kind": "skill_pack",
+                "task_id": raw.get("task_id"),
+                "token": raw.get("token"),
+                "expire_at": raw.get("expire_at"),
+                "preview": raw.get("preview") or {},
+            })
         rec.event("tool_call_end", node_name=node_name, tool_name=name, tool_version=spec.version, status="ok",
                   duration_ms=int((time.perf_counter() - started) * 1000), output_summary={"result_count": 1},
                   metadata={"kind": "builtin", "builtin_id": spec.builtin_id,
                             **({"guard_flags": sorted(flags)} if flags else {})})
-        return {"ok": True, "capability": name, "data": {"text": text}, "message": ""}
+        return {"ok": True, "capability": name, "data": data, "message": ""}
 
     def _execute_mcp(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder, node_name: str) -> dict:
         """kind=mcp：默认由 MCP 服务端校验参数，这里丢弃身份字段；spec.model_params 非空时先本地校验；结果一律作为不可信数据围栏后回图。"""

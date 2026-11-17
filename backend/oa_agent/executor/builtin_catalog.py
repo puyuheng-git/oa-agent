@@ -91,6 +91,16 @@ BUILTIN_CATALOG: list[BuiltinDef] = [
         constraints=("默认停用", "须有 sandbox_policy", "写入体积有上限"),
     ),
     BuiltinDef(
+        "sys.skill", "按需加载 Agent Skill 正文", "low", True,
+        how="DSH skill({name})：从已启用包重读当前 SKILL.md，返回 <skill_content>；目录摘要不可当步骤。",
+        constraints=("仅已启用包", "disable-model-invocation 包不可经本工具加载", "每次调用重读磁盘"),
+    ),
+    BuiltinDef(
+        "sys.skill_read", "读取 Skill 包内参考资源", "medium", True,
+        how="按已加载 SKILL.md 指引读取包内 references/assets/根级文档；禁止路径穿越与执行脚本。",
+        constraints=("路径相对包根", "禁止 ..", "白名单目录/扩展名", "有读取体积上限"),
+    ),
+    BuiltinDef(
         "sys.skill_exec", "执行 Agent Skill 包脚本", "high", True, True,
         {
             "skill_exec_timeout_seconds": 60,
@@ -101,9 +111,14 @@ BUILTIN_CATALOG: list[BuiltinDef] = [
         constraints=("须有 sandbox_policy", "仅允许包内相对脚本路径", "超时与输出有上限"),
     ),
     BuiltinDef(
-        "sys.skill_create", "创建员工个人 Agent Skill", "medium", True,
-        how="把完整 SKILL.md 写入当前员工的个人 Skill 库（kind=user）；配合系统包 skill-creator 由自然语言创建。",
-        constraints=("仅创建本人 Skill", "name 不可与系统包/他人冲突", "内容经 SKILL.md 校验"),
+        "sys.skill_create", "创建员工个人 Agent Skill（需确认）", "medium", True,
+        how="校验 SKILL.md 后签发员工确认卡；确认前不入库。配合 skill-creator 起草，oa-skill-persist 约定落盘。",
+        constraints=("仅创建本人 Skill", "name 不可与系统包/他人冲突", "内容经 SKILL.md 校验", "须员工确认后落盘"),
+    ),
+    BuiltinDef(
+        "sys.skill_update", "更新员工个人 Agent Skill（需确认）", "medium", True,
+        how="校验 SKILL.md 后签发员工确认卡，确认后更新本人已有个人 Skill 包正文。",
+        constraints=("仅更新本人 kind=user 包", "内容经 SKILL.md 校验", "须员工确认后落盘"),
     ),
 ]
 
@@ -134,6 +149,13 @@ BUILTIN_MODEL_PARAMS: dict[str, dict[str, dict[str, Any]]] = {
     "sys.web_search": {"query": _p("搜索词", required=True)},
     "sys.fs_read": {"path": _p("沙箱内路径", required=True)},
     "sys.fs_write": {"path": _p("沙箱内路径", required=True), "content": _p("内容", required=True)},
+    "sys.skill": {
+        "name": _p("Skill 包名", "精确包名，与目录 <skill name> 一致", required=True),
+    },
+    "sys.skill_read": {
+        "skill": _p("Skill 包名", "已启用的包名", required=True),
+        "path": _p("相对路径", "相对包根，如 references/guide.md", required=True),
+    },
     "sys.skill_exec": {
         "skill": _p("Skill 包名", "如 xlsx / pdf", required=True),
         "script": _p("脚本相对路径", "相对 Skill 包根，如 scripts/recalc.py", required=True),
@@ -143,7 +165,15 @@ BUILTIN_MODEL_PARAMS: dict[str, dict[str, dict[str, Any]]] = {
     "sys.skill_create": {
         "skill_md": _p(
             "SKILL.md 全文",
-            "含 YAML frontmatter（name/description）与 Markdown 正文；创建当前员工的个人 Skill",
+            "含 YAML frontmatter（name/description）与 Markdown 正文；创建当前员工的个人 Skill（须确认）",
+            required=True,
+        ),
+    },
+    "sys.skill_update": {
+        "name": _p("Skill 名", "个人库中已有 Skill 的 name（小写连字符）", required=True),
+        "skill_md": _p(
+            "SKILL.md 全文",
+            "更新后的完整 SKILL.md；frontmatter name 须与参数 name 一致",
             required=True,
         ),
     },

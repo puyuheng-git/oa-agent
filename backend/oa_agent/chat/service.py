@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Callable
@@ -47,7 +48,7 @@ from oa_agent.runtime.graphs.travel_query import RunCancelled, chat_enabled
 from oa_agent.runtime.intervention import DEFAULT_EXPIRE_MINUTES, USER_CONFIRM, InterventionService
 from oa_agent.executor.write_tools import WriteToolExecutor
 from oa_agent.db.models import InterventionTask
-from oa_agent.runtime.llm import build_chat_model, resolve_model
+from oa_agent.runtime.llm import ModelConfig, build_chat_model, resolve_candidates, resolve_model
 from oa_agent.runtime import multi_agent, workflow_catalog
 from oa_agent.runtime.multi_agent import DomainSpec
 from oa_agent.runtime.releases import Release, ReleaseError
@@ -147,28 +148,60 @@ def _parse_model_id(raw) -> int | None:
         return None
 
 
-def _model(rt: AppRuntime, config: dict, model_id: int | None = None):
+def _model_pairs(rt: AppRuntime, config: dict, *, capability: str | None = None,
+                 model_tier: str | None = None, model_id: int | None = None,
+                 use_release_pin: bool = True) -> list[tuple[object, ModelConfig]]:
+    """按路由解析有序候选 [(chat_model, cfg)]，供运行失败顺延；无可用模型或规则模式返回空列表。
+    use_release_pin=False 时不继承发布配置的 llm_model_id（路由阶段按 (text, small) 池取模型）。"""
     if config.get("intent_mode") == "rules":
-        return None
-    pinned = model_id if model_id is not None else _parse_model_id(config.get("llm_model_id"))
+        return []
+    if model_id is not None:
+        pinned = model_id
+    elif use_release_pin:
+        pinned = _parse_model_id(config.get("llm_model_id"))
+    else:
+        pinned = None
     try:
         with rt.session() as db:
-            cfg = resolve_model(db, rt.vault, rt.tenant_id, pinned)
+            cands = resolve_candidates(db, rt.vault, rt.tenant_id, pinned, capability=capability,
+                                       model_tier=model_tier)
     except SQLAlchemyError:
         log.exception("读取 LLM 配置失败，走规则解析")
-        return None
-    return (build_chat_model(cfg), cfg) if cfg else None
+        return []
+    return [(build_chat_model(cfg), cfg) for cfg in cands]
 
 
-def _router_model(rt: AppRuntime, config: dict, runtime_routing: dict):
-    """发布快照 router_model_id > runtime 默认；未配置或解析失败则 None（路由阶段回退主模型）。"""
+def _model(rt: AppRuntime, config: dict, model_id: int | None = None):
+    """首选候选 (chat_model, cfg)；无可用模型返回 None。"""
+    pairs = _model_pairs(rt, config, model_id=model_id)
+    return pairs[0] if pairs else None
+
+
+def _router_model_pairs(rt: AppRuntime, config: dict, runtime_routing: dict) -> list[tuple[object, ModelConfig]]:
+    """路由模型候选：router_model_id（发布快照 > runtime 默认）；未配置则 (text, small) 池；都没有为空（回退主模型）。"""
     raw = config.get("router_model_id")
     if raw is None or raw == "":
         raw = runtime_routing.get("router_model_id")
     mid = _parse_model_id(raw)
-    if mid is None:
-        return None
-    return _model(rt, config, model_id=mid)
+    if mid is not None:
+        return _model_pairs(rt, config, model_id=mid)
+    # 不继承发布配置的 llm_model_id，否则主模型会排在 (text, small) 池之前
+    return _model_pairs(rt, config, capability="text", model_tier="small", use_release_pin=False)
+
+
+def _router_model(rt: AppRuntime, config: dict, runtime_routing: dict):
+    """路由首选候选；未配置或解析失败则 None（路由阶段回退主模型）。"""
+    pairs = _router_model_pairs(rt, config, runtime_routing)
+    return pairs[0] if pairs else None
+
+
+def _pairs_for(model, pairs: list) -> list:
+    """候选列表须与 ctx.model 同源：_model 被替换（如测试桩）或首选不一致时，只保留 model 本身。"""
+    if model is None:
+        return []
+    if pairs and pairs[0][1] == model[1]:
+        return pairs
+    return [model]
 
 
 # ---- 发布配置 / Skill（P4、P5 "engine 提供；未提供时用代码默认值） ----
@@ -461,7 +494,7 @@ def start_run(rt: AppRuntime, session: ChatSession, message: str, correlation_id
             log.exception("保存运行上下文失败：%s", rec.run_id)
     return _drive(rt, rec, session, release.config, tracked,
                   lambda ctx: engine.invoke(ctx, message, session.thread_id, attachment_ids=attachment_ids), check=True, on_delta=on_delta,
-                  domain=domain)
+                  domain=domain, message=message)
 
 
 def _attachment_message_data(rt: AppRuntime, file_ids: list[str]) -> list[dict]:
@@ -634,22 +667,38 @@ def _recent_tool_names(rt: AppRuntime, thread_id: str | None, limit: int = 8) ->
 
 
 def _load_skill_packs(rt: AppRuntime, oa: str):
+    """启用包元数据（L1）；不预读 SKILL.md 全文（DSH：正文由 builtin.skill 按需加载）。"""
     from oa_agent.skills import service as skill_packs
 
     try:
         with rt.session() as db:
-            packs = skill_packs.enabled_packs_for(db, tenant_id=rt.tenant_id, oa=oa)
-            # 预读 SKILL.md，供渐进披露命中时注入
-            for pack in packs:
-                try:
-                    pack.skill_md = skill_packs.load_skill_body(db, rt.settings.data_dir, pack.id)
-                    pack.loaded_body = True
-                except Exception:  # noqa: BLE001
-                    pack.skill_md = ""
-            return packs
+            return skill_packs.enabled_packs_for(db, tenant_id=rt.tenant_id, oa=oa)
     except Exception:  # noqa: BLE001
         log.exception("加载 Agent Skill 包失败 oa=%s", oa)
         return []
+
+
+_SLASH_SKILL_RE = re.compile(r"(?<!\S)/([a-z0-9]+(?:-[a-z0-9]+)*)(?!\S)")
+
+
+def resolve_slash_skill_injection(rt: AppRuntime, oa: str, message: str) -> str:
+    """DSH user-explicit：消息中的 /name 直注 user-invocable 包正文。"""
+    from oa_agent.skills import service as skill_packs
+
+    packs = _load_skill_packs(rt, oa)
+    if not packs or not _SLASH_SKILL_RE.search(message or ""):
+        return ""
+    try:
+        with rt.session() as db, db.begin():
+            return skill_packs.resolve_slash_skills(
+                db,
+                data_dir=rt.settings.data_dir,
+                packs=packs,
+                message=message or "",
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("slash 加载 Skill 失败 oa=%s", oa)
+        return ""
 
 
 def skill_pack_menu(rt: AppRuntime, *, oa: str) -> list[dict]:
@@ -666,10 +715,13 @@ def skill_pack_menu(rt: AppRuntime, *, oa: str) -> list[dict]:
 
 def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
                    on_delta: Callable[[str], None] | None = None,
-                   domain: DomainSpec | None = None) -> travel_query.RunContext:
+                   domain: DomainSpec | None = None,
+                   *,
+                   message: str = "") -> travel_query.RunContext:
     runtime_routing = _runtime_routing_defaults(rt)
     skills = visible_skills_for(rt, session.oa, office_token=session.office_token)
     skill_packs = _load_skill_packs(rt, session.oa)
+    forced_skill = resolve_slash_skill_injection(rt, session.oa, message) if message else ""
     cfg = dict(config)
     domain_name = None
     if domain is not None:
@@ -678,6 +730,8 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
         if domain.system_extra:
             extra = (cfg.get("chat_instructions") or "").strip()
             cfg["chat_instructions"] = (extra + "\n" + domain.system_extra).strip() if extra else domain.system_extra
+    model = _model(rt, cfg)
+    router_pairs = _router_model_pairs(rt, cfg, runtime_routing)
     return travel_query.RunContext(
         on_delta=on_delta,
         recorder=rec,
@@ -689,14 +743,18 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
                               hub=tool_connectors(rt),
                               gateway_secret=load_settings(rt, "oa").get("gateway_secret")),
         today=datetime.now(CHINA_TZ).date(),
-        model=_model(rt, cfg),
-        router_model=_router_model(rt, cfg, runtime_routing),
+        model=model,
+        model_pairs=_pairs_for(model, _model_pairs(rt, cfg)),
+        router_model=router_pairs[0] if router_pairs else None,
+        router_model_pairs=router_pairs,
         config=cfg,
         skills=skills,
         skill_packs=skill_packs,
+        forced_skill_content=forced_skill,
         long_term_memory=_load_long_term_memory(rt, session.oa),
         tenant_id=rt.tenant_id,
         thread_id=session.thread_id,
+        data_dir=rt.settings.data_dir,
         session_factory=rt.session,
         domain=domain_name,
         runtime_routing=runtime_routing,
@@ -708,11 +766,13 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
 def _drive(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict, tracked: bool,
            call: Callable[[travel_query.RunContext], dict], check: bool = False,
            on_delta: Callable[[str], None] | None = None,
-           domain: DomainSpec | None = None) -> dict:
+           domain: DomainSpec | None = None,
+           *,
+           message: str = "") -> dict:
     engine = rt.engine
     try:
         try:
-            ctx = _build_context(rt, rec, session, config, on_delta, domain=domain)
+            ctx = _build_context(rt, rec, session, config, on_delta, domain=domain, message=message)
             if check and (ctx.model is None or not chat_enabled(config)):
                 check_skills(rt)  # 能聊天时没有可用 Skill 也照常对话，只是不能查询
             state = call(ctx)
@@ -742,6 +802,11 @@ def _drive(rt: AppRuntime, rec: RunRecorder, session: ChatSession, config: dict,
         return _handoff(rt, rec, value, tracked)
 
     reply = state.get("reply") or {"type": "text", "content": "", "data": None}
+    # 个人 Skill 确认卡：进入 waiting_confirmation，不落终态
+    if reply.get("type") == "confirmation_pending":
+        data = reply.get("data") or {}
+        if data.get("confirm_kind") == "skill_pack" or data.get("task_id"):
+            return _await_skill_confirmation(rt, rec, reply, tracked)
     spec = engine.registry.get(state.get("tool") or "")
     detail_id = (state.get("params") or {}).get("id") if spec is not None and spec.result_kind == "object" else None
     terminal = WAITING_INPUT if state.get("intent") == travel_query.ASK else SUCCEEDED
@@ -809,8 +874,20 @@ def _drive_write(rt: AppRuntime, rec: RunRecorder, session: ChatSession, expense
     return _result(rec, final, reply, tracked)
 
 
-def confirm_write(rt: AppRuntime, session: ChatSession, task_id: str, token: str, correlation_id: str) -> dict:
-    """员工凭令牌确认写操作；verify_and_consume 后恢复固定 Workflow 图。"""
+def confirm_write(
+    rt: AppRuntime,
+    session: ChatSession,
+    task_id: str,
+    token: str,
+    correlation_id: str,
+    *,
+    decision: str = "confirm",
+) -> dict:
+    """员工凭令牌确认写操作。
+
+    - 行程报销等：verify 后 resume 固定 Workflow 图
+    - 个人 Skill：verify 后 create/update 落盘（无 interrupt）
+    """
     engine = rt.engine
     with rt.session() as db:
         task = db.scalar(sa.select(InterventionTask).where(
@@ -818,14 +895,36 @@ def confirm_write(rt: AppRuntime, session: ChatSession, task_id: str, token: str
         if task is None or task.kind != USER_CONFIRM:
             raise AppError(404, "CONFIRMATION_NOT_FOUND", "确认请求不存在")
         run = db.scalar(sa.select(Run).where(Run.run_id == task.run_id))
+        bound_payload = confirmation.payload_from_binding(task)
     if run is None or run.oa != session.oa:
         raise AppError(404, "NOT_FOUND", "记录不存在")
     if run.run_status != WAITING_CONFIRMATION:
         raise AppError(409, "CONFIRMATION_NOT_PENDING", "该确认已处理或运行状态不可确认")
+
+    # Skill 确认：payload 在 binding 内，不依赖 LangGraph interrupt
+    if isinstance(bound_payload, dict) and bound_payload.get("kind") == "skill_pack":
+        return _confirm_skill_pack(
+            rt, session, run, task_id, token, bound_payload, correlation_id, decision=decision,
+        )
+
     interrupt_value = engine.pending_interrupt(run.thread_id, run.run_id)
     if interrupt_value is None or interrupt_value.get("task_id") != task_id:
         raise AppError(409, "CONFIRMATION_NOT_RESUMABLE", "无法恢复确认流程，请重新发起")
     payload = interrupt_value.get("payload") or {}
+    if decision == "reject":
+        try:
+            with rt.session() as db, db.begin():
+                confirmation.verify_and_consume(
+                    db, task_id=task_id, token=token, oa=session.oa, payload=payload, result="rejected",
+                )
+                engine.runs.transition(run.run_id, WAITING_CONFIRMATION, RUNNING, db=db)
+        except ConfirmationError as exc:
+            raise AppError(400, exc.code, exc.message) from exc
+        rec = engine.recorder_for_run(run, correlation_id)
+        reply = {"type": "markdown", "content": "已取消本次确认，未提交。", "data": None}
+        final = engine.runs.finish(rec, SUCCEEDED)
+        store_reply(rt, rec.run_id, reply)
+        return _result(rec, final, reply, True)
     try:
         with rt.session() as db, db.begin():
             confirmation.verify_and_consume(db, task_id=task_id, token=token, oa=session.oa, payload=payload)
@@ -851,6 +950,86 @@ def confirm_write(rt: AppRuntime, session: ChatSession, task_id: str, token: str
         final = engine.runs.finish(rec, FAILED, error_code="RUN_FAILED", error_summary=f"{type(exc).__name__}: {exc}")
         return _error_reply(rt, rec, "RUN_FAILED", "", True, final)
     reply = state.get("reply") or {"type": "text", "content": "", "data": None}
+    final = engine.runs.finish(rec, SUCCEEDED)
+    store_reply(rt, rec.run_id, reply)
+    return _result(rec, final, reply, True)
+
+
+def _await_skill_confirmation(rt: AppRuntime, rec: RunRecorder, reply: dict, tracked: bool) -> dict:
+    """个人 Skill 确认卡：运行转入 waiting_confirmation，等待员工点确认。"""
+    engine = rt.engine
+    try:
+        with rt.session() as db, db.begin():
+            engine.runs.transition(rec.run_id, RUNNING, WAITING_CONFIRMATION, db=db)
+    except Exception:  # noqa: BLE001
+        log.exception("转入 Skill 确认态失败 run_id=%s", rec.run_id)
+        raise
+    store_reply(rt, rec.run_id, reply)
+    return _result(rec, WAITING_CONFIRMATION, reply, tracked)
+
+
+def _confirm_skill_pack(
+    rt: AppRuntime,
+    session: ChatSession,
+    run: Run,
+    task_id: str,
+    token: str,
+    payload: dict,
+    correlation_id: str,
+    *,
+    decision: str = "confirm",
+) -> dict:
+    """确认或取消个人 Skill 落盘。"""
+    from oa_agent.skills import service as skill_packs
+
+    engine = rt.engine
+    outcome = "confirmed" if decision != "reject" else "rejected"
+    try:
+        with rt.session() as db, db.begin():
+            confirmation.verify_and_consume(
+                db, task_id=task_id, token=token, oa=session.oa, payload=payload, result=outcome,
+            )
+            engine.runs.transition(run.run_id, WAITING_CONFIRMATION, RUNNING, db=db)
+            applied = None
+            if outcome == "confirmed":
+                applied = skill_packs.apply_skill_pack_payload(
+                    db,
+                    tenant_id=rt.tenant_id,
+                    oa=session.oa,
+                    data_dir=rt.settings.data_dir,
+                    payload=payload,
+                )
+    except ConfirmationError as exc:
+        raise AppError(400, exc.code, exc.message) from exc
+    except AppError:
+        raise
+    rec = engine.recorder_for_run(run, correlation_id)
+    rec.event(
+        "employee_confirm",
+        status=RUNNING,
+        operator_id=f"employee:{session.oa}",
+        metadata={"task_id": task_id, "kind": "skill_pack", "decision": decision},
+    )
+    if outcome == "rejected":
+        reply = {
+            "type": "markdown",
+            "content": "已取消，个人 Skill 未写入。",
+            "data": {"confirm_kind": "skill_pack", "decision": "reject"},
+        }
+    else:
+        action = (applied or {}).get("action") or payload.get("action")
+        verb = "创建" if action == "create" else "更新"
+        display = (applied or {}).get("display_name") or payload.get("name") or ""
+        name = (applied or {}).get("name") or payload.get("name") or ""
+        reply = {
+            "type": "markdown",
+            "content": f"已{verb}个人 Skill「{display}」（{name}），可在工作空间「我的 Skill」中查看与启停。",
+            "data": {
+                "confirm_kind": "skill_pack",
+                "decision": "confirm",
+                "skill": applied,
+            },
+        }
     final = engine.runs.finish(rec, SUCCEEDED)
     store_reply(rt, rec.run_id, reply)
     return _result(rec, final, reply, True)
@@ -959,7 +1138,8 @@ def resume_run(rt: AppRuntime, run: Run, session: ChatSession, operator: str, co
     rec.event("operator_resume", status=RUNNING, operator_id=operator, metadata=decision)
     release = release_for_run(rt, run)
     return _drive(rt, rec, session, release.config, True,
-                  lambda ctx: engine.resume(ctx, run.thread_id, decision))
+                  lambda ctx: engine.resume(ctx, run.thread_id, decision),
+                  message="")
 
 
 def terminate_run(rt: AppRuntime, run: Run, operator: str, reason: str, db) -> None:
