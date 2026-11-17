@@ -54,7 +54,7 @@ async function load() {
     upstreams.value = r.upstreams
     defaultUpstreamKey.value = r.default_upstream_key
       || r.upstreams[0]?.key
-      || 'office'
+      || 'open_oa'
   } catch (e) {
     loadError.value = errorMessage(e)
   } finally {
@@ -133,6 +133,51 @@ async function activate(versionNo: number) {
   try {
     await http.post(`/v1/admin/tools/${detail.value.name}/activate`, { version_no: versionNo, reason })
     ElMessage.success(`已激活 v${versionNo}`)
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  }
+  await load()
+  await open(detail.value.name)
+}
+
+function needsOpenOaRepair(d: ToolDetail | null): boolean {
+  if (!d) return false
+  const reasons = d.unregistered_reasons || []
+  return reasons.some((r) => r.includes('invoke_service') || r.includes('open_oa_invoke 须为 POST'))
+}
+
+async function repairOpenOa() {
+  if (!detail.value) return
+  let invokeService = 'out_attendance/go_out_application'
+  let invokeMethod = ''
+  // 从 tool 名猜 Export 方法：search_application_list → searchApplicationList
+  const parts = detail.value.name.split('_').filter(Boolean)
+  if (parts.length) {
+    invokeMethod = parts[0] + parts.slice(1).map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('')
+  }
+  try {
+    const svc = await ElMessageBox.prompt('ANew 服务路径（invoke_service）', `修复 ${detail.value.name}`, {
+      inputValue: invokeService,
+      inputValidator: (v: string) => (v && v.trim().includes('/')) || '形如 module/export',
+    })
+    invokeService = svc.value.trim()
+    const method = await ElMessageBox.prompt('Export 方法名（invoke_method）', `修复 ${detail.value.name}`, {
+      inputValue: invokeMethod || 'searchApplicationList',
+      inputValidator: (v: string) => (v && v.trim().length >= 2) || '请填写方法名',
+    })
+    invokeMethod = method.value.trim()
+  } catch {
+    return
+  }
+  const reasonText = await askReason(`修复 open-oa：${detail.value.name}`)
+  if (!reasonText) return
+  try {
+    await http.post(`/v1/admin/tools/${detail.value.name}/repair-open-oa`, {
+      invoke_service: invokeService,
+      invoke_method: invokeMethod,
+      reason: reasonText,
+    })
+    ElMessage.success('已修复并重新注册')
   } catch (e) {
     ElMessage.error(errorMessage(e))
   }
@@ -228,84 +273,413 @@ function useDraft(d: ApipostDraft) {
   editor.value = true
 }
 
-// ---- 从 open-oa 清单导入（勾选后直接落库为 open_oa_invoke） ----
-interface OpenOaCatalogItem {
-  service: string
-  method: string
-  op?: string
-  risk?: string
-  tool_name?: string
+// ---- Export 向导：填服务路径 → 点选方法 → 表单配参 → 测通入库 ----
+interface WizardMethod {
+  name: string
+  param_names?: string[]
+  param_count?: number
   summary?: string
+  already_added?: boolean
+  tool_name?: string | null
 }
-const openOaDialog = ref(false)
-const openOaLoading = ref(false)
-const openOaImporting = ref(false)
-const openOaItems = ref<OpenOaCatalogItem[]>([])
-const openOaSelected = ref<OpenOaCatalogItem[]>([])
-const openOaErrors = ref<string[]>([])
-const openOaLoadError = ref('')
-const openOaReason = ref('')
+interface WizardObjectEntry {
+  key: string
+  value: string
+}
+interface WizardParamRow {
+  name: string
+  label: string
+  type: string
+  required: boolean
+  description: string
+  testValue: string
+  /** 对象/数组形参：键值对（数组类型只用 value） */
+  objectEntries: WizardObjectEntry[]
+  position?: number
+  kind?: string
+}
+interface WizardResultRow {
+  field: string
+  label: string
+}
+const CALL_OPTIONS = [
+  { value: 'one_by_params', label: '整包参数（一个数组传入）' },
+  { value: 'page_list', label: '分页列表（参数 + 页码 + 条数）' },
+  { value: 'named_args', label: '按参数名逐个传入' },
+]
+const OP_OPTIONS = [
+  { value: 'read', label: '读取' },
+  { value: 'write', label: '写入' },
+]
+const RISK_OPTIONS = [
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '中' },
+  { value: 'high', label: '高' },
+]
+const RESULT_KIND_OPTIONS = [
+  { value: 'list', label: '列表' },
+  { value: 'object', label: '单条对象' },
+]
+const PARAM_TYPE_OPTIONS = [
+  { value: 'string', label: '文本' },
+  { value: 'integer', label: '整数' },
+  { value: 'number', label: '数字' },
+  { value: 'boolean', label: '是/否' },
+  { value: 'object', label: '对象/字典' },
+  { value: 'array', label: '数组' },
+  { value: 'file', label: '文件路径/ID' },
+]
 
-async function openOpenOaImporter() {
-  openOaDialog.value = true
-  openOaItems.value = []
-  openOaSelected.value = []
-  openOaErrors.value = []
-  openOaLoadError.value = ''
-  openOaReason.value = ''
-  openOaLoading.value = true
+const wizardOpen = ref(false)
+const wizardBusy = ref(false)
+const wizardError = ref('')
+const wizardProbeOk = ref(false)
+const wizardProbePreview = ref('')
+const wizardStep = ref<'pick' | 'config'>('pick')
+const wizard = ref({
+  service: '',
+  method: '',
+  methods: [] as WizardMethod[],
+  methodFilter: '',
+  call: 'one_by_params',
+  op: 'read',
+  risk: 'low',
+  name: '',
+  summary: '',
+  oa: '',
+  reason: '',
+  paramRows: [] as WizardParamRow[],
+  resultKind: 'list',
+  resultRows: [{ field: 'id', label: '编号' }] as WizardResultRow[],
+})
+
+const wizardFilteredMethods = computed(() => {
+  const q = wizard.value.methodFilter.trim().toLowerCase()
+  if (!q) return wizard.value.methods
+  return wizard.value.methods.filter((m) => {
+    const hay = `${m.name} ${m.summary || ''} ${m.tool_name || ''}`.toLowerCase()
+    return hay.includes(q)
+  })
+})
+
+function openExportWizard() {
+  wizardOpen.value = true
+  wizardError.value = ''
+  wizardProbeOk.value = false
+  wizardProbePreview.value = ''
+  wizardStep.value = 'pick'
+  wizard.value.methods = []
+  wizard.value.method = ''
+  wizard.value.methodFilter = ''
+  wizard.value.paramRows = []
+  wizard.value.resultRows = [{ field: 'id', label: '编号' }]
+}
+
+async function wizardDiscover() {
+  const service = wizard.value.service.trim()
+  if (!service) {
+    ElMessage.warning('请填写服务路径，例如 out_attendance/go_out_application')
+    return
+  }
+  wizardBusy.value = true
+  wizardError.value = ''
+  wizardProbeOk.value = false
+  wizardStep.value = 'pick'
+  wizard.value.method = ''
   try {
-    const r = await http.get<{ items: OpenOaCatalogItem[] }>('/v1/admin/tools/import/open-oa-catalog')
-    openOaItems.value = Array.isArray(r.items) ? r.items : []
-    if (!openOaItems.value.length) openOaLoadError.value = '清单为空：请确认 Service 已注册 Export 且 open-oa 可访问'
+    const r = await http.post<{ methods: WizardMethod[] }>('/v1/admin/tools/export-wizard/discover', { service })
+    wizard.value.methods = Array.isArray(r.methods) ? r.methods : []
+    if (!wizard.value.methods.length) ElMessage.warning('未找到公开方法，请确认服务路径是否正确')
+    else ElMessage.success(`已拉取 ${wizard.value.methods.length} 个公开方法`)
   } catch (e) {
-    openOaLoadError.value = errorMessage(e)
+    wizardError.value = errorMessage(e)
   } finally {
-    openOaLoading.value = false
+    wizardBusy.value = false
   }
 }
 
-function openOaRowKey(row: OpenOaCatalogItem) {
-  return `${row.service}::${row.method}`
+function wizardDefaultEntriesFromDefault(def: unknown): WizardObjectEntry[] {
+  if (def && typeof def === 'object' && !Array.isArray(def)) {
+    return Object.entries(def as Record<string, unknown>).map(([key, value]) => ({
+      key,
+      value: value === undefined || value === null ? '' : String(value),
+    }))
+  }
+  if (Array.isArray(def)) {
+    return def.map((value) => ({
+      key: '',
+      value: value === undefined || value === null ? '' : String(value),
+    }))
+  }
+  return [{ key: '', value: '' }]
 }
 
-function onOpenOaSelectionChange(rows: OpenOaCatalogItem[]) {
-  openOaSelected.value = rows
-}
-
-async function runOpenOaImport() {
-  if (!openOaSelected.value.length) {
-    ElMessage.warning('请先勾选要导入的条目')
-    return
-  }
-  const reasonText = openOaReason.value.trim() || `从 open-oa 清单导入 ${openOaSelected.value.length} 项`
-  if (reasonText.length < 2) {
-    ElMessage.warning('原因至少 2 个字')
-    return
-  }
-  openOaImporting.value = true
-  openOaErrors.value = []
+async function wizardPickMethod(row: WizardMethod) {
+  wizard.value.method = row.name
+  wizardStep.value = 'config'
+  wizardBusy.value = true
+  wizardError.value = ''
+  wizardProbeOk.value = false
+  wizardProbePreview.value = ''
   try {
-    const r = await http.post<{ imported: { name: string; result: string; version_no?: number }[]; errors: string[] }>(
-      '/v1/admin/tools/import/open-oa-catalog',
-      {
-        reason: reasonText,
-        items: openOaSelected.value.map((i) => ({ service: i.service, method: i.method })),
-      },
-    )
-    openOaErrors.value = r.errors || []
-    const n = r.imported?.length || 0
-    if (n) ElMessage.success(`已导入 ${n} 个 Tool`)
-    if (r.errors?.length) ElMessage.warning(`${r.errors.length} 条失败，见对话框列表`)
-    if (n) {
-      openOaDialog.value = false
-      kindFilter.value = 'open_oa_invoke'
-      await load()
+    const d = await http.post<{
+      call_suggest?: string
+      summary?: string
+      param_count?: number
+      params?: {
+        name: string
+        type?: string
+        label?: string
+        required?: boolean
+        description?: string
+        default?: unknown
+        position?: number
+        kind?: string
+      }[]
+    }>('/v1/admin/tools/export-wizard/describe', {
+      service: wizard.value.service.trim(),
+      method: row.name,
+    })
+    wizard.value.call = d.call_suggest || 'named_args'
+    wizard.value.summary = d.summary || row.summary || row.name
+    wizard.value.name = row.name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().slice(0, 64)
+    // 每个形参单独一行可配（含数组/对象/文件），不再过滤 params/data
+    wizard.value.paramRows = (d.params || [])
+      .filter((p) => !!p?.name)
+      .map((p) => {
+        const type = p.type || 'string'
+        const isBag = type === 'object' || type === 'array'
+        const defaultText =
+          p.default === undefined || p.default === null || isBag
+            ? ''
+            : String(p.default)
+        return {
+          name: p.name,
+          label: p.label || p.name,
+          type,
+          required: !!p.required,
+          description: p.description || '',
+          testValue: defaultText,
+          objectEntries: isBag ? wizardDefaultEntriesFromDefault(p.default) : [],
+          position: p.position,
+          kind: p.kind,
+        }
+      })
+    if (wizard.value.call === 'page_list') {
+      const names = new Set(wizard.value.paramRows.map((p) => p.name))
+      if (!names.has('page')) {
+        wizard.value.paramRows.push({
+          name: 'page',
+          label: '页码',
+          type: 'integer',
+          required: false,
+          description: '从 1 开始',
+          testValue: '1',
+          objectEntries: [],
+        })
+      }
+      if (!names.has('limit')) {
+        wizard.value.paramRows.push({
+          name: 'limit',
+          label: '每页条数',
+          type: 'integer',
+          required: false,
+          description: '建议不超过 20',
+          testValue: '5',
+          objectEntries: [],
+        })
+      }
+      wizard.value.resultKind = 'list'
     }
   } catch (e) {
-    ElMessage.error(errorMessage(e))
+    wizardError.value = errorMessage(e)
   } finally {
-    openOaImporting.value = false
+    wizardBusy.value = false
+  }
+}
+
+function wizardAddParamRow() {
+  wizard.value.paramRows.push({
+    name: '',
+    label: '',
+    type: 'string',
+    required: false,
+    description: '',
+    testValue: '',
+    objectEntries: [],
+  })
+}
+
+function wizardAddObjectEntry(row: WizardParamRow) {
+  if (!row.objectEntries) row.objectEntries = []
+  row.objectEntries.push({ key: '', value: '' })
+}
+
+function wizardRemoveObjectEntry(row: WizardParamRow, idx: number) {
+  row.objectEntries.splice(idx, 1)
+}
+
+function wizardOnParamTypeChange(row: WizardParamRow) {
+  if ((row.type === 'object' || row.type === 'array') && (!row.objectEntries || !row.objectEntries.length)) {
+    row.objectEntries = [{ key: '', value: '' }]
+  }
+}
+
+function wizardRemoveParamRow(idx: number) {
+  wizard.value.paramRows.splice(idx, 1)
+}
+
+function wizardAddResultRow() {
+  wizard.value.resultRows.push({ field: '', label: '' })
+}
+
+function wizardRemoveResultRow(idx: number) {
+  wizard.value.resultRows.splice(idx, 1)
+}
+
+function wizardBuildArgs(): Record<string, unknown> {
+  const args: Record<string, unknown> = {}
+  for (const row of wizard.value.paramRows) {
+    const key = row.name.trim()
+    if (!key) continue
+    if (row.type === 'object') {
+      const obj: Record<string, string> = {}
+      for (const e of row.objectEntries || []) {
+        const k = (e.key || '').trim()
+        if (!k) continue
+        obj[k] = e.value
+      }
+      // 即使为空对象也传，便于 named_args 命中数组形参
+      args[key] = obj
+      continue
+    }
+    if (row.type === 'array') {
+      const list = (row.objectEntries || [])
+        .map((e) => e.value)
+        .filter((v) => v !== '')
+      args[key] = list
+      continue
+    }
+    const raw = row.testValue
+    if (raw === '' || raw === undefined) continue
+    if (row.type === 'integer') {
+      const n = Number.parseInt(raw, 10)
+      if (!Number.isNaN(n)) args[key] = n
+      continue
+    }
+    if (row.type === 'number') {
+      const n = Number(raw)
+      if (!Number.isNaN(n)) args[key] = n
+      continue
+    }
+    if (row.type === 'boolean') {
+      args[key] = raw === '1' || raw.toLowerCase() === 'true' || raw === '是'
+      continue
+    }
+    // string / file
+    args[key] = raw
+  }
+  return args
+}
+
+function wizardBuildModelParams(): Record<string, Record<string, unknown>> {
+  const mp: Record<string, Record<string, unknown>> = {}
+  for (const row of wizard.value.paramRows) {
+    const key = row.name.trim()
+    if (!key) continue
+    mp[key] = {
+      type: row.type || 'string',
+      label: row.label.trim() || key,
+      required: !!row.required,
+      description: row.description.trim(),
+    }
+  }
+  return mp
+}
+
+async function wizardProbe() {
+  if (!wizard.value.oa.trim()) {
+    ElMessage.warning('请填写测试员工 OA 账号')
+    return
+  }
+  if (!wizard.value.method) {
+    ElMessage.warning('请先选择方法')
+    return
+  }
+  const args = wizardBuildArgs()
+  wizardBusy.value = true
+  wizardError.value = ''
+  wizardProbeOk.value = false
+  try {
+    const r = await http.post<{ data: unknown }>('/v1/admin/tools/export-wizard/probe', {
+      service: wizard.value.service.trim(),
+      method: wizard.value.method.trim(),
+      oa: wizard.value.oa.trim(),
+      args,
+      call: wizard.value.call,
+      op: wizard.value.op,
+    })
+    wizardProbeOk.value = true
+    wizardProbePreview.value = JSON.stringify(r.data, null, 2).slice(0, 4000)
+    ElMessage.success('测试成功，可以入库')
+  } catch (e) {
+    wizardProbeOk.value = false
+    wizardError.value = errorMessage(e)
+  } finally {
+    wizardBusy.value = false
+  }
+}
+
+async function wizardSave() {
+  if (!wizardProbeOk.value) {
+    ElMessage.warning('请先测试成功再入库')
+    return
+  }
+  if (!wizard.value.name.trim()) {
+    ElMessage.warning('请填写工具名称')
+    return
+  }
+  const resultRows = wizard.value.resultRows
+    .map((r) => ({ field: r.field.trim(), label: r.label.trim() }))
+    .filter((r) => r.field)
+  if (!resultRows.length) {
+    ElMessage.warning('请至少添加一个返回字段')
+    return
+  }
+  const fields = resultRows.map((r) => r.field)
+  const labels: Record<string, string> = {}
+  for (const r of resultRows) labels[r.field] = r.label || r.field
+  const reasonText = wizard.value.reason.trim() || `接入方法 ${wizard.value.method}`
+  wizardBusy.value = true
+  wizardError.value = ''
+  try {
+    await http.post('/v1/admin/tools/export-wizard/save', {
+      reason: reasonText,
+      service: wizard.value.service.trim(),
+      method: wizard.value.method.trim(),
+      oa: wizard.value.oa.trim(),
+      args: wizardBuildArgs(),
+      call: wizard.value.call,
+      op: wizard.value.op,
+      risk: wizard.value.risk,
+      name: wizard.value.name.trim(),
+      summary: wizard.value.summary.trim(),
+      model_params: wizardBuildModelParams(),
+      result: {
+        kind: wizard.value.resultKind,
+        fields,
+        labels,
+        list_columns: wizard.value.resultKind === 'list' ? fields.slice(0, 6) : [],
+      },
+    })
+    ElMessage.success('已入库，请到列表中启用')
+    wizardOpen.value = false
+    kindFilter.value = 'open_oa_invoke'
+    await load()
+  } catch (e) {
+    wizardError.value = errorMessage(e)
+  } finally {
+    wizardBusy.value = false
   }
 }
 
@@ -318,39 +692,109 @@ async function createSkill(draft: SkillDraft, toolName: string) {
   }
 }
 
-function isOfficeTool(tool: { kind?: string | null } | null | undefined): boolean {
-  return !tool?.kind || tool.kind === 'office'
+const metaEditor = ref(false)
+const metaForm = ref({ name: '', summary: '', kind: '' as string })
+
+function isExtensionTool(tool: { kind?: string | null } | null | undefined): boolean {
+  return tool?.kind === 'builtin' || tool?.kind === 'mcp'
 }
 
-function editBlockedReason(tool: { kind?: string | null; current_schema?: unknown } | null): string | null {
-  if (!tool) return 'Tool 不存在'
-  if (tool.kind === 'open_oa_invoke') {
-    return 'open-oa 调用 Tool 的契约来自清单；请用「从 open-oa 清单导入」覆盖更新，或用启停开关。'
-  }
-  if (!isOfficeTool(tool)) {
-    if (tool.kind === 'builtin') {
-      return '内置 Tool 由系统提供，不能用此表单改路径/参数；请用列表里的启停开关。'
-    }
-    return 'MCP Tool 的定义来自「MCP 连接」同步，不能用此表单改路径/参数；请到 MCP 连接页重新同步，或用启停开关。'
-  }
-  if (!tool.current_schema) return '该 OA 接口 Tool 没有有效版本，无法编辑（可尝试「从文件导入」或新建）'
-  return null
+/** OA / open-oa：有契约版本链，可激活历史版本 */
+function isOfficeTool(tool: { kind?: string | null } | null | undefined): boolean {
+  return !isExtensionTool(tool)
 }
 
 async function edit(name: string) {
   try {
     const d = await http.get<ToolDetail>(`/v1/admin/tools/${name}`)
-    const blocked = editBlockedReason(d)
-    if (blocked) {
-      ElMessage.warning(blocked)
-      return
-    }
-    editing.value = true
-    form.value = toolFormFromSchema(d.current_schema!)
     reason.value = ''
     draftWarnings.value = []
     skillDraft.value = null
+    // 内置 / MCP：实现在代码或远端，表单只改正文摘要
+    if (isExtensionTool(d)) {
+      metaForm.value = { name: d.name, summary: d.summary || '', kind: d.kind || '' }
+      metaEditor.value = true
+      return
+    }
+    if (!d.current_schema) {
+      ElMessage.warning('该 Tool 没有有效版本，无法编辑（可尝试「从文件导入」或「接入业务接口」）')
+      return
+    }
+    editing.value = true
+    form.value = toolFormFromSchema(d.current_schema)
+    // 配置里若仍是 office，把展示值对齐到已配置的上游 key，避免「未配置」误导
+    if (!upstreams.value.some((u) => u.key === form.value.upstream)) {
+      if (form.value.upstream === 'open_oa' && upstreams.value.some((u) => u.key === 'office')) {
+        form.value.upstream = 'office'
+      } else if (defaultUpstreamKey.value) {
+        form.value.upstream = defaultUpstreamKey.value
+      }
+    }
     editor.value = true
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  }
+}
+
+async function saveMeta() {
+  if (reason.value.trim().length < 2) {
+    ElMessage.warning('请填写变更原因（至少 2 个字，写入审计）')
+    return
+  }
+  if (!metaForm.value.summary.trim()) {
+    ElMessage.warning('请填写摘要')
+    return
+  }
+  saving.value = true
+  try {
+    // 内置/MCP 走元数据更新；其余字段占位满足接口校验
+    await http.put(`/v1/admin/tools/${metaForm.value.name}`, {
+      name: metaForm.value.name,
+      summary: metaForm.value.summary.trim(),
+      description: '',
+      method: 'GET',
+      upstream: defaultUpstreamKey.value || 'office',
+      path: '/',
+      timeout_seconds: 10,
+      inject_identity_fields: [],
+      top_level_fields: [],
+      query_params_field: null,
+      identity_params: {},
+      model_params: {},
+      result: { kind: 'object', fields: [], labels: {}, list_columns: [] },
+      reason: reason.value.trim(),
+    })
+    ElMessage.success('已保存')
+    metaEditor.value = false
+    await load()
+    if (detail.value?.name === metaForm.value.name) await open(metaForm.value.name)
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    saving.value = false
+  }
+}
+
+async function removeTool(row: ToolItem) {
+  const reasonText = await askReason(`删除 Tool：${row.name}`)
+  if (!reasonText) return
+  try {
+    await ElMessageBox.confirm(
+      `确定删除「${row.name}」？依赖它的 Skill 将变为不可用。内置 Tool 删除后不会在「从文件导入」时自动恢复。`,
+      '删除 Tool',
+      { type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await http.del(`/v1/admin/tools/${row.name}`, { reason: reasonText })
+    ElMessage.success('已删除')
+    if (detail.value?.name === row.name) {
+      drawer.value = false
+      detail.value = null
+    }
+    await load()
   } catch (e) {
     ElMessage.error(errorMessage(e))
   }
@@ -396,7 +840,7 @@ onMounted(load)
       type="info"
       :closable="false"
       show-icon
-      title="「编辑」只适用于 OA 接口 Tool（路径/参数/返回字段）。open-oa 调用请用「从 open-oa 清单导入」覆盖；内置与 MCP 用启停；MCP 定义到「MCP 连接」同步。保存时兼容变更立即生效，不兼容变更需激活。员工身份由服务端注入。"
+      title="全部 Tool 均可编辑与删除。OA / open-oa 改契约表单；内置与 MCP 只改摘要。删除需填审计原因。员工身份由服务端注入。"
       style="margin-bottom: 12px"
     />
     <div style="margin-bottom: 12px">
@@ -404,8 +848,8 @@ onMounted(load)
       <el-tooltip content="粘贴 Apipost 接口文档分享链接，自动生成 Tool 草稿（检查后再保存）">
         <el-button @click="openImporter">从 Apipost 导入</el-button>
       </el-tooltip>
-      <el-tooltip content="从 open-oa export-catalog 勾选导入为 open_oa_invoke Tool（直接落库）">
-        <el-button @click="openOpenOaImporter">从 open-oa 清单导入</el-button>
+      <el-tooltip content="填写服务路径，点选 Export 公开方法，表单配置后测试入库">
+        <el-button @click="openExportWizard">接入业务接口</el-button>
       </el-tooltip>
       <el-tooltip content="从仓库 openapi/*.yaml 批量导入；同名 Tool 会被文件中的定义覆盖（按版本规则）">
         <el-button :loading="syncing" @click="sync">从文件导入</el-button>
@@ -478,17 +922,44 @@ onMounted(load)
       <el-table-column label="来源" width="150">
         <template #default="{ row }">{{ row.source_file === 'admin' ? '管理后台' : row.source_file }}</template>
       </el-table-column>
-      <el-table-column label="" width="100" fixed="right">
+      <el-table-column label="" width="140" fixed="right">
         <template #default="{ row }">
-          <el-tooltip v-if="!isOfficeTool(row)" :content="editBlockedReason(row) || ''">
-            <span class="muted">不可编辑</span>
-          </el-tooltip>
-          <el-button v-else link type="primary" @click="edit(row.name)">编辑</el-button>
+          <el-button link type="primary" @click="edit(row.name)">编辑</el-button>
+          <el-button link type="danger" @click="removeTool(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
 
-    <el-dialog v-model="editor" :title="editing ? `编辑 Tool：${form.name}` : '新建 Tool'" width="1100px" top="4vh" :close-on-click-modal="false">
+    <el-dialog
+      v-model="metaEditor"
+      :title="`编辑 ${metaForm.kind === 'mcp' ? 'MCP' : '内置'} Tool：${metaForm.name}`"
+      width="520px"
+      :close-on-click-modal="false"
+      :teleported="true"
+      append-to="body"
+    >
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="实现与参数定义不在此修改；可改摘要说明，并用列表启停控制是否开放。"
+        style="margin-bottom: 12px"
+      />
+      <el-form label-width="80px">
+        <el-form-item label="摘要" required>
+          <el-input v-model="metaForm.summary" maxlength="255" show-word-limit />
+        </el-form-item>
+        <el-form-item label="原因" required>
+          <el-input v-model="reason" type="textarea" :rows="2" maxlength="200" show-word-limit placeholder="写入审计，至少 2 个字" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="metaEditor = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="saveMeta">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="editor" :title="editing ? `编辑 Tool：${form.name}` : '新建 Tool'" width="1100px" :close-on-click-modal="false" :teleported="true" append-to="body" align-center>
       <el-alert
         v-if="draftWarnings.length"
         type="warning"
@@ -657,7 +1128,7 @@ onMounted(load)
       </template>
     </el-dialog>
 
-    <el-dialog v-model="importer" title="从 Apipost 导入" width="720px" :close-on-click-modal="false">
+    <el-dialog v-model="importer" title="从 Apipost 导入" width="720px" :close-on-click-modal="false" :teleported="true" append-to="body">
       <el-form label-width="100px">
         <el-form-item label="分享链接" required>
           <el-input
@@ -694,58 +1165,226 @@ onMounted(load)
       </template>
     </el-dialog>
 
-    <el-dialog v-model="openOaDialog" title="从 open-oa 清单导入" width="860px" :close-on-click-modal="false">
-      <div class="hint" style="margin-bottom: 8px">
-        拉取 open-oa <code>GET /agent/export-catalog</code>，勾选后导入为 <code>open_oa_invoke</code> Tool（直接落库并按版本规则覆盖同名）。需已配置 mint_base_url 与 AGENT_GATEWAY_SECRET。
+    <el-dialog v-model="wizardOpen" title="接入业务接口向导" width="960px" :close-on-click-modal="false" top="4vh" :teleported="true" append-to="body">
+      <div class="hint" style="margin-bottom: 10px">
+        ① 填写服务路径并拉取方法 → ② 点击某一方法 → ③ 填写中文配置与测试值 → ④ 测试成功后入库。服务路径对应 Service 模块，例如
+        <code>out_attendance/go_out_application</code>。
       </div>
-      <el-form label-width="80px" style="margin-bottom: 8px">
-        <el-form-item label="原因">
-          <el-input v-model="openOaReason" placeholder="写入审计，缺省为「从 open-oa 清单导入 N 项」" maxlength="200" show-word-limit />
+      <el-alert v-if="wizardError" type="error" :closable="false" :title="wizardError" style="margin-bottom: 8px" />
+
+      <el-form label-width="120px">
+        <el-form-item label="服务路径" required>
+          <div style="display: flex; gap: 8px; width: 100%">
+            <el-input
+              v-model="wizard.service"
+              placeholder="例如 out_attendance/go_out_application"
+              @keyup.enter="wizardDiscover"
+            />
+            <el-button type="primary" :loading="wizardBusy" @click="wizardDiscover">拉取方法列表</el-button>
+          </div>
+          <div class="hint">对应目录 service-app/src/service/…/Export.php，将列出该文件全部公开方法。</div>
         </el-form-item>
       </el-form>
-      <el-alert v-if="openOaLoadError" type="error" :closable="false" :title="openOaLoadError" style="margin-bottom: 8px" />
-      <el-alert v-for="(e, i) in openOaErrors" :key="`oe${i}`" type="error" :closable="false" :title="e" style="margin-bottom: 6px" />
-      <el-table
-        v-loading="openOaLoading"
-        :data="openOaItems"
-        size="small"
-        border
-        max-height="420"
-        :row-key="openOaRowKey"
-        @selection-change="onOpenOaSelectionChange"
-      >
-        <el-table-column type="selection" width="42" :reserve-selection="false" />
-        <el-table-column label="Tool 名" min-width="180">
-          <template #default="{ row }"><code>{{ row.tool_name || '—' }}</code></template>
-        </el-table-column>
-        <el-table-column label="service" min-width="200" show-overflow-tooltip>
-          <template #default="{ row }"><code>{{ row.service }}</code></template>
-        </el-table-column>
-        <el-table-column label="method" min-width="160" show-overflow-tooltip>
-          <template #default="{ row }"><code>{{ row.method }}</code></template>
-        </el-table-column>
-        <el-table-column label="op" width="70">
-          <template #default="{ row }">{{ row.op || '—' }}</template>
-        </el-table-column>
-        <el-table-column label="风险" width="70">
-          <template #default="{ row }">{{ row.risk || '—' }}</template>
-        </el-table-column>
-        <el-table-column label="说明" min-width="160" show-overflow-tooltip prop="summary" />
-      </el-table>
-      <div class="hint" style="margin-top: 8px">已选 {{ openOaSelected.length }} / {{ openOaItems.length }}</div>
+
+      <template v-if="wizardStep === 'pick'">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
+          <strong>请点击选择方法</strong>
+          <el-input
+            v-model="wizard.methodFilter"
+            placeholder="按方法名 / 说明筛选"
+            clearable
+            style="max-width: 280px; margin-left: auto"
+          />
+          <span class="hint">共 {{ wizard.methods.length }} 个</span>
+        </div>
+        <el-table
+          v-loading="wizardBusy"
+          :data="wizardFilteredMethods"
+          size="small"
+          border
+          max-height="420"
+          highlight-current-row
+          empty-text="请先拉取方法列表"
+          @row-click="wizardPickMethod"
+        >
+          <el-table-column label="方法名" min-width="200">
+            <template #default="{ row }">
+              <el-button link type="primary">{{ row.name }}</el-button>
+            </template>
+          </el-table-column>
+          <el-table-column label="参数个数" width="90" align="center">
+            <template #default="{ row }">
+              {{ row.param_count ?? row.param_names?.length ?? '—' }}
+            </template>
+          </el-table-column>
+          <el-table-column label="说明" min-width="220" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.summary || '—' }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="160">
+            <template #default="{ row }">
+              <el-tag v-if="row.already_added" type="success" size="small">已添加</el-tag>
+              <span v-if="row.already_added && row.tool_name" class="hint" style="margin-left: 4px">{{ row.tool_name }}</span>
+              <el-tag v-else type="info" size="small" effect="plain">未添加</el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+
+      <template v-else>
+        <div style="margin-bottom: 10px">
+          <el-button link type="primary" @click="wizardStep = 'pick'">← 返回方法列表</el-button>
+          <span style="margin-left: 8px">当前方法：<code>{{ wizard.method }}</code></span>
+        </div>
+        <el-form label-width="120px">
+          <el-form-item label="工具名称" required>
+            <el-input v-model="wizard.name" maxlength="64" placeholder="对话里使用的工具英文名，建议小写+下划线" />
+            <div class="hint">入库后的 Tool 唯一名，例如 query_my_travel_expense_list</div>
+          </el-form-item>
+          <el-form-item label="用途说明">
+            <el-input v-model="wizard.summary" maxlength="255" placeholder="给管理员和模型看的中文说明" />
+          </el-form-item>
+          <el-form-item label="调用方式">
+            <el-select v-model="wizard.call" style="width: 100%">
+              <el-option v-for="o in CALL_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+            </el-select>
+            <div class="hint">决定参数如何传给 PHP 方法；分页接口一般选「分页列表」</div>
+          </el-form-item>
+          <el-form-item label="操作类型">
+            <el-radio-group v-model="wizard.op">
+              <el-radio-button v-for="o in OP_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</el-radio-button>
+            </el-radio-group>
+            <div class="hint">写入类会要求确认与幂等键</div>
+          </el-form-item>
+          <el-form-item label="风险等级">
+            <el-radio-group v-model="wizard.risk">
+              <el-radio-button v-for="o in RISK_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+
+          <el-form-item label="请求参数">
+            <div style="width: 100%">
+              <div class="hint" style="margin-bottom: 6px">
+                每个形参单独配置类型与测试值（含对象/数组/文件）。对象用键值对、数组用多行值；「测试值」仅本页试调。
+              </div>
+              <el-table :data="wizard.paramRows" size="small" border empty-text="暂无参数，可点击下方添加">
+                <el-table-column label="#" width="48" align="center">
+                  <template #default="{ row }">{{ row.position || '' }}</template>
+                </el-table-column>
+                <el-table-column label="参数名" width="120">
+                  <template #default="{ row }"><el-input v-model="row.name" placeholder="英文名" /></template>
+                </el-table-column>
+                <el-table-column label="中文名" width="110">
+                  <template #default="{ row }"><el-input v-model="row.label" placeholder="展示名" /></template>
+                </el-table-column>
+                <el-table-column label="类型" width="130">
+                  <template #default="{ row }">
+                    <el-select v-model="row.type" style="width: 100%" @change="wizardOnParamTypeChange(row)">
+                      <el-option v-for="o in PARAM_TYPE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+                    </el-select>
+                  </template>
+                </el-table-column>
+                <el-table-column label="必填" width="64" align="center">
+                  <template #default="{ row }"><el-checkbox v-model="row.required" /></template>
+                </el-table-column>
+                <el-table-column label="说明" min-width="100">
+                  <template #default="{ row }"><el-input v-model="row.description" placeholder="可选" /></template>
+                </el-table-column>
+                <el-table-column label="测试值" min-width="220">
+                  <template #default="{ row }">
+                    <template v-if="row.type === 'object' || row.type === 'array'">
+                      <div
+                        v-for="(e, i) in row.objectEntries"
+                        :key="i"
+                        style="display: flex; gap: 4px; margin-bottom: 4px; align-items: center"
+                      >
+                        <el-input
+                          v-if="row.type === 'object'"
+                          v-model="e.key"
+                          placeholder="键"
+                          style="width: 40%"
+                        />
+                        <el-input v-model="e.value" :placeholder="row.type === 'array' ? '数组项' : '值'" />
+                        <el-button link type="danger" @click="wizardRemoveObjectEntry(row, i)">删</el-button>
+                      </div>
+                      <el-button link type="primary" @click="wizardAddObjectEntry(row)">加一项</el-button>
+                    </template>
+                    <el-input
+                      v-else-if="row.type === 'boolean'"
+                      v-model="row.testValue"
+                      placeholder="true / false / 是"
+                    />
+                    <el-input
+                      v-else
+                      v-model="row.testValue"
+                      :placeholder="row.type === 'file' ? '文件路径或 ID' : '试调时用'"
+                    />
+                  </template>
+                </el-table-column>
+                <el-table-column label="" width="64">
+                  <template #default="{ $index }">
+                    <el-button link type="danger" @click="wizardRemoveParamRow($index)">删除</el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-button style="margin-top: 6px" @click="wizardAddParamRow">添加参数</el-button>
+            </div>
+          </el-form-item>
+
+          <el-form-item label="返回形态">
+            <el-radio-group v-model="wizard.resultKind">
+              <el-radio-button v-for="o in RESULT_KIND_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item label="返回字段" required>
+            <div style="width: 100%">
+              <div class="hint" style="margin-bottom: 6px">白名单字段：只有这里列出的字段会回给模型。「字段名」为接口里的英文键，「中文名」用于展示。</div>
+              <el-table :data="wizard.resultRows" size="small" border>
+                <el-table-column label="字段名" min-width="140">
+                  <template #default="{ row }"><el-input v-model="row.field" placeholder="如 id、date" /></template>
+                </el-table-column>
+                <el-table-column label="中文名" min-width="140">
+                  <template #default="{ row }"><el-input v-model="row.label" placeholder="如 单号、日期" /></template>
+                </el-table-column>
+                <el-table-column label="" width="64">
+                  <template #default="{ $index }">
+                    <el-button link type="danger" @click="wizardRemoveResultRow($index)">删除</el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-button style="margin-top: 6px" @click="wizardAddResultRow">添加返回字段</el-button>
+            </div>
+          </el-form-item>
+
+          <el-form-item label="测试员工" required>
+            <el-input v-model="wizard.oa" placeholder="员工 OA 账号（USER_ID）" style="max-width: 280px" />
+            <div class="hint">用该员工身份真实调用接口，请使用你有权限的测试账号</div>
+          </el-form-item>
+          <el-form-item label="审计原因">
+            <el-input v-model="wizard.reason" maxlength="200" placeholder="写入操作审计，可留空自动生成" />
+          </el-form-item>
+        </el-form>
+
+        <el-alert
+          v-if="wizardProbeOk"
+          type="success"
+          :closable="false"
+          title="测试成功，可以入库"
+          style="margin-bottom: 8px"
+        />
+        <div v-if="wizardProbePreview" class="hint" style="margin-bottom: 4px">测试返回预览（仅供核对）：</div>
+        <pre v-if="wizardProbePreview" class="hint" style="max-height: 180px; overflow: auto; white-space: pre-wrap">{{ wizardProbePreview }}</pre>
+      </template>
+
       <template #footer>
-        <el-button :loading="openOaLoading" @click="openOpenOaImporter">重新拉取</el-button>
-        <el-button @click="openOaDialog = false">关闭</el-button>
-        <el-button
-          type="primary"
-          :loading="openOaImporting"
-          :disabled="!openOaSelected.length || openOaLoading"
-          @click="runOpenOaImport"
-        >导入所选</el-button>
+        <el-button @click="wizardOpen = false">关闭</el-button>
+        <template v-if="wizardStep === 'config'">
+          <el-button :loading="wizardBusy" @click="wizardProbe">测试接口</el-button>
+          <el-button type="primary" :loading="wizardBusy" :disabled="!wizardProbeOk" @click="wizardSave">测试成功后入库</el-button>
+        </template>
       </template>
     </el-dialog>
 
-    <el-drawer v-model="drawer" :title="detail?.name || 'Tool'" size="720px">
+    <el-drawer v-model="drawer" :title="detail?.name || 'Tool'" size="720px" :teleported="true" append-to="body">
       <el-skeleton v-if="!detail" :rows="6" />
       <template v-else>
         <el-alert
@@ -757,14 +1396,26 @@ onMounted(load)
           style="margin-bottom: 12px"
         />
         <el-alert
-          v-if="!isOfficeTool(detail)"
-          type="info"
+          v-if="needsOpenOaRepair(detail)"
+          type="error"
           :closable="false"
           show-icon
-          :title="editBlockedReason(detail) || ''"
+          title="这是 open-oa 调用 Tool，编辑时曾丢失 ANew 目标。请点「修复 open-oa」补回 service/method，或用「接入业务接口」同名覆盖。"
           style="margin-bottom: 12px"
         />
-        <el-button v-else type="primary" plain size="small" @click="edit(detail.name)">编辑定义</el-button>
+        <div style="margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap">
+          <el-button type="primary" plain size="small" @click="edit(detail.name)">编辑</el-button>
+          <el-button
+            v-if="needsOpenOaRepair(detail) || detail.kind === 'open_oa_invoke'"
+            type="warning"
+            plain
+            size="small"
+            @click="repairOpenOa"
+          >
+            修复 open-oa
+          </el-button>
+          <el-button type="danger" plain size="small" @click="removeTool(detail)">删除</el-button>
+        </div>
 
         <template v-if="guide">
           <h4>实现说明</h4>
@@ -856,7 +1507,7 @@ onMounted(load)
               <template #default="{ row }">
                 <el-tag v-if="row.is_current" type="success" size="small">当前</el-tag>
                 <el-tag v-if="row.is_pending" type="warning" size="small">待激活</el-tag>
-                <el-button v-if="!row.is_current && isOfficeTool(detail)" link type="primary" size="small" @click="activate(row.version_no)">激活</el-button>
+                <el-button v-if="!row.is_current" link type="primary" size="small" @click="activate(row.version_no)">激活</el-button>
               </template>
             </el-table-column>
           </el-table>

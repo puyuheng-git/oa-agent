@@ -38,8 +38,9 @@ describe('catalogForm', () => {
     expect(toolPayload(back)).toEqual(payload)
   })
 
-  it('defaults upstream to office and keeps a chosen one', () => {
-    expect(toolFormFromSchema({ name: 'x', result: {} }).upstream).toBe('office')
+  it('defaults upstream to open_oa and keeps a chosen one', () => {
+    expect(toolFormFromSchema({ name: 'x', result: {} }).upstream).toBe('open_oa')
+    expect(toolFormFromSchema({ name: 'x', upstream: 'office', result: {} }).upstream).toBe('open_oa')
     expect(emptyToolForm('hr').upstream).toBe('hr')
     const form = { ...emptyToolForm(), upstream: 'hr' }
     expect(toolPayload(form).upstream).toBe('hr')

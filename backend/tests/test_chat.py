@@ -337,7 +337,20 @@ def test_office_token_expired_message(chat, office):
     office.post(INVOKE_URL).mock(return_value=httpx.Response(401))
     h = open_chat(chat)
     body = send(chat, h, "查上周行程报销").json()
-    assert body["reply"]["content"] == "登录已过期，请重新打开 OA 助手页。"
+    assert body["reply"]["error_code"] == "OFFICE_TOKEN_EXPIRED"
+    assert "登录已过期" in body["reply"]["content"]
+
+
+def test_office_biz_login_hint_maps_token_expired(chat, office):
+    """业务码返回「请登录」不得原样甩给员工，须升为 OFFICE_TOKEN_EXPIRED。"""
+    office.post(INVOKE_URL).mock(
+        return_value=httpx.Response(200, json={"code": "401", "msg": "请登录"})
+    )
+    h = open_chat(chat)
+    body = send(chat, h, "查上周行程报销").json()
+    assert body["reply"]["error_code"] == "OFFICE_TOKEN_EXPIRED"
+    assert "请登录" not in body["reply"]["content"]
+    assert "登录已过期" in body["reply"]["content"]
 
 
 def test_duplicate_message_and_validation(chat, office):

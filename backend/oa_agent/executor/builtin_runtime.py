@@ -508,7 +508,20 @@ class BuiltinRuntime:
 
         script_src = (bundle / script).resolve()
         if not str(script_src).startswith(str(bundle.resolve())) or not script_src.is_file():
-            raise ToolError("NOT_FOUND", "脚本不存在", user_message="Skill 脚本不存在")
+            # 列出包内真实脚本，避免模型编造路径后只看到「脚本不存在」
+            available = sorted(
+                p.relative_to(bundle).as_posix()
+                for p in bundle.rglob("*")
+                if p.is_file() and p.suffix.lower() in {".py", ".js"}
+                and "scripts/" in p.relative_to(bundle).as_posix()
+            )[:20]
+            hint = "、".join(available) if available else "（无）"
+            raise ToolError(
+                "NOT_FOUND",
+                f"脚本不存在：{script}",
+                user_message=f"Skill 脚本不存在：{script}。可用脚本：{hint}。"
+                "若只需提取上传文件正文，请直接根据附件内容回答，无需调用脚本。",
+            )
 
         run_id = secrets.token_hex(8)
         work = (

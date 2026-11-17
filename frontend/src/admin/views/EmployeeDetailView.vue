@@ -493,7 +493,8 @@ onMounted(reloadTab)
     </el-tabs>
   </el-card>
 
-  <el-drawer v-model="msgDrawer" size="55%" :title="msgThread ? `消息 · ${msgThread.title ?? msgThread.thread_id}` : '消息'">
+  <el-drawer v-model="msgDrawer" size="55%" :title="msgThread ? `消息 · ${msgThread.title ?? msgThread.thread_id}` : '消息'"
+    :teleported="true" append-to="body">
     <el-skeleton v-if="messagesLoading" :rows="8" />
     <div v-else class="msgs">
       <div v-for="m in messages" :key="m.message_id" :class="['msg', m.role]">

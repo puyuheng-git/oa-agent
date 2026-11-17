@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ from websockets.sync.client import connect as ws_connect
 
 from oa_agent.auth import chat_launch
 from oa_agent.auth.chat_launch import ChatSession
+from oa_agent.channels import wecom_media
 from oa_agent.chat import service
 from oa_agent.chat.threads import ensure_thread
 from oa_agent.config.schema import default as default_setting
@@ -47,6 +49,7 @@ PING_INTERVAL = default_setting("wecom", "ping_interval_seconds")
 WORKERS = default_setting("wecom", "workers")
 GROUP_TEXT = default_setting("messages", "wecom_group")
 UNSUPPORTED_TEXT = default_setting("messages", "wecom_unsupported")
+MEDIA_FAILED_TEXT = default_setting("messages", "wecom_media_failed")
 IDENTITY_FAILED_TEXT = default_setting("messages", "wecom_identity_failed")
 WORKING_TEXT = default_setting("messages", "wecom_working")
 PENDING_SUFFIX = "\n\n" + default_setting("messages", "wecom_pending_suffix")
@@ -66,11 +69,13 @@ class SubscribeFailed(Exception):
 
 
 Respond = Callable[[str, bool], None]
+# 可选：将导出文件回传到企微会话（由长连接实现；单测可省略）
+SendFile = Callable[[str, bytes], None]
 
 
 # ---- 消息处理（与连接无关，便于测试） ----
 
-def process_message(rt, body: dict, respond: Respond) -> None:
+def process_message(rt, body: dict, respond: Respond, send_file: SendFile | None = None) -> None:
     msgid = str(body.get("msgid") or "")
     if msgid and not rt.kv.current.set_nx(f"wecom:msgid:{msgid}", "1", _int(rt, "message_dedupe_seconds")):
         return  # 企业微信可能重复推送同一条消息
@@ -78,8 +83,18 @@ def process_message(rt, body: dict, respond: Respond) -> None:
         respond(service.text(rt, "wecom_group"), True)
         return
     text = message_text(body)
-    if not text:
-        respond(service.text(rt, "wecom_unsupported"), True)
+    media_items = []
+    media_expected = _expects_media(body)
+    try:
+        media_items = wecom_media.collect_media(body)
+    except Exception:  # noqa: BLE001
+        log.exception("解析企业微信媒体失败")
+    # 图片/文件下载失败时明确提示重发，避免误报「不支持」（与 Web 附件能力对齐）
+    if not text and not media_items:
+        if media_expected:
+            respond(service.text(rt, "wecom_media_failed"), True)
+        else:
+            respond(service.text(rt, "wecom_unsupported"), True)
         return
     userid = str((body.get("from") or {}).get("userid") or "")
     if not userid:
@@ -90,19 +105,105 @@ def process_message(rt, body: dict, respond: Respond) -> None:
         log.warning("企业微信用户身份解析失败：%s %s", getattr(exc, "code", ""), redact(getattr(exc, "message", "")))
         respond(getattr(exc, "user_message", "") or service.text(rt, "wecom_identity_failed"), True)
         return
+    # 有附件无正文时，给模型一句可读提示（与 Web 端只传附件时一致）
+    if not text and media_items:
+        names = "、".join(m.filename for m in media_items[:5])
+        text = f"请根据我发送的文件处理：{names}"
+    attachment_ids = _save_wecom_uploads(rt, session, media_items)
     respond(service.text(rt, "wecom_working"), False)
     streamer = _Streamer(respond, _int(rt, "stream_flush_ms") / 1000)
-    try:
-        service.guard_message(rt, session, text, f"wecom:{msgid or uuid.uuid4().hex}")
-        reply = service.handle_message(rt, session, text, new_request_id(), session_key=key,
-                                       on_delta=streamer.delta)["reply"]
-    except AppError as exc:
-        reply = {"type": "error", "content": exc.message}
-    except Exception:  # noqa: BLE001 —— 已发出「正在查询」，必须结束这条流式消息
-        log.exception("企业微信消息处理失败")
-        reply = {"type": "error", "content": service.text(rt, "generic_failure")}
+    reply = _run_chat(rt, session, key, text, msgid, streamer, attachment_ids)
+    # token 被上游拒绝时强制重签一次再试（企微无网页入口，不能要求「请登录」）
+    if _needs_token_remint(reply):
+        try:
+            session, key = wecom_session(rt, userid, force_remint=True)
+            streamer = _Streamer(respond, _int(rt, "stream_flush_ms") / 1000)
+            reply = _run_chat(rt, session, key, text, f"{msgid}:retry", streamer, attachment_ids)
+        except (AppError, OfficeApiError) as exc:
+            reply = {"type": "error", "content": getattr(exc, "user_message", "")
+                     or service.text(rt, "wecom_identity_failed"), "error_code": "OFFICE_TOKEN_EXPIRED"}
     respond(reply_markdown(reply, "\n\n" + service.text(rt, "wecom_pending_suffix"),
                            "\n\n" + service.text(rt, "wecom_truncated_suffix")), True)
+    _maybe_send_export_file(rt, session, reply, send_file)
+
+
+def _expects_media(body: dict) -> bool:
+    """回调是否声明了图片/文件（含 mixed 中的媒体项）。"""
+    kind = body.get("msgtype")
+    if kind in ("image", "file"):
+        return True
+    if kind != "mixed":
+        return False
+    items = (body.get("mixed") or {}).get("msg_item") or []
+    return any(
+        isinstance(i, dict) and i.get("msgtype") in ("image", "file")
+        for i in items
+    )
+
+
+def _needs_token_remint(reply: dict) -> bool:
+    """上游票失效：error_code 或文案含登录提示时均触发续期。"""
+    if not isinstance(reply, dict):
+        return False
+    if reply.get("error_code") == "OFFICE_TOKEN_EXPIRED":
+        return True
+    from oa_agent.integrations.open_oa import looks_like_login_hint
+
+    return looks_like_login_hint(str(reply.get("content") or ""))
+
+
+def _run_chat(rt, session, key, text, msgid, streamer, attachment_ids: list[str]) -> dict:
+    try:
+        client_msg = f"wecom:{msgid or uuid.uuid4().hex}"
+        service.guard_message(rt, session, text, client_msg, attachment_ids=attachment_ids or None)
+        return service.handle_message(
+            rt, session, text, new_request_id(), session_key=key,
+            on_delta=streamer.delta, attachment_ids=attachment_ids or None,
+        )["reply"]
+    except AppError as exc:
+        return {"type": "error", "content": exc.message, "error_code": getattr(exc, "code", "") or ""}
+    except Exception:  # noqa: BLE001 —— 已发出「正在查询」，必须结束这条流式消息
+        log.exception("企业微信消息处理失败")
+        return {"type": "error", "content": service.text(rt, "generic_failure")}
+
+
+def _save_wecom_uploads(rt, session: ChatSession, media_items: list) -> list[str]:
+    """将企微媒体写入与 Web 相同的附件管线，返回 file_id 列表。"""
+    if not media_items:
+        return []
+    from oa_agent.chat.attachment_files import save_uploads
+    from oa_agent.executor.builtin_runtime import build_export_store
+
+    files = [(m.filename, m.data) for m in media_items]
+    store = build_export_store(rt)
+    with rt.session() as db:
+        saved = save_uploads(
+            db, store, tenant_id=rt.tenant_id, oa=session.oa,
+            thread_id=session.thread_id, files=files,
+        )
+    return [str(row["file_id"]) for row in saved]
+
+
+def _maybe_send_export_file(rt, session: ChatSession, reply: dict, send_file: SendFile | None) -> None:
+    """导出结果带 ticket 时，把文件回传到企微（与 Web 下载对齐）。"""
+    if send_file is None:
+        return
+    data = reply.get("data") if isinstance(reply, dict) else None
+    if not isinstance(data, dict) or data.get("kind") != "file":
+        return
+    ticket = str(data.get("ticket") or "").strip()
+    if not ticket:
+        return
+    try:
+        from oa_agent.executor.builtin_runtime import build_builtin_runtime
+
+        taken = build_builtin_runtime(rt).take_export(ticket, session.oa)
+        if taken is None:
+            return
+        raw, filename = taken
+        send_file(str(data.get("filename") or filename or "导出.xlsx"), raw)
+    except Exception:  # noqa: BLE001 —— 回传失败不影响文字回复
+        log.exception("企业微信导出文件回传失败")
 
 
 class _Streamer:
@@ -130,6 +231,7 @@ def message_text(body: dict) -> str:
         items = (body.get("mixed") or {}).get("msg_item") or []
         return " ".join(str((i.get("text") or {}).get("content") or "") for i in items
                         if isinstance(i, dict) and i.get("msgtype") == "text").strip()
+    # image/file：正文可为空，由附件管线承接
     return ""
 
 
@@ -162,13 +264,18 @@ def _user_key(userid: str) -> str:
     return "wecom:user:" + hashlib.sha256(userid.encode()).hexdigest()
 
 
-def wecom_session(rt, userid: str) -> tuple[ChatSession, str]:
+def wecom_session(rt, userid: str, *, force_remint: bool = False) -> tuple[ChatSession, str]:
     """企业微信用户的服务端会话：ticket 随机生成、只存在服务端；token 临近过期时按 userid 经 WeComIdP 重新解析并签发。"""
     kv = rt.kv.current
     ticket = kv.get(_user_key(userid))
     session = chat_launch.load_session(kv, ticket) if ticket else None
     policy = service.launch_policy(rt)
-    if session is None or session.token_expires_at - int(time.time()) < policy.remint_before:
+    need_mint = (
+        force_remint
+        or session is None
+        or session.token_expires_at - int(time.time()) < policy.remint_before
+    )
+    if need_mint:
         gateway_secret = service.load_settings(rt, "oa").get("gateway_secret")
         client = service.office_client(rt)
         claims = WeComIdP(client_factory=lambda: client).verify(
@@ -219,6 +326,8 @@ class WeComChannel:
         self._thread: threading.Thread | None = None
         self._ws = None
         self._send_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending: dict[str, tuple[threading.Event, dict]] = {}
         self._pool = ThreadPoolExecutor(self._number("workers", WORKERS), thread_name_prefix="wecom")
         self._status: dict = {"status": "未配置"}
 
@@ -342,8 +451,11 @@ class WeComChannel:
         cmd = frame.get("cmd")
         req_id = (frame.get("headers") or {}).get("req_id") or ""
         body = frame.get("body") or {}
+        if req_id and self._fulfill_pending(req_id, frame):
+            return
         if cmd == "aibot_msg_callback":
-            self._pool.submit(self._safe, process_message, self.rt, body, self._responder(req_id))
+            respond, send_file = self._responder(req_id)
+            self._pool.submit(self._safe, process_message, self.rt, body, respond, send_file)
         elif cmd == "aibot_event_callback":
             event = (body.get("event") or {}).get("eventtype")
             if event == "disconnected_event":
@@ -353,14 +465,93 @@ class WeComChannel:
         elif frame.get("errcode") not in (None, 0):
             log.warning("企业微信返回错误：errcode=%s errmsg=%s", frame.get("errcode"), frame.get("errmsg"))
 
-    def _responder(self, req_id: str) -> Respond:
+    def _fulfill_pending(self, req_id: str, frame: dict) -> bool:
+        with self._pending_lock:
+            waiter = self._pending.pop(req_id, None)
+        if waiter is None:
+            return False
+        event, box = waiter
+        box["frame"] = frame
+        event.set()
+        return True
+
+    def _rpc(self, frame: dict, timeout: float = 60.0) -> dict:
+        """发送帧并等待同 req_id 回执（用于媒体上传）。"""
+        headers = dict(frame.get("headers") or {})
+        req_id = str(headers.get("req_id") or _req_id())
+        headers["req_id"] = req_id
+        frame = {**frame, "headers": headers}
+        event = threading.Event()
+        box: dict = {}
+        with self._pending_lock:
+            self._pending[req_id] = (event, box)
+        try:
+            self._send(frame)
+            if not event.wait(timeout):
+                raise TimeoutError(f"企业微信 RPC 超时：{frame.get('cmd')}")
+        finally:
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+        return box.get("frame") or {}
+
+    def _upload_media(self, filename: str, data: bytes, media_type: str = "file") -> str:
+        """分片上传临时素材，返回 media_id。"""
+        chunks = wecom_media.media_chunks(data)
+        digest = hashlib.md5(data).hexdigest()
+        init = self._rpc({
+            "cmd": "aibot_upload_media_init",
+            "headers": {"req_id": _req_id()},
+            "body": {
+                "type": media_type,
+                "filename": (filename or "file.bin")[:256],
+                "total_size": len(data),
+                "total_chunks": len(chunks),
+                "md5": digest,
+            },
+        })
+        if init.get("errcode") not in (None, 0):
+            raise RuntimeError(f"upload_init errcode={init.get('errcode')} errmsg={init.get('errmsg')}")
+        upload_id = str((init.get("body") or {}).get("upload_id") or "")
+        if not upload_id:
+            raise RuntimeError("upload_init 缺少 upload_id")
+        for idx, chunk in enumerate(chunks):
+            ack = self._rpc({
+                "cmd": "aibot_upload_media_chunk",
+                "headers": {"req_id": _req_id()},
+                "body": {
+                    "upload_id": upload_id,
+                    "chunk_index": idx,
+                    "base64_data": base64.b64encode(chunk).decode("ascii"),
+                },
+            })
+            if ack.get("errcode") not in (None, 0):
+                raise RuntimeError(f"upload_chunk[{idx}] errcode={ack.get('errcode')}")
+        finish = self._rpc({
+            "cmd": "aibot_upload_media_finish",
+            "headers": {"req_id": _req_id()},
+            "body": {"upload_id": upload_id},
+        })
+        if finish.get("errcode") not in (None, 0):
+            raise RuntimeError(f"upload_finish errcode={finish.get('errcode')} errmsg={finish.get('errmsg')}")
+        media_id = str((finish.get("body") or {}).get("media_id") or "")
+        if not media_id:
+            raise RuntimeError("upload_finish 缺少 media_id")
+        return media_id
+
+    def _responder(self, req_id: str) -> tuple[Respond, SendFile]:
         stream_id = uuid.uuid4().hex
 
         def respond(content: str, finish: bool) -> None:
             self._send({"cmd": "aibot_respond_msg", "headers": {"req_id": req_id},
                         "body": {"msgtype": "stream",
                                  "stream": {"id": stream_id, "finish": finish, "content": content}}})
-        return respond
+
+        def send_file(filename: str, data: bytes) -> None:
+            media_id = self._upload_media(filename, data, "file")
+            self._send({"cmd": "aibot_respond_msg", "headers": {"req_id": req_id},
+                        "body": {"msgtype": "file", "file": {"media_id": media_id}}})
+
+        return respond, send_file
 
     def _welcome(self, req_id: str, body: dict | None = None) -> None:
         body = body or {}

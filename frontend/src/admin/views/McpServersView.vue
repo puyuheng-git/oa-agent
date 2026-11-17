@@ -218,7 +218,7 @@ onMounted(load)
       </el-table-column>
     </el-table>
 
-    <el-dialog v-model="editor" :title="editing ? `编辑 MCP 连接：${form.name}` : '新建 MCP 连接'" width="720px" :close-on-click-modal="false">
+    <el-dialog v-model="editor" :title="editing ? `编辑 MCP 连接：${form.name}` : '新建 MCP 连接'" width="720px" :close-on-click-modal="false" :teleported="true" append-to="body">
       <el-form label-width="120px">
         <el-form-item label="连接名" required>
           <el-input v-model="form.name" :disabled="editing" placeholder="小写字母、数字、下划线、连字符，字母开头，创建后不可改" />

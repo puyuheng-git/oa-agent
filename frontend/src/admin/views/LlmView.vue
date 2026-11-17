@@ -231,7 +231,7 @@ onMounted(load)
     </el-table>
   </el-card>
 
-  <el-dialog v-model="pDialog" :title="pEditing ? '编辑提供方' : '新增提供方'" width="560px">
+  <el-dialog v-model="pDialog" :title="pEditing ? '编辑提供方' : '新增提供方'" width="560px" :teleported="true" append-to="body">
     <el-form label-width="110px">
       <el-form-item label="名称"><el-input v-model="pForm.name" /></el-form-item>
       <el-form-item label="Base URL"><el-input v-model="pForm.base_url" placeholder="https://api.example.com/v1" /></el-form-item>
@@ -249,7 +249,7 @@ onMounted(load)
     </template>
   </el-dialog>
 
-  <el-dialog v-model="mDialog" :title="mEditing ? '编辑模型' : '新增模型'" width="560px">
+  <el-dialog v-model="mDialog" :title="mEditing ? '编辑模型' : '新增模型'" width="560px" :teleported="true" append-to="body">
     <el-form label-width="110px">
       <el-form-item label="提供方">
         <el-select v-model="mForm.provider_id" style="width: 100%">

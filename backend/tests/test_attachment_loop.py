@@ -2,11 +2,13 @@ import re
 
 from oa_agent.chat.attachment_extract import UNREADABLE, Extracted, Sheet, extract_upload
 from oa_agent.chat.attachment_loop import (
+    GENERIC_FALLBACK,
     IMAGE_BUDGET,
     MAX_PAGES,
     MAX_READS,
     MAX_ROWS,
     MAX_SLICE_CHARS,
+    SCANNED_FALLBACK,
     TEXT_BUDGET,
     LoadedFile,
     ReadArgs,
@@ -14,6 +16,7 @@ from oa_agent.chat.attachment_loop import (
     read_slice,
     run_loop,
 )
+from oa_agent.chat.attachment_extract import NO_PAGE_TEXT
 
 NO_MORE = "\u6ca1\u6709\u66f4\u591a\u53ef\u8bfb\u5185\u5bb9"
 NOTE_ROWS = "\u5df2\u8bfb\u8fc7\uff1a\u8d26\uff0c\u7b2c1\u884c\u5230\u7b2c2\u884c"
@@ -42,6 +45,7 @@ def _extracted(**kwargs) -> Extracted:
         height=0,
         image_png=None,
         unreadable=None,
+        page_images=(),
     )
     blank.update(kwargs)
     return Extracted(**blank)
@@ -165,8 +169,8 @@ def test_twenty_reads_do_not_call_ask_again_and_answer_is_nonempty():
     result = run_loop([_file(extracted, media_kind="xlsx")], ask)
     assert calls["n"] == 20
     assert result.kind == "answer"
-    assert result.answer
-    assert NOTE_TABLE in result.answer
+    assert result.answer == GENERIC_FALLBACK
+    assert "根据已读内容回答" not in result.answer
     assert NOTE_TABLE in result.read_note
 
 
@@ -341,3 +345,70 @@ def test_no_more_content_still_returns_nonempty_answer():
     assert calls["n"] <= 3
     assert result.kind == "answer"
     assert result.answer
+
+
+def test_blank_pdf_short_circuits_to_scanned_fallback():
+    extracted = _extracted(pages=[NO_PAGE_TEXT], text=NO_PAGE_TEXT, profile="\u9875\u6570\uff1a1")
+
+    def ask(messages):
+        raise AssertionError("model must not be called for empty-page PDF")
+
+    result = run_loop([_file(extracted, filename="scan.pdf", media_kind="pdf")], ask)
+    assert result.kind == "answer"
+    assert result.answer == SCANNED_FALLBACK
+    assert "根据已读内容回答" not in result.answer
+    assert "已读过" not in result.answer
+
+
+def test_scanned_pdf_with_page_images_goes_to_model():
+    png = b"\x89PNG\r\n\x1a\n" + b"fake"
+    extracted = _extracted(
+        pages=[NO_PAGE_TEXT],
+        text=NO_PAGE_TEXT,
+        profile="\u9875\u6570\uff1a1",
+        page_images=(png,),
+        width=100,
+        height=80,
+    )
+    projection = project([_file(extracted, filename="scan.pdf", media_kind="pdf")])
+    assert projection.mode == "full"
+    assert len(projection.images) == 1
+    assert projection.images[0][1] == png
+
+    def ask(messages):
+        return {"action": "answer", "answer": "\u786e\u8ba4\u5355\u5df2\u8bc6\u56fe"}
+
+    result = run_loop([_file(extracted, filename="scan.pdf", media_kind="pdf")], ask)
+    assert result.answer == "\u786e\u8ba4\u5355\u5df2\u8bc6\u56fe"
+    assert result.answer != SCANNED_FALLBACK
+
+
+def test_meta_english_answer_is_replaced_by_fallback():
+    extracted = _extracted(text="hello body", profile="note")
+
+    def ask(messages):
+        return {
+            "action": "answer",
+            "answer": "Need ensure JSON valid, answer string. No markdown outside.",
+        }
+
+    result = run_loop([_file(extracted, filename="note.md", media_kind="md")], ask)
+    assert result.answer == GENERIC_FALLBACK
+
+
+def test_invalid_action_never_echoes_read_note_as_reply():
+    extracted = _extracted(pages=["cover text", "page two"])
+    calls = {"n": 0}
+
+    def ask(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _read(page_from=1)
+        return {"action": "chat"}
+
+    result = run_loop([_file(extracted, filename="a.pdf", media_kind="pdf")], ask)
+    assert result.kind == "answer"
+    assert result.answer == GENERIC_FALLBACK
+    assert "根据已读内容回答" not in result.answer
+    assert "已读过" not in result.answer
+    assert "已读过" in result.read_note

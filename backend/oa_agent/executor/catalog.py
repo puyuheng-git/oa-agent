@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 
 OPENAPI_DIR = REPO_ROOT / "openapi"
 SKILLS_DIR = REPO_ROOT / "skills"
-PARAM_TYPES = {"string", "integer"}
+PARAM_TYPES = {"string", "integer", "number", "boolean", "object", "array", "file"}
 IDENTITY_FIELDS = {"oa"}
 RESULT_KINDS = {"list", "object"}
 RISK_LEVELS = {"low", "medium", "high"}
@@ -130,7 +130,9 @@ def _normalize_param(name: str, rule: Any, errors: list[str], op: str) -> dict:
                                 "label", "enum_labels")
            if k in rule and rule[k] not in (None, "", [], {})}
     if out.get("type", "string") not in PARAM_TYPES:
-        errors.append(f"{op}.model_params.{name}.type 只支持 string / integer")
+        errors.append(
+            f"{op}.model_params.{name}.type 只支持 string / integer / number / boolean / object / array / file"
+        )
     out.setdefault("type", "string")
     out["required"] = bool(out.get("required", False))
     if "enum" in out and not isinstance(out["enum"], list):
@@ -205,6 +207,9 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
         errors.append(f"{name}.timeout_seconds 必须在 (0, 60] 秒内")
         timeout = 10.0
     upstream = str(xa.get("upstream") or DEFAULT_UPSTREAM).strip()
+    # office 与 open_oa 为同一默认上游的新旧标识，统一成 DEFAULT，避免编辑时误判不兼容
+    if upstream == LEGACY_UPSTREAM:
+        upstream = DEFAULT_UPSTREAM
     if not UPSTREAM_KEY_RE.fullmatch(upstream):
         errors.append(f"{name}.upstream 只能用小写字母、数字、下划线，以字母开头，2～32 位")
     spec = {
@@ -245,7 +250,7 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
 
 
 def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
-    """open-oa export-catalog 单条 → Tool 规范化 schema（kind 由调用方写入 Tool 行）。"""
+    """向导/契约条目 → Tool 规范化 schema（kind 由调用方写入 Tool 行）。"""
     from oa_agent.integrations.open_oa import INVOKE_PATH
 
     errors: list[str] = []
@@ -309,42 +314,61 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
     if spec:
         spec["invoke_service"] = service
         spec["invoke_method"] = method
+        call = str(item.get("call") or "one_by_params").strip() or "one_by_params"
+        if call not in ("one_by_params", "page_list", "named_args"):
+            errors.append(f"{name}.call 取值无效")
+        else:
+            spec["invoke_call"] = call
+        spec["invoke_op"] = op_kind if op_kind in ("read", "write") else "read"
         if item.get("extensions") is not None:
             spec["extensions"] = item.get("extensions")
     return spec, errors
 
 
 def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
-    """后台表单 → 与 OpenAPI 导入相同的规范化定义。表单只开放 GET 只读查询。"""
+    """后台表单 → 与 OpenAPI 导入相同的规范化定义。
+
+    默认只开放 GET 只读；若带 invoke_service/method（open-oa 调用），允许 POST 并保留 ANew 目标。
+    """
     name = str(form.get("name") or "").strip()
     errors: list[str] = []
     if not NAME_RE.match(name):
         errors.append("Tool 名只能用小写字母、数字、下划线，以字母开头，3～64 位")
     method = str(form.get("method") or "GET").upper()
-    if method != "GET":
+    inv_s = str(form.get("invoke_service") or "").strip()
+    inv_m = str(form.get("invoke_method") or "").strip()
+    is_invoke = bool(inv_s and inv_m)
+    if is_invoke:
+        method = "POST"
+    elif method != "GET":
         errors.append("一期只支持 GET 只读查询接口（写操作需要员工确认流程）")
     path = str(form.get("path") or "").strip()
-    if not path.startswith("/") or path.startswith("//") or " " in path or "://" in path:
+    if not is_invoke and (not path.startswith("/") or path.startswith("//") or " " in path or "://" in path):
         errors.append("接口路径必须是以 / 开头的相对路径（地址在「连接配置 → 业务上游 / 连接器」中配置，Tool 里只选地址）")
     result = form.get("result") or {}
+    xa = {
+        "enabled": True,
+        "description": form.get("description") or "",
+        "upstream": form.get("upstream") or DEFAULT_UPSTREAM,
+        "risk_level": form.get("risk_level") or "low",
+        "requires_confirmation": bool(form.get("requires_confirmation")),
+        "timeout_seconds": form.get("timeout_seconds", 10),
+        "inject_identity_fields": form.get("inject_identity_fields") or [],
+        "top_level_fields": form.get("top_level_fields") or [],
+        "query_params_field": form.get("query_params_field") or None,
+        "identity_params": form.get("identity_params") or {},
+        "model_params": form.get("model_params") or {},
+        "result": {"kind": result.get("kind") or "object", "fields": result.get("fields") or [],
+                   "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or []},
+    }
+    if is_invoke:
+        xa["invoke_service"] = inv_s
+        xa["invoke_method"] = inv_m
+        path = INVOKE_PATH
     op = {
         "operationId": name,
         "summary": form.get("summary") or "",
-        "x-agent": {
-            "enabled": True,
-            "description": form.get("description") or "",
-            "upstream": form.get("upstream") or DEFAULT_UPSTREAM,
-            "risk_level": form.get("risk_level") or "low",
-            "requires_confirmation": bool(form.get("requires_confirmation")),
-            "timeout_seconds": form.get("timeout_seconds", 10),
-            "inject_identity_fields": form.get("inject_identity_fields") or [],
-            "top_level_fields": form.get("top_level_fields") or [],
-            "query_params_field": form.get("query_params_field") or None,
-            "identity_params": form.get("identity_params") or {},
-            "model_params": form.get("model_params") or {},
-            "result": {"kind": result.get("kind") or "object", "fields": result.get("fields") or [],
-                       "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or []},
-        },
+        "x-agent": xa,
     }
     if form.get("identity_bindings") is not None:
         op["x-agent"]["identity_bindings"] = form.get("identity_bindings") or []
@@ -393,10 +417,29 @@ def schema_part(spec: dict) -> dict:
 
 # ---------------- 兼容性 ----------------
 
+def _canonical_upstream(value: str | None) -> str:
+    """office / open_oa / 缺省 视为同一默认上游。"""
+    upstream = (value or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
+    if upstream == LEGACY_UPSTREAM:
+        return DEFAULT_UPSTREAM
+    return upstream
+
+
+def _schema_for_compare(schema: dict) -> dict:
+    """比较前归一化：默认上游不入哈希差异（兼容库内仍写着 office 的旧版本）。"""
+    out = dict(schema)
+    upstream = _canonical_upstream(out.get("upstream"))
+    if upstream == DEFAULT_UPSTREAM:
+        out.pop("upstream", None)
+    else:
+        out["upstream"] = upstream
+    return out
+
+
 def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
     if old is None:
         return INITIAL, []
-    if canonical_hash(old) == canonical_hash(new):
+    if canonical_hash(_schema_for_compare(old)) == canonical_hash(_schema_for_compare(new)):
         return UNCHANGED, []
     diff: list[dict] = []
     breaking = False
@@ -409,9 +452,10 @@ def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
     for key in ("method", "path", "query_params_field", "risk_level", "requires_confirmation"):
         if old.get(key) != new.get(key):
             add(key, "changed", old.get(key), new.get(key), True)
-    old_up, new_up = old.get("upstream", DEFAULT_UPSTREAM), new.get("upstream", DEFAULT_UPSTREAM)
+    old_up = _canonical_upstream(old.get("upstream"))
+    new_up = _canonical_upstream(new.get("upstream"))
     if old_up != new_up:
-        add("upstream", "changed", old_up, new_up, True)
+        add("upstream", "changed", old.get("upstream", DEFAULT_UPSTREAM), new.get("upstream", DEFAULT_UPSTREAM), True)
     for key in ("inject_identity_fields", "top_level_fields"):
         if old.get(key) != new.get(key):
             add(key, "changed", old.get(key), new.get(key), True)
@@ -553,6 +597,8 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
         identity_bindings=bindings,
         invoke_service=str(schema.get("invoke_service") or ""),
         invoke_method=str(schema.get("invoke_method") or ""),
+        invoke_call=str(schema.get("invoke_call") or "one_by_params"),
+        invoke_op=str(schema.get("invoke_op") or ("write" if schema.get("requires_confirmation") else "read")),
     )
 
 
@@ -570,6 +616,41 @@ def _extension_tool_spec(tool: Tool) -> ToolSpec:
         result_kind=TEXT_RESULT_KIND, result_fields=TEXT_RESULT_FIELDS, summary=tool.summary or "",
         kind=tool.kind, builtin_id=tool.builtin_id, mcp_server_id=tool.mcp_server_id,
         mcp_tool_name=tool.mcp_tool_name, sandbox_policy=dict(tool.sandbox_policy_json or {}))
+
+
+def recover_open_oa_invoke_schema(db: Session, tool: Tool, schema: dict | None) -> tuple[dict, bool]:
+    """若 open_oa_invoke 缺 invoke_*，从历史版本补回；返回 (schema, 是否已修复)。"""
+    schema = dict(schema or {})
+    if str(schema.get("invoke_service") or "").strip() and str(schema.get("invoke_method") or "").strip():
+        # 确保 method/path 正确
+        fixed = False
+        if str(schema.get("method") or "").upper() != "POST":
+            schema["method"] = "POST"
+            fixed = True
+        if str(schema.get("path") or "") != INVOKE_PATH:
+            schema["path"] = INVOKE_PATH
+            fixed = True
+        return schema, fixed
+    if (tool.kind or "office") != "open_oa_invoke":
+        return schema, False
+    versions = db.scalars(
+        sa.select(ToolVersion).where(ToolVersion.tool_id == tool.id).order_by(ToolVersion.version_no.desc())
+    ).all()
+    for ver in versions:
+        src = ver.schema_json or {}
+        inv_s = str(src.get("invoke_service") or "").strip()
+        inv_m = str(src.get("invoke_method") or "").strip()
+        if not inv_s or not inv_m:
+            continue
+        schema["invoke_service"] = inv_s
+        schema["invoke_method"] = inv_m
+        schema["method"] = "POST"
+        schema["path"] = INVOKE_PATH
+        for key in ("invoke_call", "invoke_op", "call"):
+            if src.get(key) and not schema.get(key):
+                schema[key] = src[key]
+        return schema, True
+    return schema, False
 
 
 def registration_blockers(tool: Tool, has_version: bool, method: str | None = None,
@@ -663,7 +744,7 @@ class Catalog:
                     tool.spec_enabled = False
                     tool.last_sync_at, tool.last_sync_result, tool.last_sync_error = now, "removed", None
                     report["tools"].append({"name": name, "result": "removed"})
-        ensure_builtin_tools(db, self.tenant)  # 刷新时补齐缺失的内置工具（不覆盖管理员改动）
+        # 不再在同步时补齐已删内置 Tool，避免管理员删除后被自动恢复
         return report
 
     def _sync_tool(self, db: Session, source: str, spec_version: str, spec: dict, operator: str, now) -> dict:
@@ -840,6 +921,11 @@ class Catalog:
                 if version is None:
                     continue
                 schema = version.schema_json or {}
+                # 编辑损坏后：运行时从历史版本补回 invoke，避免 open_oa_invoke 永久未注册
+                if kind == "open_oa_invoke":
+                    schema, repaired = recover_open_oa_invoke_schema(db, tool, schema)
+                    if repaired:
+                        version.schema_json = schema
                 if registration_blockers(tool, True, schema.get("method"), schema=schema):
                     continue
             elif registration_blockers(tool, version is not None):
@@ -847,8 +933,9 @@ class Catalog:
             if version is None:  # builtin / mcp 无 OpenAPI 版本
                 tools[tool.name] = _extension_tool_spec(tool)
                 continue
+            schema = version.schema_json or {}
             tools[tool.name] = to_tool_spec(
-                version.schema_json, version.spec_version, version.version_no, version.schema_hash,
+                schema, version.spec_version, version.version_no, version.schema_hash,
                 kind=kind, builtin_id=tool.builtin_id, mcp_server_id=tool.mcp_server_id,
                 mcp_tool_name=tool.mcp_tool_name, sandbox_policy=tool.sandbox_policy_json)
         return ToolRegistry(tools)

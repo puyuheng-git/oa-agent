@@ -21,7 +21,24 @@ interface PackItem {
   updated_at?: string
 }
 
-const mainTab = ref<'catalog' | 'packs'>('catalog')
+interface MarketSubmission {
+  listing_id: number
+  id: number
+  name: string
+  display_name: string
+  description: string
+  publisher_oa: string
+  market_status: string
+  market_description?: string
+  model_review_status?: string
+  model_review_summary?: string
+  model_review_recommend?: string
+  admin_note?: string
+  skill_md_preview?: string
+  updated_at?: string
+}
+
+const mainTab = ref<'catalog' | 'packs' | 'market'>('catalog')
 
 const items = ref<SkillItem[]>([])
 const loading = ref(false)
@@ -156,6 +173,100 @@ async function toggle(skill: SkillItem) {
   await load()
 }
 
+async function removeSkill(skill: SkillItem) {
+  let reason = ''
+  try {
+    reason = (
+      await ElMessageBox.prompt('请填写原因（写入审计）', `删除 Skill：${skill.name}`, {
+        inputValidator: (v: string) => (v && v.trim().length >= 2) || '至少 2 个字',
+      })
+    ).value.trim()
+  } catch {
+    return
+  }
+  try {
+    await ElMessageBox.confirm(`确定删除「${skill.display_name}」？此操作不可恢复。`, '删除 Skill', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    await http.del(`/v1/admin/skills/${skill.name}`, { reason })
+    ElMessage.success('已删除')
+    await load()
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  }
+}
+
+const packEditor = ref(false)
+const packEditing = ref<PackItem | null>(null)
+const packMd = ref('')
+const packReason = ref('')
+const packSaving = ref(false)
+
+async function editPack(row: PackItem) {
+  try {
+    const r = await http.get<{ skill_md: string }>(`/v1/admin/skill-packs/${row.id}`)
+    packEditing.value = row
+    packMd.value = r.skill_md
+    packReason.value = ''
+    packEditor.value = true
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  }
+}
+
+async function savePack() {
+  if (!packEditing.value) return
+  if (packReason.value.trim().length < 2) {
+    ElMessage.warning('请填写变更原因')
+    return
+  }
+  if (packMd.value.trim().length < 10) {
+    ElMessage.warning('请填写完整的 SKILL.md')
+    return
+  }
+  packSaving.value = true
+  try {
+    await http.put(`/v1/admin/skill-packs/${packEditing.value.id}`, {
+      skill_md: packMd.value,
+      reason: packReason.value.trim(),
+    })
+    ElMessage.success('已保存')
+    packEditor.value = false
+    await loadPacks()
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    packSaving.value = false
+  }
+}
+
+async function removePack(row: PackItem) {
+  let reason = ''
+  try {
+    reason = (
+      await ElMessageBox.prompt('请填写原因（写入审计）', `删除 Skill 包：${row.name}`, {
+        inputValidator: (v: string) => (v && v.trim().length >= 2) || '至少 2 个字',
+      })
+    ).value.trim()
+  } catch {
+    return
+  }
+  try {
+    await ElMessageBox.confirm(`确定删除包「${row.display_name}」？`, '删除', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    await http.del(`/v1/admin/skill-packs/${row.id}`, { reason })
+    ElMessage.success('已删除')
+    await loadPacks()
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  }
+}
+
 async function doImport() {
   if (importReason.value.trim().length < 2) {
     ElMessage.warning('请填写变更原因')
@@ -224,9 +335,82 @@ async function viewMd(row: PackItem) {
   }
 }
 
+const marketItems = ref<MarketSubmission[]>([])
+const marketLoading = ref(false)
+const marketFilter = ref('pending_admin')
+
+async function loadMarket() {
+  marketLoading.value = true
+  try {
+    marketItems.value = (
+      await http.get<{ items: MarketSubmission[] }>(
+        `/v1/admin/skill-packs/market?status=${encodeURIComponent(marketFilter.value)}`,
+      )
+    ).items
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    marketLoading.value = false
+  }
+}
+
+async function approveMarket(row: MarketSubmission) {
+  let reason = '审核通过'
+  try {
+    reason = (
+      await ElMessageBox.prompt('审核备注（可选，写入审计）', `通过：${row.display_name}`, {
+        inputValue: '审核通过上架',
+        inputValidator: (v: string) => (v && v.trim().length >= 2) || '至少 2 个字',
+      })
+    ).value.trim()
+  } catch {
+    return
+  }
+  try {
+    await http.post(`/v1/admin/skill-packs/market/${row.listing_id}/approve`, {
+      reason,
+      note: reason,
+    })
+    ElMessage.success('已通过并上架到 Skill 市场')
+    await loadMarket()
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  }
+}
+
+async function rejectMarket(row: MarketSubmission) {
+  let reason = ''
+  try {
+    reason = (
+      await ElMessageBox.prompt('请填写驳回原因（将展示给推送者）', `驳回：${row.display_name}`, {
+        inputValidator: (v: string) => (v && v.trim().length >= 2) || '至少 2 个字',
+      })
+    ).value.trim()
+  } catch {
+    return
+  }
+  try {
+    await http.post(`/v1/admin/skill-packs/market/${row.listing_id}/reject`, {
+      reason,
+      note: reason,
+    })
+    ElMessage.success('已驳回')
+    await loadMarket()
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  }
+}
+
+function recommendType(v?: string) {
+  if (v === 'approve') return 'success'
+  if (v === 'reject') return 'danger'
+  return 'warning'
+}
+
 watch(mainTab, (t) => {
   if (t === 'catalog') void load()
-  else void loadPacks()
+  else if (t === 'packs') void loadPacks()
+  else void loadMarket()
 })
 
 onMounted(() => {
@@ -292,9 +476,10 @@ onMounted(() => {
               <span class="muted">{{ formatTime(row.last_sync_at) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="" width="80" fixed="right">
+          <el-table-column label="" width="140" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" @click="edit(row)">编辑</el-button>
+              <el-button link type="danger" @click="removeSkill(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -305,7 +490,7 @@ onMounted(() => {
           type="info"
           :closable="false"
           show-icon
-          title="Skill 包（SKILL.md + scripts）可从 GitHub 导入（如 Anthropic Office Skills）。网络不通时会自动重试；仍失败请检查出网/代理后重试。"
+          title="后台添加的 Skill 包为系统包：默认全员可用并注入系统提示词；不会出现在对话页「我的 Skill」。可从 GitHub 导入。"
           style="margin-bottom: 12px"
         />
         <div style="margin-bottom: 12px">
@@ -324,11 +509,7 @@ onMounted(() => {
           <el-table-column label="调用" width="90" align="center" prop="invoke_count" />
           <el-table-column label="默认启用" width="100">
             <template #default="{ row }">
-              <el-switch
-                :model-value="row.enabled"
-                :disabled="row.kind !== 'system'"
-                @click="row.kind === 'system' && toggleDefault(row)"
-              />
+              <el-switch :model-value="row.enabled" @click="toggleDefault(row)" />
             </template>
           </el-table-column>
           <el-table-column label="更新" width="160">
@@ -336,16 +517,110 @@ onMounted(() => {
               <span class="muted">{{ formatTime(row.updated_at) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="" width="100" fixed="right">
+          <el-table-column label="" width="180" fixed="right">
             <template #default="{ row }">
-              <el-button link type="primary" @click="viewMd(row)">查看</el-button>
+              <el-button link type="primary" @click="editPack(row)">编辑</el-button>
+              <el-button link @click="viewMd(row)">查看</el-button>
+              <el-button link type="danger" @click="removePack(row)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="市场审核" name="market" lazy>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="员工推送的 Skill 经模型审查后进入本列表；通过后才会出现在对话页 Skill 市场。"
+          style="margin-bottom: 12px"
+        />
+        <div style="margin-bottom: 12px; display: flex; gap: 8px; align-items: center">
+          <el-select v-model="marketFilter" style="width: 160px" @change="loadMarket">
+            <el-option label="待审核" value="pending_admin" />
+            <el-option label="已上架" value="published" />
+            <el-option label="已驳回" value="rejected" />
+            <el-option label="全部" value="all" />
+          </el-select>
+          <el-button @click="loadMarket">刷新</el-button>
+        </div>
+        <el-table v-loading="marketLoading" :data="marketItems" empty-text="暂无投稿">
+          <el-table-column label="Skill" min-width="220">
+            <template #default="{ row }">
+              <b>{{ row.display_name }}</b>
+              <div class="muted">{{ row.name }} · 推送者 {{ row.publisher_oa }}</div>
+              <div class="muted">{{ row.market_description || row.description }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="模型审查" min-width="280">
+            <template #default="{ row }">
+              <el-tag size="small" :type="recommendType(row.model_review_recommend)">
+                {{ row.model_review_recommend || row.model_review_status || '—' }}
+              </el-tag>
+              <div class="muted" style="white-space: pre-wrap; margin-top: 6px">
+                {{ row.model_review_summary || '暂无审查意见' }}
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="120">
+            <template #default="{ row }">
+              <el-tag
+                size="small"
+                :type="row.market_status === 'published' ? 'success' : row.market_status === 'rejected' ? 'danger' : 'warning'"
+              >
+                {{ row.market_status }}
+              </el-tag>
+              <div v-if="row.admin_note" class="muted">{{ row.admin_note }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="" width="160" fixed="right">
+            <template #default="{ row }">
+              <el-button
+                v-if="row.market_status === 'pending_admin' || row.market_status === 'rejected'"
+                link
+                type="success"
+                @click="approveMarket(row)"
+              >
+                通过
+              </el-button>
+              <el-button
+                v-if="row.market_status === 'pending_admin'"
+                link
+                type="danger"
+                @click="rejectMarket(row)"
+              >
+                驳回
+              </el-button>
             </template>
           </el-table-column>
         </el-table>
       </el-tab-pane>
     </el-tabs>
 
-    <el-dialog v-model="editor" :title="editing ? `编辑 Skill：${editing}` : '新建 Skill'" width="760px" :close-on-click-modal="false">
+    <el-dialog
+      v-model="packEditor"
+      :title="packEditing ? `编辑 Skill 包：${packEditing.name}` : '编辑 Skill 包'"
+      width="760px"
+      :close-on-click-modal="false"
+      :teleported="true"
+      append-to="body"
+      align-center
+    >
+      <el-form label-width="90px">
+        <el-form-item label="SKILL.md" required>
+          <el-input v-model="packMd" type="textarea" :rows="16" />
+        </el-form-item>
+        <el-form-item label="变更原因" required>
+          <el-input v-model="packReason" type="textarea" :rows="2" maxlength="200" show-word-limit />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="packEditor = false">取消</el-button>
+        <el-button type="primary" :loading="packSaving" @click="savePack">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="editor" :title="editing ? `编辑 Skill：${editing}` : '新建 Skill'" width="760px" :close-on-click-modal="false" :teleported="true" append-to="body" align-center>
       <el-form label-width="110px">
         <el-form-item label="Skill 名" required>
           <el-input v-model="form.name" :disabled="!!editing" placeholder="如 leave_query（小写字母、数字、下划线，创建后不可改）" />
@@ -382,7 +657,7 @@ onMounted(() => {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="importOpen" title="从 GitHub 导入 Skill 包" width="640px" :close-on-click-modal="false">
+    <el-dialog v-model="importOpen" title="从 GitHub 导入 Skill 包" width="640px" :close-on-click-modal="false" :teleported="true" append-to="body">
       <el-alert
         type="warning"
         :closable="false"

@@ -77,6 +77,7 @@ class HttpJsonConnector:
         authorization: str,
         timeout: float | None = None,
         idempotency_key: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> ConnectorResult:
         if self._delegate:
             return self._invoke_via_client(
@@ -87,6 +88,7 @@ class HttpJsonConnector:
                 authorization=authorization,
                 timeout=timeout,
                 idempotency_key=idempotency_key,
+                extra_headers=extra_headers,
             )
         return self._invoke_direct(
             method,
@@ -96,6 +98,7 @@ class HttpJsonConnector:
             authorization=authorization,
             timeout=timeout,
             idempotency_key=idempotency_key,
+            extra_headers=extra_headers,
         )
 
     def _invoke_via_client(
@@ -108,6 +111,7 @@ class HttpJsonConnector:
         authorization: str,
         timeout: float | None,
         idempotency_key: str | None,
+        extra_headers: dict[str, str] | None = None,
     ) -> ConnectorResult:
         assert self._client is not None
         try:
@@ -120,6 +124,7 @@ class HttpJsonConnector:
                     authorization,
                     timeout=timeout,
                     idempotency_key=idempotency_key,
+                    extra_headers=extra_headers,
                 )
             else:
                 raise ConnectorError("UPSTREAM_HTTP_ERROR", f"不支持的 HTTP 方法：{method}")
@@ -147,6 +152,7 @@ class HttpJsonConnector:
         authorization: str,
         timeout: float | None,
         idempotency_key: str | None,
+        extra_headers: dict[str, str] | None = None,
     ) -> ConnectorResult:
         assert self._base_url is not None
         verb = method.upper()
@@ -156,6 +162,8 @@ class HttpJsonConnector:
         headers = {"Authorization": authorization}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
+        if extra_headers:
+            headers.update({k: v for k, v in extra_headers.items() if v})
 
         started = time.perf_counter()
         try:

@@ -178,6 +178,10 @@ def test_pdf_page_contains_contract_text():
 def test_blank_pdf_page_says_no_extractable_text():
     result = extract_upload("scan.pdf", _blank_pdf())
     assert result.pages == [NO_PAGE_TEXT]
+    # 无文字层时应栅格化供多模态识图
+    assert len(result.page_images) >= 1
+    assert result.page_images[0][:8] == b"\x89PNG\r\n\x1a\n"
+    assert "已渲染页面图" in result.profile
 
 
 def test_pdf_outline_goes_into_profile():

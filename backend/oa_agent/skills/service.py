@@ -102,8 +102,12 @@ def enabled_packs_for(db: Session, *, tenant_id: str, oa: str) -> list[SkillPack
     return out
 
 
+# 市场上架状态：仅 published 对全员可见
+_MARKET_ACTIVE = frozenset({"pending_admin", "published", "rejected"})
+
+
 def list_user_library(db: Session, *, tenant_id: str, oa: str) -> list[dict[str, Any]]:
-    """员工 Skill 管理页：仅本人自建 + 市场安装；系统包不出现在此列表。"""
+    """员工「我的 Skill」：仅本人自建 + 市场安装；后台系统包不展示（仍注入系统提示词）。"""
     packs = list(db.scalars(sa.select(SkillPack).where(SkillPack.tenant_id == tenant_id)).all())
     user_rows = {
         r.pack_id: r
@@ -116,7 +120,7 @@ def list_user_library(db: Session, *, tenant_id: str, oa: str) -> list[dict[str,
         for r in db.scalars(
             sa.select(SkillMarketListing).where(
                 SkillMarketListing.tenant_id == tenant_id,
-                SkillMarketListing.status == "published",
+                SkillMarketListing.status.in_(list(_MARKET_ACTIVE)),
             )
         ).all()
     }
@@ -126,21 +130,35 @@ def list_user_library(db: Session, *, tenant_id: str, oa: str) -> list[dict[str,
             continue
         row = user_rows.get(pack.id)
         version = _version(db, pack)
+        listing = listings.get(pack.id)
         if pack.owner_oa == oa:
             enabled = row.enabled if row is not None else True
-            items.append(_pack_dict(pack, version, enabled=enabled, origin=row.origin if row else "created",
-                                    in_library=True, listed=pack.id in listings))
+            items.append(_pack_dict(
+                pack, version, enabled=enabled, origin=row.origin if row else "created",
+                in_library=True, listed=listing is not None and listing.status != "withdrawn",
+                listing=listing,
+            ))
             continue
         if row is not None and row.origin == "market_install":
-            items.append(_pack_dict(pack, version, enabled=row.enabled, origin="market_install",
-                                    in_library=True, listed=pack.id in listings))
-    items.sort(key=lambda x: (x["name"],))
+            items.append(_pack_dict(
+                pack, version, enabled=row.enabled, origin="market_install",
+                in_library=True, listed=False, listing=None,
+            ))
+    items.sort(key=lambda x: x["name"])
     return items
 
 
-def _pack_dict(pack: SkillPack, version: SkillPackVersion | None, *, enabled: bool, origin: str,
-               in_library: bool, listed: bool) -> dict[str, Any]:
-    return {
+def _pack_dict(
+    pack: SkillPack,
+    version: SkillPackVersion | None,
+    *,
+    enabled: bool,
+    origin: str,
+    in_library: bool,
+    listed: bool,
+    listing: SkillMarketListing | None = None,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
         "id": pack.id,
         "name": pack.name,
         "display_name": pack.display_name or pack.name,
@@ -156,6 +174,23 @@ def _pack_dict(pack: SkillPack, version: SkillPackVersion | None, *, enabled: bo
         "in_library": in_library,
         "listed": listed,
         "updated_at": pack.updated_at,
+    }
+    if listing is not None:
+        data.update(_listing_public(listing))
+    return data
+
+
+def _listing_public(listing: SkillMarketListing) -> dict[str, Any]:
+    return {
+        "market_status": listing.status,
+        "market_description": listing.description or "",
+        "model_review_status": listing.model_review_status or "",
+        "model_review_summary": listing.model_review_summary or "",
+        "model_review_recommend": listing.model_review_recommend or "",
+        "model_reviewed_at": listing.model_reviewed_at,
+        "admin_note": listing.admin_note or "",
+        "admin_reviewer": listing.admin_reviewer or "",
+        "admin_reviewed_at": listing.admin_reviewed_at,
     }
 
 
@@ -289,6 +324,14 @@ def create_user_pack(
     return pack
 
 
+def _user_library_row(db: Session, *, tenant_id: str, oa: str, pack_id: int) -> UserSkillPack | None:
+    return db.scalar(
+        sa.select(UserSkillPack).where(
+            UserSkillPack.tenant_id == tenant_id, UserSkillPack.oa == oa, UserSkillPack.pack_id == pack_id,
+        )
+    )
+
+
 def update_user_pack(
     db: Session,
     *,
@@ -302,8 +345,10 @@ def update_user_pack(
     pack = db.get(SkillPack, pack_id)
     if pack is None or pack.tenant_id != tenant_id:
         raise AppError(404, "NOT_FOUND", "Skill 包不存在")
-    if pack.kind == "system" or pack.owner_oa != oa:
-        raise AppError(403, "FORBIDDEN", "只能编辑自己创建的 Skill")
+    row = _user_library_row(db, tenant_id=tenant_id, oa=oa, pack_id=pack_id)
+    # 本人创建、市场安装到自己库、或系统包均可改正文
+    if pack.owner_oa != oa and pack.kind != "system" and (row is None or row.origin != "market_install"):
+        raise AppError(403, "FORBIDDEN", "只能编辑自己库中的 Skill")
     version = _version(db, pack)
     if version is None:
         raise AppError(404, "NOT_FOUND", "Skill 包无版本")
@@ -324,13 +369,10 @@ def set_pack_enabled(db: Session, *, tenant_id: str, oa: str, pack_id: int, enab
     pack = db.get(SkillPack, pack_id)
     if pack is None or pack.tenant_id != tenant_id:
         raise AppError(404, "NOT_FOUND", "Skill 包不存在")
+    # 系统包仅后台可改；对话页「我的 Skill」不再展示系统包
     if pack.kind == "system":
-        raise AppError(403, "FORBIDDEN", "系统 Skill 由后台统一配置，员工不可启停")
-    row = db.scalar(
-        sa.select(UserSkillPack).where(
-            UserSkillPack.tenant_id == tenant_id, UserSkillPack.oa == oa, UserSkillPack.pack_id == pack_id,
-        )
-    )
+        raise AppError(403, "FORBIDDEN", "系统 Skill 由后台统一启停，无法在对话页修改")
+    row = _user_library_row(db, tenant_id=tenant_id, oa=oa, pack_id=pack_id)
     if row is None:
         if pack.owner_oa != oa:
             raise AppError(404, "NOT_FOUND", "未安装该 Skill")
@@ -344,28 +386,73 @@ def set_pack_enabled(db: Session, *, tenant_id: str, oa: str, pack_id: int, enab
     row.updated_at = utcnow()
 
 
-def delete_user_pack(db: Session, *, tenant_id: str, oa: str, pack_id: int, data_dir: Path) -> None:
-    pack = db.get(SkillPack, pack_id)
-    if pack is None or pack.tenant_id != tenant_id:
-        raise AppError(404, "NOT_FOUND", "Skill 包不存在")
-    if pack.kind == "system" or pack.owner_oa != oa:
-        raise AppError(403, "FORBIDDEN", "只能删除自己创建的 Skill")
+def _purge_pack(db: Session, *, pack: SkillPack, data_dir: Path) -> None:
+    """彻底删除包、版本文件与全员安装记录。"""
     listing = db.scalar(
         sa.select(SkillMarketListing).where(
-            SkillMarketListing.tenant_id == tenant_id, SkillMarketListing.pack_id == pack_id,
+            SkillMarketListing.tenant_id == pack.tenant_id, SkillMarketListing.pack_id == pack.id,
         )
     )
     if listing is not None:
         listing.status = "withdrawn"
         listing.updated_at = utcnow()
-    db.execute(sa.delete(UserSkillPack).where(UserSkillPack.pack_id == pack_id))
-    versions = list(db.scalars(sa.select(SkillPackVersion).where(SkillPackVersion.pack_id == pack_id)).all())
+    db.execute(sa.delete(UserSkillPack).where(UserSkillPack.pack_id == pack.id))
+    versions = list(db.scalars(sa.select(SkillPackVersion).where(SkillPackVersion.pack_id == pack.id)).all())
     for v in versions:
         path = pack_bundle_dir(data_dir, v.storage_path)
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
         db.delete(v)
     db.delete(pack)
+
+
+def delete_user_pack(db: Session, *, tenant_id: str, oa: str, pack_id: int, data_dir: Path) -> None:
+    pack = db.get(SkillPack, pack_id)
+    if pack is None or pack.tenant_id != tenant_id:
+        raise AppError(404, "NOT_FOUND", "Skill 包不存在")
+    row = _user_library_row(db, tenant_id=tenant_id, oa=oa, pack_id=pack_id)
+    # 市场安装：只从个人库移除，不删原包
+    if row is not None and row.origin == "market_install" and pack.owner_oa != oa:
+        db.delete(row)
+        return
+    if pack.owner_oa == oa or pack.kind == "system":
+        _purge_pack(db, pack=pack, data_dir=data_dir)
+        return
+    raise AppError(403, "FORBIDDEN", "只能删除自己库中的 Skill")
+
+
+def admin_update_pack(
+    db: Session,
+    *,
+    tenant_id: str,
+    pack_id: int,
+    data_dir: Path,
+    skill_md: str,
+    operator: str,
+) -> SkillPack:
+    """管理端更新任意 Skill 包正文。"""
+    pack = db.get(SkillPack, pack_id)
+    if pack is None or pack.tenant_id != tenant_id:
+        raise AppError(404, "NOT_FOUND", "Skill 包不存在")
+    version = _version(db, pack)
+    if version is None:
+        raise AppError(404, "NOT_FOUND", "Skill 包无版本")
+    root = pack_bundle_dir(data_dir, version.storage_path)
+    files = load_bundle_files(root)
+    files["SKILL.md"] = skill_md.encode("utf-8")
+    try:
+        save_pack_version(db, pack=pack, files=files, data_dir=data_dir, operator=operator)
+    except SkillMdError as exc:
+        raise AppError(422, "VALIDATION_ERROR", exc.message) from None
+    return pack
+
+
+def admin_delete_pack(db: Session, *, tenant_id: str, pack_id: int, data_dir: Path) -> None:
+    """管理端删除任意 Skill 包。"""
+    pack = db.get(SkillPack, pack_id)
+    if pack is None or pack.tenant_id != tenant_id:
+        raise AppError(404, "NOT_FOUND", "Skill 包不存在")
+    _purge_pack(db, pack=pack, data_dir=data_dir)
 
 
 def publish_to_market(
@@ -376,6 +463,7 @@ def publish_to_market(
     pack_id: int,
     description: str | None = None,
 ) -> SkillMarketListing:
+    """提交上架：写入待审记录（模型审查由调用方随后写入）。"""
     pack = db.get(SkillPack, pack_id)
     if pack is None or pack.tenant_id != tenant_id:
         raise AppError(404, "NOT_FOUND", "Skill 包不存在")
@@ -393,25 +481,128 @@ def publish_to_market(
             SkillMarketListing.tenant_id == tenant_id, SkillMarketListing.pack_id == pack_id,
         )
     )
+    now = utcnow()
     if listing is None:
         listing = SkillMarketListing(
             tenant_id=tenant_id,
             pack_id=pack_id,
             publisher_oa=oa,
             description=market_desc,
-            status="published",
+            status="pending_admin",
             invoke_count=int(pack.invoke_count or 0),
-            created_at=utcnow(),
-            updated_at=utcnow(),
+            model_review_status="",
+            model_review_summary="",
+            model_review_recommend="",
+            admin_note="",
+            admin_reviewer="",
+            admin_reviewed_at=None,
+            created_at=now,
+            updated_at=now,
         )
         db.add(listing)
     else:
-        listing.status = "published"
+        if listing.status == "published":
+            raise AppError(409, "ALREADY_PUBLISHED", "该 Skill 已在市场中，请先下架再重新推送")
+        listing.status = "pending_admin"
         listing.publisher_oa = oa
         listing.description = market_desc
         listing.invoke_count = int(pack.invoke_count or 0)
-        listing.updated_at = utcnow()
+        listing.admin_note = ""
+        listing.admin_reviewer = ""
+        listing.admin_reviewed_at = None
+        listing.updated_at = now
     return listing
+
+
+def apply_model_review(
+    listing: SkillMarketListing,
+    *,
+    status: str,
+    summary: str,
+    recommend: str,
+) -> None:
+    """写回模型审查结果（不改变 pending_admin，仍待管理员终审）。"""
+    listing.model_review_status = status
+    listing.model_review_summary = (summary or "")[:8000]
+    listing.model_review_recommend = recommend or ""
+    listing.model_reviewed_at = utcnow()
+    listing.updated_at = utcnow()
+
+
+def run_model_skill_review(
+    *,
+    vault,
+    tenant_id: str,
+    db: Session,
+    pack: SkillPack,
+    skill_md: str,
+    market_desc: str,
+) -> dict[str, str]:
+    """调用租户默认模型审查 Skill；失败时返回 skipped/error，不阻断提交。"""
+    from oa_agent.runtime.llm import build_chat_model, resolve_model
+
+    cfg = resolve_model(db, vault, tenant_id) if vault is not None else None
+    if cfg is None:
+        return {
+            "status": "skipped",
+            "summary": "未配置可用模型，已跳过自动审查，请管理员人工审核。",
+            "recommend": "review",
+        }
+    prompt = (
+        "你是企业内部 Skill 安全与质量审查员。根据 SKILL.md 与市场上架描述，判断是否适合发布到员工 Skill 市场。\n"
+        "只输出一个 JSON 对象，不要其它文字：\n"
+        '{"recommend":"approve|reject|review","summary":"中文审查意见，分点说明安全性、可用性、描述是否准确"}\n'
+        "规则：\n"
+        "- 含明显恶意指令、泄露密钥、越权操作、外泄数据倾向 → reject\n"
+        "- 内容空洞、无法执行、描述与正文严重不符 → reject 或 review\n"
+        "- 基本可用且风险可控 → approve；存疑 → review\n"
+    )
+    human = (
+        f"## 市场上架描述\n{market_desc}\n\n"
+        f"## Skill 元信息\nname={pack.name}\ndisplay={pack.display_name}\n"
+        f"description={pack.description}\n\n"
+        f"## SKILL.md\n{skill_md[:12000]}"
+    )
+    try:
+        model = build_chat_model(cfg)
+        resp = model.invoke([("system", prompt), ("human", human)])
+        raw = getattr(resp, "content", None) or str(resp)
+        if isinstance(raw, list):
+            raw = "".join(str(x) for x in raw)
+        text = str(raw).strip()
+        parsed = _parse_review_json(text)
+        recommend = str(parsed.get("recommend") or "review").strip().lower()
+        if recommend not in ("approve", "reject", "review"):
+            recommend = "review"
+        summary = str(parsed.get("summary") or text)[:4000].strip() or "模型未给出明确意见"
+        return {"status": "passed", "summary": summary, "recommend": recommend}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Skill 模型审查失败 pack=%s", pack.name)
+        return {
+            "status": "error",
+            "summary": f"自动审查失败：{type(exc).__name__}，请管理员人工审核。",
+            "recommend": "review",
+        }
+
+
+def _parse_review_json(text: str) -> dict:
+    import json
+    import re
+
+    cleaned = re.sub(r"```(?:json)?\s*", "", text)
+    cleaned = cleaned.replace("```", "").strip()
+    try:
+        data = json.loads(cleaned)
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        m = re.search(r"\{[\s\S]*\}", cleaned)
+        if not m:
+            return {}
+        try:
+            data = json.loads(m.group(0))
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
 
 
 def withdraw_from_market(db: Session, *, tenant_id: str, oa: str, pack_id: int) -> None:
@@ -602,11 +793,91 @@ def admin_list_packs(db: Session, *, tenant_id: str) -> list[dict[str, Any]]:
 
 
 def admin_set_system_default(db: Session, *, tenant_id: str, pack_id: int, enabled_default: bool) -> SkillPack:
+    """管理端设置包默认启停（系统包改 enabled_default；用户包同步写 owner 的 UserSkillPack）。"""
     pack = db.get(SkillPack, pack_id)
     if pack is None or pack.tenant_id != tenant_id:
         raise AppError(404, "NOT_FOUND", "Skill 包不存在")
-    if pack.kind != "system":
-        raise AppError(422, "VALIDATION_ERROR", "只能设置系统包默认启停")
     pack.enabled_default = enabled_default
     pack.updated_at = utcnow()
+    if pack.kind != "system" and pack.owner_oa:
+        row = _user_library_row(db, tenant_id=tenant_id, oa=pack.owner_oa, pack_id=pack.id)
+        if row is None:
+            db.add(UserSkillPack(
+                tenant_id=tenant_id, oa=pack.owner_oa, pack_id=pack.id, enabled=enabled_default,
+                origin="created", created_at=utcnow(), updated_at=utcnow(),
+            ))
+        else:
+            row.enabled = enabled_default
+            row.updated_at = utcnow()
     return pack
+
+
+def admin_list_market_submissions(
+    db: Session,
+    *,
+    tenant_id: str,
+    status: str = "pending_admin",
+) -> list[dict[str, Any]]:
+    """管理端：市场投稿列表（默认待审）。"""
+    q = sa.select(SkillMarketListing).where(SkillMarketListing.tenant_id == tenant_id)
+    if status and status != "all":
+        q = q.where(SkillMarketListing.status == status)
+    rows = list(db.scalars(q.order_by(SkillMarketListing.updated_at.desc(), SkillMarketListing.id.desc())).all())
+    items: list[dict[str, Any]] = []
+    for listing in rows:
+        pack = db.get(SkillPack, listing.pack_id)
+        if pack is None:
+            continue
+        version = _version(db, pack)
+        items.append({
+            **_pack_dict(pack, version, enabled=True, origin="market", in_library=False, listed=True, listing=listing),
+            "listing_id": listing.id,
+            "publisher_oa": listing.publisher_oa,
+            "skill_md_preview": (version.skill_md[:2000] if version else ""),
+        })
+    return items
+
+
+def admin_approve_market(
+    db: Session,
+    *,
+    tenant_id: str,
+    listing_id: int,
+    reviewer: str,
+    note: str = "",
+) -> SkillMarketListing:
+    listing = db.get(SkillMarketListing, listing_id)
+    if listing is None or listing.tenant_id != tenant_id:
+        raise AppError(404, "NOT_FOUND", "投稿不存在")
+    if listing.status not in ("pending_admin", "rejected"):
+        raise AppError(409, "INVALID_STATUS", f"当前状态不可通过：{listing.status}")
+    listing.status = "published"
+    listing.admin_note = (note or "").strip()[:512]
+    listing.admin_reviewer = reviewer
+    listing.admin_reviewed_at = utcnow()
+    listing.updated_at = utcnow()
+    return listing
+
+
+def admin_reject_market(
+    db: Session,
+    *,
+    tenant_id: str,
+    listing_id: int,
+    reviewer: str,
+    note: str,
+) -> SkillMarketListing:
+    listing = db.get(SkillMarketListing, listing_id)
+    if listing is None or listing.tenant_id != tenant_id:
+        raise AppError(404, "NOT_FOUND", "投稿不存在")
+    if listing.status != "pending_admin":
+        raise AppError(409, "INVALID_STATUS", f"当前状态不可驳回：{listing.status}")
+    note = (note or "").strip()
+    if len(note) < 2:
+        raise AppError(422, "VALIDATION_ERROR", "请填写驳回原因")
+    listing.status = "rejected"
+    listing.admin_note = note[:512]
+    listing.admin_reviewer = reviewer
+    listing.admin_reviewed_at = utcnow()
+    listing.updated_at = utcnow()
+    return listing

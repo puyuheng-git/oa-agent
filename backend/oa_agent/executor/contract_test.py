@@ -39,6 +39,11 @@ def contract_check(schema: dict[str, Any] | None) -> ContractCheckResult:
 
 
 def is_activatable(schema: dict[str, Any] | None) -> bool:
-    """一期仅允许 GET；缺样例时仍可调 activate（见 contract_check 告警）。"""
+    """可激活：GET 只读；或带 invoke_service/method 的 open-oa POST。"""
     schema = schema or {}
-    return str(schema.get("method") or "GET").upper() == "GET"
+    method = str(schema.get("method") or "GET").upper()
+    if method == "GET":
+        return True
+    if method == "POST" and str(schema.get("invoke_service") or "").strip() and str(schema.get("invoke_method") or "").strip():
+        return True
+    return False

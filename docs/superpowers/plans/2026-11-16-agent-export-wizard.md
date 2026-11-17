@@ -34,8 +34,9 @@
 
 | 文件 | 职责 |
 |------|------|
-| `service-app/.../oa/agent_bridge/ExportInspector.php` | **新建** `listPublicMethods` / `describeMethod` |
-| `service-app/.../oa/agent_bridge/Export.php` | 改：discover 委托 Inspector；`invokeAgentExport` 无 Registry，按 `call` 绑定 |
+| `service-app/.../oa/agent_bridge/logic/ExportInspectorImpl.php` | **新建** `listPublicMethods` / `describeMethod` |
+| `service-app/.../oa/agent_bridge/logic/AgentExportInvokeImpl.php` | **新建** 无 Registry 的 invoke 绑定 |
+| `service-app/.../oa/agent_bridge/Export.php` | 门面：仅转发 Impl，不含业务逻辑 |
 | `service-app/.../oa/agent_bridge/AgentExportRegistry.php` | **删除** |
 | `service-app/.../oa/agent_bridge/Error.php` | 文案：NOT_FOUND=方法不存在；可增 `AGENT_EXPORT_BAD_CALL` |
 | `service-app/.../oa/agent_bridge/_smoke_*.php` | 冒烟改为 Inspector + 无 Registry invoke |

@@ -140,7 +140,8 @@ def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
             if "default" in rule:
                 clean[key] = rule["default"]
             continue
-        if rule.get("type") == "integer":
+        ptype = rule.get("type") or "string"
+        if ptype == "integer":
             try:
                 value = int(value)
             except (TypeError, ValueError):
@@ -149,6 +150,30 @@ def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
                 raise ToolError("INVALID_ARGUMENT", f"{key} 不能小于 {rule['minimum']}")
             if "maximum" in rule and value > rule["maximum"]:
                 value = rule["maximum"]  # 上限截断（如 limit ≤ 20）
+        elif ptype == "number":
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ToolError("INVALID_ARGUMENT", f"{key} 必须是数字") from None
+        elif ptype == "boolean":
+            if isinstance(value, bool):
+                pass
+            elif isinstance(value, (int, float)):
+                value = bool(value)
+            else:
+                value = str(value).strip().lower() in ("1", "true", "yes", "y", "是")
+        elif ptype == "object":
+            if not isinstance(value, dict):
+                raise ToolError("INVALID_ARGUMENT", f"{key} 必须是对象")
+        elif ptype == "array":
+            if not isinstance(value, list):
+                raise ToolError("INVALID_ARGUMENT", f"{key} 必须是数组")
+        elif ptype == "file":
+            value = str(value).strip()
+            if not value:
+                if rule.get("required"):
+                    raise ToolError("INVALID_ARGUMENT", f"缺少参数 {key}")
+                continue
         else:
             value = str(value).strip()
             if rule.get("format") == "date":
@@ -224,16 +249,18 @@ def _extract_list(data: object) -> tuple[list, int]:
 class ToolExecutor:
     def __init__(self, registry: ToolRegistry, clients: dict[str, OfficeApiClient], remark_limit: int = REMARK_LIMIT,
                  *, mcp_client: object | None = None, builtin_runtime: object | None = None,
-                 hub: ConnectorHub | None = None):
+                 hub: ConnectorHub | None = None, gateway_secret: str | None = None):
         """clients：地址标识 → office-api 客户端（见 office_api.upstream_clients）；mcp_client：出站 MCP 客户端；
         builtin_runtime：内置 Tool 运行时（None → 仅 time/calc 可用，export/memory 需注入带存储的运行时）；
-        hub：可选 ConnectorHub；有对应 connector 时优先 invoke，否则回退 clients。"""
+        hub：可选 ConnectorHub；有对应 connector 时优先 invoke，否则回退 clients；
+        gateway_secret：open-oa invoke 双鉴权用的 Agent 网关密钥。"""
         self.registry = registry
         self.clients = clients
         self.remark_limit = remark_limit
         self.mcp_client = mcp_client  # None → 未配置出站连接器（调用即「未对你开放」）
         self.builtin_runtime = builtin_runtime
         self.hub = hub
+        self.gateway_secret = (gateway_secret or "").strip() or None
 
     def _execute_builtin(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder,
                          node_name: str) -> dict:
@@ -323,8 +350,13 @@ class ToolExecutor:
         connector_id = spec.upstream or DEFAULT_UPSTREAM
         service = (spec.invoke_service or "").strip()
         method = (spec.invoke_method or "").strip()
+        call = (spec.invoke_call or "one_by_params").strip() or "one_by_params"
+        op = (spec.invoke_op or "read").strip() or "read"
         if not service or not method:
             raise ToolError("TOOL_NOT_AVAILABLE", f"open_oa_invoke 未配置 service/method：{spec.name}",
+                            user_message=MSG_NOT_AVAILABLE)
+        if not self.gateway_secret:
+            raise ToolError("UPSTREAM_NOT_CONFIGURED", "未配置 AGENT_GATEWAY_SECRET，无法调用 open-oa invoke",
                             user_message=MSG_NOT_AVAILABLE)
         rec.tool_call_count += 1
         rec.event(
@@ -333,11 +365,12 @@ class ToolExecutor:
             metadata={
                 "path": spec.path or INVOKE_PATH, "upstream": spec.upstream, "connector_id": connector_id,
                 "kind": "open_oa_invoke", "invoke_service": service, "invoke_method": method,
+                "invoke_call": call, "invoke_op": op,
                 **({"dropped_fields": dropped} if dropped else {}),
             },
         )
         started = time.perf_counter()
-        body = {"service": service, "method": method, "args": clean}
+        body = {"service": service, "method": method, "args": clean, "call": call, "op": op}
         try:
             connector, client = self._resolve_client(spec.upstream)
             if connector is None and client is None:
@@ -346,20 +379,25 @@ class ToolExecutor:
             auth = authorization_for(identity, connector_id, allow_office_fallback=share_office)
             path = (spec.path or INVOKE_PATH).strip() or INVOKE_PATH
             idem = None
-            if (spec.risk_level or "low") != "low" or spec.requires_confirmation:
-                # 写路径幂等键由上层确认流注入；此处预留 header 位（Task 7）
+            if (spec.risk_level or "low") != "low" or spec.requires_confirmation or op == "write":
+                # 写路径幂等键由上层确认流注入
                 idem = (args or {}).get("_idempotency_key") or None
                 if isinstance(idem, str):
                     idem = idem.strip() or None
                 else:
                     idem = None
+            from oa_agent.integrations.open_oa import GATEWAY_SECRET_HEADER
+            gw_headers = {GATEWAY_SECRET_HEADER: self.gateway_secret}
             if connector is not None:
                 resp = connector.invoke(
                     "POST", path, params=None, json_body=body, authorization=auth,
-                    timeout=spec.timeout_seconds, idempotency_key=idem,
+                    timeout=spec.timeout_seconds, idempotency_key=idem, extra_headers=gw_headers,
                 )
             else:
-                resp = client.post(path, body, auth, timeout=spec.timeout_seconds, idempotency_key=idem)
+                resp = client.post(
+                    path, body, auth, timeout=spec.timeout_seconds, idempotency_key=idem,
+                    extra_headers=gw_headers,
+                )
             result = compact(spec, resp.data, clean, self.remark_limit)
         except (OfficeApiError, ConnectorError, ToolError) as exc:
             rec.event(

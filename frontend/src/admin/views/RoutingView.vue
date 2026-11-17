@@ -298,7 +298,7 @@ onMounted(() => {
       </el-tab-pane>
     </el-tabs>
 
-    <el-drawer v-model="drawer" title="调用过程" size="520px">
+    <el-drawer v-model="drawer" title="调用过程" size="520px" :teleported="true" append-to="body">
       <div v-loading="detailLoading">
         <template v-if="detail">
           <p>

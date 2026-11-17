@@ -16,4 +16,8 @@ setUnauthenticatedHandler(() => {
   }
 })
 
-createApp(App).use(ElementPlus, { locale: zhCn }).use(router).mount('#app')
+createApp(App).use(ElementPlus, {
+  locale: zhCn,
+  // 弹层统一挂到 body，避免落在 .holo-body 滚动容器内滚出视野
+  zIndex: 4000,
+}).use(router).mount('#app')

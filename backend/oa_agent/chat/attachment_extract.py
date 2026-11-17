@@ -24,6 +24,10 @@ MAX_SIDE = 8192
 MAX_PIXELS = 64_000_000
 MAX_LONG_SIDE = 2048
 MAX_PROFILE_CHARS = 8000
+# 与 attachment_loop.IMAGE_BUDGET 对齐：扫描件最多渲这么多页给多模态
+MAX_PDF_RENDER_PAGES = 8
+# 渲染目标约 144dpi（scale=2）；再按 MAX_LONG_SIDE 收缩
+PDF_RENDER_SCALE = 2.0
 
 _IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 
@@ -44,8 +48,10 @@ class Extracted:
     pages: list[str]
     width: int
     height: int
-    image_png: bytes | None
-    unreadable: str | None
+    image_png: bytes | None = None
+    unreadable: str | None = None
+    # 扫描件等无文字层 PDF：页面栅格化后的 PNG，供多模态识读
+    page_images: tuple[bytes, ...] = ()
 
 
 def extract_upload(filename: str, data: bytes) -> Extracted:
@@ -450,6 +456,64 @@ def _extract_pdf(data: bytes) -> Extracted:
         return _unreadable()
 
 
+def _pages_lack_text(pages: list[str]) -> bool:
+    return bool(pages) and all((page or "").strip() == NO_PAGE_TEXT for page in pages)
+
+
+def _pil_to_png_bytes(image: Image.Image) -> tuple[bytes, int, int] | None:
+    """按图片附件同一套边长/像素上限，输出 PNG。"""
+    oriented = ImageOps.exif_transpose(image) or image
+    width, height = oriented.size
+    if _image_exceeds_limit(width, height):
+        return None
+    long_side = max(width, height)
+    if long_side > MAX_LONG_SIDE:
+        scale = MAX_LONG_SIDE / long_side
+        width = max(1, round(width * scale))
+        height = max(1, round(height * scale))
+        oriented = oriented.resize((width, height), Image.Resampling.LANCZOS)
+    colored = oriented.convert("RGBA" if _has_alpha(oriented) else "RGB")
+    buffer = io.BytesIO()
+    colored.save(buffer, format="PNG")
+    return buffer.getvalue(), width, height
+
+
+def _render_pdf_page_images(data: bytes, page_count: int) -> tuple[tuple[bytes, ...], int, int]:
+    """无文字层时把前 N 页渲成 PNG，供多模态模型识图。失败返回空元组。"""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return (), 0, 0
+    try:
+        document = pdfium.PdfDocument(data)
+    except Exception:
+        return (), 0, 0
+    images: list[bytes] = []
+    first_w = 0
+    first_h = 0
+    try:
+        limit = min(int(page_count), len(document), MAX_PDF_RENDER_PAGES)
+        for index in range(limit):
+            page = document[index]
+            try:
+                bitmap = page.render(scale=PDF_RENDER_SCALE)
+                pil = bitmap.to_pil()
+                converted = _pil_to_png_bytes(pil)
+                if converted is None:
+                    continue
+                png, width, height = converted
+                images.append(png)
+                if not first_w:
+                    first_w, first_h = width, height
+            except Exception:
+                continue
+            finally:
+                page.close()
+    finally:
+        document.close()
+    return tuple(images), first_w, first_h
+
+
 def _read_pdf(data: bytes) -> Extracted:
     reader = PdfReader(io.BytesIO(data))
     if reader.is_encrypted:
@@ -474,15 +538,28 @@ def _read_pdf(data: bytes) -> Extracted:
     if outline_lines:
         profile_lines.append("目录：")
         profile_lines.extend(outline_lines)
+
+    # 扫描件：文字层为空时栅格化页面，走多模态识图，而不是直接判失败
+    page_images: tuple[bytes, ...] = ()
+    width = 0
+    height = 0
+    if _pages_lack_text(pages):
+        page_images, width, height = _render_pdf_page_images(data, len(pages))
+        if page_images:
+            profile_lines.append(f"已渲染页面图：{len(page_images)}页（供识图）")
+        else:
+            profile_lines.append("无文字层且页面渲染失败")
+
     return Extracted(
         text="\n".join(pages),
         profile=_cap_profile("\n".join(profile_lines)),
         sheets=[],
         pages=pages,
-        width=0,
-        height=0,
+        width=width,
+        height=height,
         image_png=None,
         unreadable=None,
+        page_images=page_images,
     )
 
 

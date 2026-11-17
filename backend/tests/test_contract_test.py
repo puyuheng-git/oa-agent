@@ -12,6 +12,12 @@ def test_contract_check_warns_without_samples():
     assert not result.passed and result.warnings
 
 
-def test_is_activatable_get_only():
+def test_is_activatable_get_and_open_oa_post():
     assert is_activatable({"method": "GET"})
     assert not is_activatable({"method": "POST"})
+    assert is_activatable({
+        "method": "POST",
+        "invoke_service": "out_attendance/go_out_application",
+        "invoke_method": "searchApplicationList",
+    })
+    assert not is_activatable({"method": "POST", "invoke_service": "a/b"})

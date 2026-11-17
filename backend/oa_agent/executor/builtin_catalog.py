@@ -181,7 +181,7 @@ def builtin_guide(builtin_id: str | None) -> dict[str, Any] | None:
             "note": "执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。",
         },
         "runtime": "BuiltinRuntime（进程内）",
-        "edit_hint": "实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。",
+        "edit_hint": "实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。",
     }
 
 

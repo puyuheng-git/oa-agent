@@ -560,7 +560,11 @@ class UserSkillPack(Base):
 
 
 class SkillMarketListing(Base):
-    """租户内 Skill 市场上架。"""
+    """租户内 Skill 市场上架。
+
+    status：pending_admin（待管理员审核）| published | rejected | withdrawn
+    推送后先经模型审查，再进入后台审核；仅 published 出现在员工市场。
+    """
 
     __tablename__ = "agent_skill_market_listing"
     __table_args__ = (
@@ -573,8 +577,19 @@ class SkillMarketListing(Base):
     pack_id: Mapped[int] = mapped_column(sa.BigInteger)
     publisher_oa: Mapped[str] = mapped_column(sa.String(64))
     description: Mapped[str] = mapped_column(sa.String(1024), default="", server_default="")
-    status: Mapped[str] = mapped_column(sa.String(16), default="published")  # published|withdrawn
+    status: Mapped[str] = mapped_column(sa.String(16), default="pending_admin")
     invoke_count: Mapped[int] = mapped_column(sa.Integer, default=0, server_default="0")
+    # 模型自动审查
+    model_review_status: Mapped[str] = mapped_column(sa.String(16), default="", server_default="")
+    # passed | failed | skipped | error；TEXT 在 MySQL 无 DEFAULT，可空由业务读时按 "" 处理
+    model_review_summary: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    model_review_recommend: Mapped[str] = mapped_column(sa.String(16), default="", server_default="")
+    # approve | reject | review
+    model_reviewed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    # 管理员审核
+    admin_note: Mapped[str] = mapped_column(sa.String(512), default="", server_default="")
+    admin_reviewer: Mapped[str] = mapped_column(sa.String(64), default="", server_default="")
+    admin_reviewed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 

@@ -213,7 +213,7 @@ defineExpose({
   height: 100%;
   display: block;
   mix-blend-mode: screen;
-  contain: strict;
+  contain: layout style;
 }
 /* 面板打开时冻结画面并弱化混合，避免滚动时每帧重算 screen blend */
 .stage.paused .gl {

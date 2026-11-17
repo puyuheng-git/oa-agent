@@ -44,6 +44,8 @@ class ToolSpec:
     # open_oa_invoke：固定转发到 /agent/invoke 的 ANew 目标（模型不可改）
     invoke_service: str = ""
     invoke_method: str = ""
+    invoke_call: str = "one_by_params"  # page_list | one_by_params | named_args
+    invoke_op: str = "read"  # read | write
 
     def label(self, key: str) -> str:
         return self.result_labels.get(key) or key

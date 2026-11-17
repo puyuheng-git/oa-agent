@@ -171,3 +171,31 @@ def test_help_is_generated_from_skills(chat, office):
     h = open_chat(chat)
     body = send(chat, h, "你好").json()
     assert "行程报销查询" in body["reply"]["content"] and "查上周的行程报销" in body["reply"]["content"]
+
+
+def test_tool_and_skill_can_be_deleted(admin):
+    """全部 Tool / Skill 可删除；内置 Tool 可改摘要。"""
+    _ensure_office_upstream(admin)
+    tool_body = {**LEAVE_TOOL, "upstream": "office", "name": "query_my_leave_list_del"}
+    skill_body = {**LEAVE_SKILL, "name": "leave_query_del", "tools": ["query_my_leave_list_del"]}
+    created = admin.post("/v1/admin/tools", json=tool_body)
+    assert created.status_code == 200, created.text
+    skill = admin.post("/v1/admin/skills", json=skill_body)
+    assert skill.status_code == 200, skill.text
+
+    # 内置 Tool：只改摘要
+    meta = admin.put("/v1/admin/tools/builtin.time", json={
+        "name": "builtin.time", "summary": "当前时间（测试改摘要）", "description": "",
+        "path": "/", "upstream": "office", "result": {"kind": "object", "fields": []}, "reason": "改摘要",
+    })
+    assert meta.status_code == 200, meta.text
+    assert meta.json()["tool"]["summary"] == "当前时间（测试改摘要）"
+
+    assert admin.delete("/v1/admin/skills/leave_query_del", json={"reason": "删技能"}).status_code == 200
+    assert admin.get("/v1/admin/skills/leave_query_del").status_code == 404
+
+    assert admin.delete("/v1/admin/tools/query_my_leave_list_del", json={"reason": "删工具"}).status_code == 200
+    assert admin.get("/v1/admin/tools/query_my_leave_list_del").status_code == 404
+
+    assert admin.delete("/v1/admin/tools/builtin.calc", json={"reason": "删内置"}).status_code == 200
+    assert admin.get("/v1/admin/tools/builtin.calc").status_code == 404

@@ -15,7 +15,7 @@ const BUILTIN: Record<string, ToolGuide> = {
     constraints: ['缺省时区 Asia/Shanghai', '结果经不可信数据围栏后回图'],
     model_params: { timezone: p('时区', 'IANA 时区名，如 Asia/Shanghai；缺省为平台默认时区') },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
   'sys.calc': {
     kind: 'builtin', builtin_id: 'sys.calc', summary: '安全表达式计算', risk_level: 'low',
@@ -24,7 +24,7 @@ const BUILTIN: Record<string, ToolGuide> = {
     constraints: ['表达式最长 200 字符', '指数绝对值 ≤ 64', '结果绝对值有上限，防溢出'],
     model_params: { expression: p('表达式', '只支持数字与 + - * / // % ** 括号，如 (3+4)*2', { required: true }) },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
   'sys.export': {
     kind: 'builtin', builtin_id: 'sys.export', summary: '导出文件并返回下载票据', risk_level: 'medium',
@@ -33,7 +33,7 @@ const BUILTIN: Record<string, ToolGuide> = {
     constraints: ['内容体积有上限', '文件名缺省为 导出.xlsx', '文件名经清洗，禁止路径穿越'],
     model_params: { content: p('内容', '要导出的文本', { required: true }), filename: p('文件名') },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
   'sys.memory': {
     kind: 'builtin', builtin_id: 'sys.memory', summary: '员工长期记忆', risk_level: 'medium',
@@ -46,7 +46,7 @@ const BUILTIN: Record<string, ToolGuide> = {
       kind: p('类别'),
     },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
   'sys.cron': {
     kind: 'builtin', builtin_id: 'sys.cron', summary: '定时触发已发布的流程或任务模板', risk_level: 'high',
@@ -58,7 +58,7 @@ const BUILTIN: Record<string, ToolGuide> = {
       action: p('操作', 'list / add / remove'), workflow: p('流程'), cron: p('cron 表达式'), job_id: p('任务 ID'),
     },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
   'sys.http': {
     kind: 'builtin', builtin_id: 'sys.http', summary: '受控 HTTP 请求', risk_level: 'high',
@@ -68,7 +68,7 @@ const BUILTIN: Record<string, ToolGuide> = {
     default_sandbox_policy: { http_allow_hosts: [], http_methods: ['GET'], http_max_response_bytes: 65536 },
     model_params: { url: p('URL', '', { required: true }), method: p('方法') },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
   'sys.web_search': {
     kind: 'builtin', builtin_id: 'sys.web_search', summary: '网络搜索', risk_level: 'high',
@@ -78,7 +78,7 @@ const BUILTIN: Record<string, ToolGuide> = {
     default_sandbox_policy: { search_max_results: 5 },
     model_params: { query: p('搜索词', '', { required: true }) },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
   'sys.fs_read': {
     kind: 'builtin', builtin_id: 'sys.fs_read', summary: '沙箱内读文件', risk_level: 'high',
@@ -88,7 +88,7 @@ const BUILTIN: Record<string, ToolGuide> = {
     default_sandbox_policy: { fs_root: 'sandbox', fs_max_read_bytes: 65536 },
     model_params: { path: p('沙箱内路径', '', { required: true }) },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
   'sys.fs_write': {
     kind: 'builtin', builtin_id: 'sys.fs_write', summary: '沙箱内写文件', risk_level: 'high',
@@ -101,7 +101,7 @@ const BUILTIN: Record<string, ToolGuide> = {
       content: p('内容', '', { required: true }),
     },
     result: { kind: 'text', fields: ['text'], note: '执行结果统一围栏为文本块回图，不走 OA 接口字段白名单。' },
-    edit_hint: '实现写在代码目录中，后台不能改路径/算法；可用启停与 Skill 绑定控制是否对员工开放。',
+    edit_hint: '实现写在代码目录中；后台可改摘要、启停与删除。参数/算法需改代码后重启。',
   },
 }
 
@@ -184,7 +184,7 @@ export function resolveToolGuide(detail: ToolDetail | null): ToolGuide | null {
       },
       model_params: (schema.model_params as ToolGuide['model_params']) || {},
       result: (schema.result as Record<string, unknown>) || {},
-      edit_hint: '参数定义来自 open-oa catalog；请用「从 open-oa 清单导入」覆盖更新，或用启停开关。',
+      edit_hint: '请用「接入 Export 向导」覆盖更新，或用启停开关。',
     }
   }
   return {

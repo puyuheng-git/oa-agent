@@ -104,7 +104,7 @@ onMounted(load)
       style="margin-top: 12px" @current-change="load" />
   </el-card>
 
-  <el-dialog v-model="dialog" :title="editing ? '编辑账号' : '新增账号'" width="520px">
+  <el-dialog v-model="dialog" :title="editing ? '编辑账号' : '新增账号'" width="520px" :teleported="true" append-to="body">
     <el-form label-width="90px">
       <el-form-item label="用户名"><el-input v-model="form.username" :disabled="!!editing" /></el-form-item>
       <el-form-item label="显示名"><el-input v-model="form.display_name" /></el-form-item>

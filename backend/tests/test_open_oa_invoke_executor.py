@@ -38,6 +38,8 @@ def _invoke_spec(**kwargs) -> ToolSpec:
         kind="open_oa_invoke",
         invoke_service="out_attendance/go_out_application",
         invoke_method="getTravelExpensePageList",
+        invoke_call="page_list",
+        invoke_op="read",
     )
     base.update(kwargs)
     return ToolSpec(**base)
@@ -50,6 +52,7 @@ def test_execute_open_oa_invoke_posts_service_method():
         seen["method"] = request.method
         seen["path"] = request.url.path
         seen["auth"] = request.headers.get("authorization")
+        seen["gateway"] = request.headers.get("x-agent-gateway-secret")
         import json
         seen["body"] = json.loads(request.content.decode())
         return httpx.Response(
@@ -59,7 +62,11 @@ def test_execute_open_oa_invoke_posts_service_method():
 
     client = OpenOaClient("http://open-oa.test", transport=httpx.MockTransport(handler))
     spec = _invoke_spec()
-    ex = ToolExecutor(ToolRegistry({spec.name: spec}), clients={DEFAULT_UPSTREAM: client})
+    ex = ToolExecutor(
+        ToolRegistry({spec.name: spec}),
+        clients={DEFAULT_UPSTREAM: client},
+        gateway_secret="gw-secret",
+    )
     out = ex.execute(
         spec.name,
         {"page": 1, "limit": 5, "oa": "attacker"},
@@ -71,8 +78,11 @@ def test_execute_open_oa_invoke_posts_service_method():
     assert seen["method"] == "POST"
     assert seen["path"].endswith(INVOKE_PATH)
     assert seen["auth"] == "Bearer tok"
+    assert seen["gateway"] == "gw-secret"
     assert seen["body"]["service"] == "out_attendance/go_out_application"
     assert seen["body"]["method"] == "getTravelExpensePageList"
+    assert seen["body"]["call"] == "page_list"
+    assert seen["body"]["op"] == "read"
     assert seen["body"]["args"].get("page") == 1
     assert "oa" not in seen["body"]["args"]
     assert out["data"]["list"] == [{"id": 9, "date": "2026-01-01"}]

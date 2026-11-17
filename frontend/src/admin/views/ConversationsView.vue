@@ -139,7 +139,7 @@ onMounted(load)
   </el-card>
 
   <el-drawer v-model="detailOpen" size="60%" :title="detail ? `完整对话 · ${detail.oa} · ${detail.thread_id}` : '完整对话'"
-    @closed="closeThread">
+    :teleported="true" append-to="body" @closed="closeThread">
     <el-skeleton v-if="!detail" :rows="8" />
     <div v-else class="conv">
       <template v-for="item in timeline" :key="item.key">

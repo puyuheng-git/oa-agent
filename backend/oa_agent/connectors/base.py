@@ -55,4 +55,5 @@ class Connector(Protocol):
         authorization: str,
         timeout: float | None = None,
         idempotency_key: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> ConnectorResult: ...

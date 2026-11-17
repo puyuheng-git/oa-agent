@@ -45,8 +45,8 @@ class AdminClient:
     def put(self, url, json=None, headers=None):
         return self.client.put(url, json=json, headers=self._h(headers))
 
-    def delete(self, url, headers=None):
-        return self.client.delete(url, headers=self._h(headers))
+    def delete(self, url, json=None, headers=None):
+        return self.client.request("DELETE", url, json=json, headers=self._h(headers))
 
 
 def setup_token(settings: AppSettings) -> str:

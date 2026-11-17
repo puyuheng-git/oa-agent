@@ -34,6 +34,61 @@ def list_packs(ctx: AdminCtx = Depends(admin_read(SKILL))):
     return {"items": packs.admin_list_packs(ctx.db, tenant_id=ctx.runtime.tenant_id)}
 
 
+class MarketDecisionIn(ReasonIn):
+    note: str = Field(default="", max_length=512)
+
+
+@router.get("/market")
+def list_market_submissions(status: str = "pending_admin", ctx: AdminCtx = Depends(admin_read(SKILL))):
+    """员工推送的 Skill 市场投稿（含模型审查结果）。"""
+    return {
+        "items": packs.admin_list_market_submissions(
+            ctx.db, tenant_id=ctx.runtime.tenant_id, status=status or "pending_admin",
+        )
+    }
+
+
+@router.post("/market/{listing_id}/approve")
+def approve_market(listing_id: int, body: MarketDecisionIn, ctx: AdminCtx = Depends(admin_write(SKILL))):
+    with ctx.db.begin():
+        listing = packs.admin_approve_market(
+            ctx.db,
+            tenant_id=ctx.runtime.tenant_id,
+            listing_id=listing_id,
+            reviewer=ctx.user.username,
+            note=body.note or body.reason,
+        )
+        ctx.audit(
+            "skill_market.approve",
+            "skill_market_listing",
+            str(listing.id),
+            after={"pack_id": listing.pack_id, "status": listing.status},
+            reason=body.reason,
+        )
+    return {"id": listing.id, "pack_id": listing.pack_id, "status": listing.status}
+
+
+@router.post("/market/{listing_id}/reject")
+def reject_market(listing_id: int, body: MarketDecisionIn, ctx: AdminCtx = Depends(admin_write(SKILL))):
+    note = (body.note or body.reason or "").strip()
+    with ctx.db.begin():
+        listing = packs.admin_reject_market(
+            ctx.db,
+            tenant_id=ctx.runtime.tenant_id,
+            listing_id=listing_id,
+            reviewer=ctx.user.username,
+            note=note,
+        )
+        ctx.audit(
+            "skill_market.reject",
+            "skill_market_listing",
+            str(listing.id),
+            after={"pack_id": listing.pack_id, "status": listing.status, "note": note},
+            reason=body.reason,
+        )
+    return {"id": listing.id, "pack_id": listing.pack_id, "status": listing.status}
+
+
 @router.post("/import/github")
 def import_github(body: GithubImportIn, ctx: AdminCtx = Depends(admin_write(SKILL))):
     data_dir = ctx.runtime.settings.data_dir
@@ -84,6 +139,10 @@ def set_default(pack_id: int, body: EnableDefaultIn, ctx: AdminCtx = Depends(adm
     return {"id": pack.id, "name": pack.name, "enabled_default": pack.enabled_default}
 
 
+class PackUpdateIn(ReasonIn):
+    skill_md: str = Field(min_length=10, max_length=200_000)
+
+
 @router.get("/{pack_id}")
 def pack_detail(pack_id: int, ctx: AdminCtx = Depends(admin_read(SKILL))):
     pack = ctx.db.get(SkillPack, pack_id)
@@ -93,3 +152,37 @@ def pack_detail(pack_id: int, ctx: AdminCtx = Depends(admin_read(SKILL))):
     items = packs.admin_list_packs(ctx.db, tenant_id=ctx.runtime.tenant_id)
     view = next((i for i in items if i["id"] == pack_id), None) or {"id": pack_id, "name": pack.name}
     return {**view, "skill_md": body}
+
+
+@router.put("/{pack_id}")
+def update_pack(pack_id: int, body: PackUpdateIn, ctx: AdminCtx = Depends(admin_write(SKILL))):
+    with ctx.db.begin():
+        pack = packs.admin_update_pack(
+            ctx.db,
+            tenant_id=ctx.runtime.tenant_id,
+            pack_id=pack_id,
+            data_dir=ctx.runtime.settings.data_dir,
+            skill_md=body.skill_md,
+            operator=ctx.user.username,
+        )
+        ctx.audit(
+            "skill_pack.update", "skill_pack", pack.name,
+            after={"pack_id": pack.id}, reason=body.reason,
+        )
+    detail = packs.load_skill_body(ctx.db, ctx.runtime.settings.data_dir, pack_id)
+    return {"id": pack_id, "name": pack.name, "skill_md": detail}
+
+
+@router.delete("/{pack_id}")
+def delete_pack(pack_id: int, body: ReasonIn, ctx: AdminCtx = Depends(admin_write(SKILL))):
+    with ctx.db.begin():
+        pack = ctx.db.get(SkillPack, pack_id)
+        if pack is None or pack.tenant_id != ctx.runtime.tenant_id:
+            raise AppError(404, "NOT_FOUND", "Skill 包不存在")
+        name = pack.name
+        packs.admin_delete_pack(
+            ctx.db, tenant_id=ctx.runtime.tenant_id, pack_id=pack_id,
+            data_dir=ctx.runtime.settings.data_dir,
+        )
+        ctx.audit("skill_pack.delete", "skill_pack", name, before={"pack_id": pack_id}, reason=body.reason)
+    return {"ok": True, "id": pack_id}

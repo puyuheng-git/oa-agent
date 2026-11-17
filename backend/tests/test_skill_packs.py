@@ -94,7 +94,7 @@ def test_save_pack_version_roundtrip(tmp_path: Path):
         assert (tmp_path / version.storage_path / "scripts" / "run.py").is_file()
 
 
-def test_list_user_library_hides_system_and_ensure_creator(tmp_path: Path):
+def test_list_user_library_excludes_system_but_prompt_still_loads(tmp_path: Path):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
@@ -118,16 +118,18 @@ def test_list_user_library_hides_system_and_ensure_creator(tmp_path: Path):
         db.commit()
         items = packs.list_user_library(db, tenant_id="t1", oa="u1")
         names = {i["name"] for i in items}
+        # 对话页「我的 Skill」不展示后台系统包
         assert "skill-creator" not in names
         assert "mine" in names
         assert created.name == "mine"
+        # 系统包仍注入运行时提示词
         enabled = packs.enabled_packs_for(db, tenant_id="t1", oa="u1")
         kinds = {p.name: p.kind for p in enabled}
         assert kinds.get("skill-creator") == "system"
         assert kinds.get("mine") == "user"
 
 
-def test_describe_skill_packs_system_full_text():
+def test_describe_skill_packs_all_enabled_full_text():
     from oa_agent.runtime.graphs.oa_assistant import _describe_skill_packs
     from oa_agent.skills.service import SkillPackState
 
@@ -138,11 +140,18 @@ def test_describe_skill_packs_system_full_text():
             skill_md="---\nname: skill-creator\ndescription: x\n---\n\n# BODY_MARKER\n",
         ),
         SkillPackState(
-            id=2, name="mine", display_name="Mine", description="personal",
+            id=2, name="pdf", display_name="PDF", description="handle pdf files",
+            kind="system", enabled=True, skill_md="# PDF_BODY\n",
+        ),
+        SkillPackState(
+            id=3, name="mine", display_name="Mine", description="personal",
             kind="user", enabled=True, skill_md="# USER_BODY\n",
         ),
-    ], message="hello")
+    ], message="请处理这个 pdf")
     assert "系统内置 Skill" in text
     assert "BODY_MARKER" in text
-    assert "员工个人 Skill" in text
-    assert "USER_BODY" not in text  # 未命中关键词时不注入用户全文
+    assert "PDF_BODY" in text
+    assert "员工个人" in text
+    assert "USER_BODY" in text  # 已启用的个人包默认全文注入
+    # pdf 相关问题时 pdf 包应排在前面
+    assert text.index("PDF_BODY") < text.index("BODY_MARKER")

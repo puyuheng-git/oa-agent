@@ -72,7 +72,7 @@ export const http = {
   },
   post: <T = unknown>(url: string, body?: unknown) => request<T>('POST', url, body ?? {}),
   put: <T = unknown>(url: string, body?: unknown) => request<T>('PUT', url, body ?? {}),
-  del: <T = unknown>(url: string) => request<T>('DELETE', url),
+  del: <T = unknown>(url: string, body?: unknown) => request<T>('DELETE', url, body),
 }
 
 export function errorMessage(e: unknown): string {

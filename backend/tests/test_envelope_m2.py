@@ -52,6 +52,22 @@ def test_oa_office_401_maps_office_token_expired():
     assert err.http_status == 401
 
 
+def test_oa_office_biz_login_hint_maps_office_token_expired():
+    """HTTP 200 + msg「请登录」须升为 OFFICE_TOKEN_EXPIRED，便于企微续期。"""
+    body = {"code": "401", "msg": "请登录"}
+    with pytest.raises(ConnectorError) as exc_info:
+        parse_envelope(
+            "oa_office",
+            200,
+            body,
+            success_codes=DEFAULT_SUCCESS,
+            hint_max=200,
+        )
+    err = exc_info.value
+    assert err.code == "OFFICE_TOKEN_EXPIRED"
+    assert err.user_message == "请登录"
+
+
 def test_get_profile_oa_office():
     assert get_profile("oa_office") is get_profile("oa_office")
 

@@ -16,8 +16,11 @@ from oa_agent.observability.redact import redact, redact_secrets
 
 MINT_PATH = "/agent/token/mint"
 INVOKE_PATH = "/agent/invoke"
-CATALOG_PATH = "/agent/export-catalog"
+EXPORT_DISCOVER_PATH = "/agent/export/discover"
+EXPORT_DESCRIBE_PATH = "/agent/export/describe"
+EXPORT_PROBE_PATH = "/agent/export/probe"
 DEFAULT_SUCCESS_CODES = ("0", "200")
+GATEWAY_SECRET_HEADER = "X-Agent-Gateway-Secret"
 DEFAULT_UPSTREAM = "open_oa"
 # 旧会话 / 旧 Tool 上游标识兼容
 LEGACY_UPSTREAM = "office"
@@ -32,6 +35,12 @@ _VAGUE_FAILURE_RE = re.compile(
 )
 _NOT_FOUND_HINT_RE = re.compile(r"不存在|未找到|找不到|无此|没有该|无数据|not\s*found", re.I)
 _FORBIDDEN_HINT_RE = re.compile(r"权限|无权|不允许|禁止|forbidden|permission|denied", re.I)
+_LOGIN_HINT_RE = re.compile(r"请登录|未登录|请重新从\s*OA|登录已过期|重新打开", re.I)
+
+
+def looks_like_login_hint(text: str) -> bool:
+    """上游/业务提示是否像登录失效（用于升码与企微续期）。"""
+    return bool(text and _LOGIN_HINT_RE.search(text))
 
 
 def employee_facing_error(
@@ -48,6 +57,8 @@ def employee_facing_error(
         return "未找到该报销单，请核对单号是否正确。"
     if _FORBIDDEN_HINT_RE.search(text) or http_status == 403:
         return "你没有权限查看该报销单。"
+    if code == "OFFICE_TOKEN_EXPIRED" or looks_like_login_hint(text) or http_status == 401:
+        return None  # 交由 messages.office_token_expired / 企微续期重试
     if text and not _VAGUE_FAILURE_RE.match(text):
         return None
     if code == "UPSTREAM_HTTP_ERROR" and http_status is not None and http_status >= 500:
@@ -220,25 +231,79 @@ class OpenOaClient:
         data, hint = self._unwrap(resp)
         return OpenOaResponse(data, resp.status_code, ms, hint)
 
-    def get_export_catalog(self, *, gateway_secret: str, timeout: float | None = None) -> list:
-        """管理端导入：用网关密钥拉清单（不经员工 Bearer）。
-
-        同时带 Header 与 query（open-oa AuthAgentBearer 二者其一即可），避免部分网关剥 Header。
-        """
+    def _gateway_headers(self, gateway_secret: str) -> dict:
         if not gateway_secret:
             raise OpenOaError("OFFICE_API_NOT_CONFIGURED", "未配置 AGENT_GATEWAY_SECRET")
+        return {GATEWAY_SECRET_HEADER: gateway_secret}
+
+    def discover_exports(self, service: str, *, gateway_secret: str, timeout: float | None = None) -> list:
+        """向导：列 Export public 方法（仅网关密钥）。"""
+        headers = self._gateway_headers(gateway_secret)
         resp, _ = self._send(
-            "GET", CATALOG_PATH,
-            headers={"X-Agent-Gateway-Secret": gateway_secret},
+            "POST", EXPORT_DISCOVER_PATH,
+            json={"service": service},
+            headers=headers,
             params={"gateway_secret": gateway_secret},
-            timeout=timeout or 10.0,
+            timeout=timeout or 15.0,
         )
         data, _ = self._unwrap(resp)
-        if isinstance(data, dict) and isinstance(data.get("items"), list):
-            return data["items"]
+        if isinstance(data, dict) and isinstance(data.get("methods"), list):
+            return data["methods"]
         if isinstance(data, list):
             return data
-        raise OpenOaError("UPSTREAM_BAD_RESPONSE", "export-catalog 响应缺少 items")
+        raise OpenOaError("UPSTREAM_BAD_RESPONSE", "export/discover 响应缺少 methods")
+
+    def describe_export(
+        self, service: str, method: str, *, gateway_secret: str, timeout: float | None = None,
+    ) -> dict:
+        """向导：单方法参数/call 草稿。"""
+        headers = self._gateway_headers(gateway_secret)
+        resp, _ = self._send(
+            "POST", EXPORT_DESCRIBE_PATH,
+            json={"service": service, "method": method},
+            headers=headers,
+            params={"gateway_secret": gateway_secret},
+            timeout=timeout or 15.0,
+        )
+        data, _ = self._unwrap(resp)
+        if not isinstance(data, dict):
+            raise OpenOaError("UPSTREAM_BAD_RESPONSE", "export/describe 响应无效")
+        return data
+
+    def probe_export(
+        self,
+        *,
+        service: str,
+        method: str,
+        oa: str,
+        args: dict,
+        call: str = "one_by_params",
+        op: str = "read",
+        gateway_secret: str,
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ):
+        """向导：指定测试员工真调一次。"""
+        headers = self._gateway_headers(gateway_secret)
+        body = {
+            "service": service,
+            "method": method,
+            "oa": oa,
+            "args": args or {},
+            "call": call or "one_by_params",
+            "op": op or "read",
+        }
+        if idempotency_key:
+            body["idempotency_key"] = idempotency_key
+        resp, _ = self._send(
+            "POST", EXPORT_PROBE_PATH,
+            json=body,
+            headers=headers,
+            params={"gateway_secret": gateway_secret},
+            timeout=timeout or 30.0,
+        )
+        data, _ = self._unwrap(resp)
+        return data
 
 
 OfficeApiClient = OpenOaClient

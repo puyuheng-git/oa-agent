@@ -43,7 +43,7 @@ def collect(rt, body):
 
 def test_message_flow_identity_from_oa(chat, office):
     office.post(f"{OFFICE}/agent/token/mint").mock(side_effect=wework_mint)
-    route = office.get(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {
+    route = office.post(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {
         "list": [ROW], "total": 1}}))
     rt = runtime(chat)
 
@@ -74,10 +74,47 @@ def test_group_unbound_and_unsupported(chat, office):
     assert collect(rt, text_msg("g1", "查行程", chattype="group")) == [(wecom.GROUP_TEXT, True)]
     assert collect(rt, text_msg("u1", "查行程", userid="wx_nobody")) == [
         ("你的企业微信尚未绑定 OA 账号，请联系管理员", True)]
+    # 媒体 URL 不可达：明确提示文件接收失败（与 Web 附件能力对齐，非「不支持」）
     image = {"msgid": "i1", "chattype": "single", "from": {"userid": "wx_zhangsan"}, "msgtype": "image",
              "image": {"url": "https://x", "aeskey": "k"}}
-    assert collect(rt, image) == [(wecom.UNSUPPORTED_TEXT, True)]
+    assert collect(rt, image) == [(wecom.MEDIA_FAILED_TEXT, True)]
     assert wecom.reply_markdown({"type": "markdown", "content": "表" * 10000}).endswith(wecom.TRUNCATED_SUFFIX)
+
+
+def test_wecom_remint_on_biz_login_hint(chat, office):
+    """业务「请登录」升码后企微自动续期并重试，不把「请登录」甩给员工。"""
+    office.post(f"{OFFICE}/agent/token/mint").mock(side_effect=wework_mint)
+    calls = {"n": 0}
+
+    def invoke_once_login(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json={"code": "401", "msg": "请登录"})
+        return httpx.Response(200, json={"code": 0, "data": {"list": [ROW], "total": 1}})
+
+    office.post(LIST_URL).mock(side_effect=invoke_once_login)
+    rt = runtime(chat)
+    out = collect(rt, text_msg("login-retry", "查上周行程报销"))
+    content, finish = out[-1]
+    assert finish and "请登录" not in content
+    assert "共查到 **1** 条" in content
+    assert calls["n"] == 2
+
+
+def test_wecom_media_decrypt_roundtrip():
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from oa_agent.channels import wecom_media
+
+    key = b"0123456789abcdef0123456789abcdef"  # 32 bytes AES-256
+    iv = key[:16]
+    plain = b"hello-wecom-file-payload!!"  # 任意长度，手动 PKCS7
+    pad = 16 - (len(plain) % 16)
+    padded = plain + bytes([pad]) * pad
+    enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    cipher = enc.update(padded) + enc.finalize()
+    import base64
+    aeskey = base64.b64encode(key).decode().rstrip("=")
+    assert wecom_media.decrypt_aes_cbc(cipher, aeskey) == plain
 
 
 class FakeWeCom:
@@ -124,7 +161,7 @@ def wait_for(cond, timeout=10.0):
 
 def test_long_connection_end_to_end(chat, office, monkeypatch):
     office.post(f"{OFFICE}/agent/token/mint").mock(side_effect=wework_mint)
-    office.get(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": [ROW], "total": 1}}))
+    office.post(LIST_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": [ROW], "total": 1}}))
     rt = runtime(chat)
     rt.wecom.stop()
     monkeypatch.setattr(wecom, "CONFIG_POLL", 0.2)

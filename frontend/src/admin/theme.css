@@ -175,6 +175,30 @@ html.dark .el-select__wrapper.is-focused {
   box-shadow: 0 0 0 1px var(--tech-cyan) inset, 0 0 10px rgba(34, 211, 238, 0.25) !important;
 }
 
+/*
+ * 仅约束 dialog / message-box 在视口居中；不要全局抬所有 .el-overlay 的 z-index，
+ * 否则下拉/隐藏遮罩可能盖住整页导致无法点击、无法滚动。
+ */
+.el-overlay-dialog,
+.el-message-box__wrapper {
+  position: fixed !important;
+  inset: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  overflow: auto !important;
+  padding: 24px 16px !important;
+  box-sizing: border-box !important;
+}
+.el-overlay-dialog .el-dialog {
+  position: relative !important;
+  margin: 0 auto !important;
+  top: 0 !important;
+  max-height: min(90vh, 900px);
+  max-width: calc(100vw - 32px);
+  overflow: auto;
+}
+
 html.dark .el-dialog,
 html.dark .el-drawer,
 html.dark .el-message-box {

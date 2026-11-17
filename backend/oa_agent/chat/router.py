@@ -855,6 +855,8 @@ class SkillPackPublishIn(BaseModel):
 @router.post("/skill-packs/{pack_id}/publish")
 def publish_my_skill_pack(pack_id: int, body: SkillPackPublishIn, request: Request,
                           auth: ChatAuth = Depends(chat_auth)):
+    """推送到市场：模型审查 → 后台待审；通过后才出现在 Skill 市场。"""
+    from oa_agent.db.models import SkillPack
     from oa_agent.skills import service as skill_packs
 
     rt = get_runtime(request)
@@ -863,10 +865,29 @@ def publish_my_skill_pack(pack_id: int, body: SkillPackPublishIn, request: Reque
             db, tenant_id=rt.tenant_id, oa=auth.session.oa, pack_id=pack_id,
             description=body.description,
         )
+        pack = db.get(SkillPack, pack_id)
+        skill_md = skill_packs.load_skill_body(db, rt.settings.data_dir, pack_id)
+        review = skill_packs.run_model_skill_review(
+            vault=rt.vault,
+            tenant_id=rt.tenant_id,
+            db=db,
+            pack=pack,
+            skill_md=skill_md,
+            market_desc=listing.description or "",
+        )
+        skill_packs.apply_model_review(
+            listing,
+            status=review["status"],
+            summary=review["summary"],
+            recommend=review["recommend"],
+        )
         return {
             "pack_id": listing.pack_id,
             "status": listing.status,
             "description": listing.description or "",
+            "model_review_status": listing.model_review_status,
+            "model_review_summary": listing.model_review_summary,
+            "model_review_recommend": listing.model_review_recommend,
         }
 
 

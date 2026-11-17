@@ -55,9 +55,10 @@ export function emptyParam(): ParamRow {
   }
 }
 
-export function emptyToolForm(defaultUpstream = 'office'): ToolForm {
+/** 与后端 DEFAULT_UPSTREAM 对齐；office 为历史别名，保存时会与 open_oa 视为同一上游 */
+export function emptyToolForm(defaultUpstream = 'open_oa'): ToolForm {
   return {
-    name: '', summary: '', description: '', upstream: defaultUpstream || 'office', path: '/',
+    name: '', summary: '', description: '', upstream: defaultUpstream || 'open_oa', path: '/',
     timeout_seconds: 10, injectOa: true,
     query_params_field: 'queryParams', identityParams: '', result_kind: 'list', params: [], fields: [],
   }
@@ -118,7 +119,7 @@ export function toolPayload(form: ToolForm): Record<string, unknown> {
     summary: form.summary.trim(),
     description: form.description.trim(),
     method: 'GET',
-    upstream: form.upstream || 'office',
+    upstream: form.upstream || 'open_oa',
     path: form.path.trim(),
     timeout_seconds: form.timeout_seconds,
     inject_identity_fields: form.injectOa ? ['oa'] : [],
@@ -142,11 +143,13 @@ export function toolFormFromSchema(schema: Record<string, any>): ToolForm {
   const result = schema.result || {}
   const labels: Record<string, string> = result.labels || {}
   const columns: string[] = result.list_columns || []
+  // 库内旧版可能写 office；与 open_oa 等价，展示统一成 open_oa
+  const upstream = schema.upstream === 'office' || !schema.upstream ? 'open_oa' : schema.upstream
   return {
     name: schema.name,
     summary: schema.summary || '',
     description: schema.description || '',
-    upstream: schema.upstream || 'office',
+    upstream,
     path: schema.path || '/',
     timeout_seconds: schema.timeout_seconds ?? 10,
     injectOa: (schema.inject_identity_fields || []).includes('oa'),

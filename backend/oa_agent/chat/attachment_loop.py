@@ -14,9 +14,25 @@ MAX_SLICE_CHARS = 8000
 
 NO_MORE = "没有更多可读内容"
 
+# 无文字层且页面也渲不出图时的员工可见兜底（禁止把「已读过」内部备注直接当回复）
+SCANNED_FALLBACK = (
+    "这份附件没有可提取的文字，页面也未能渲染成图片供识读。"
+    "请换可复制文字的 PDF/Word，或把关键页截成图片后再发。"
+)
+GENERIC_FALLBACK = (
+    "我已查看附件，但没能整理出可用结论。"
+    "请再具体说明要核对或提取的内容。"
+)
+
 _DRIVE = re.compile(r"[A-Za-z]:[\\/]")
 _HTTP_URL = re.compile(r"https?://", re.IGNORECASE)
 _HTTP_WORD = re.compile(r"http", re.IGNORECASE)
+_THINK_WRAP = re.compile(r"^<think\b[^>]*>(.*?)</think\s*>\s*(.*)$", re.I | re.S)
+_META_ANSWER = re.compile(
+    r"(need ensure json|json valid|no markdown|builtin\.skill_exec|"
+    r"action\s*[:=]\s*[\"']?(?:answer|read|tool)|let'?s settle|could use builtin)",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -60,14 +76,26 @@ class _Slice:
     note: str
 
 
+def _file_images(file: LoadedFile) -> list[tuple[str, bytes]]:
+    """收集可送多模态的 PNG：扫描 PDF 的 page_images 优先，其次单图附件。"""
+    extracted = file.extracted
+    if extracted.page_images:
+        return [
+            (f"{file.file_id}#p{index + 1}", png)
+            for index, png in enumerate(extracted.page_images)
+            if png
+        ]
+    if extracted.image_png:
+        return [(file.file_id, extracted.image_png)]
+    return []
+
+
 def project(files: list[LoadedFile]) -> Projection:
     catalog = "\n\n".join(_catalog_entry(item) for item in files)
     text_length = sum(len(item.extracted.text or "") for item in files)
-    images = [
-        (item.file_id, item.extracted.image_png)
-        for item in files
-        if item.extracted.image_png
-    ]
+    images: list[tuple[str, bytes]] = []
+    for item in files:
+        images.extend(_file_images(item))
     if text_length <= TEXT_BUDGET and len(images) <= IMAGE_BUDGET:
         full_text = "\n\n".join(part for part in (_full_entry(item) for item in files) if part)
         return Projection("full", catalog, full_text, images)
@@ -89,6 +117,9 @@ def run_loop(files: list[LoadedFile], ask) -> LoopResult:
     projection = project(files)
     base = _base_prompt(projection)
     reads: list[_Slice] = []
+    # 全是无正文页、又没有可识图 PNG：不必空转 read，直接说明扫描件限制
+    if _files_are_scanned_without_image(files):
+        return LoopResult("answer", SCANNED_FALLBACK, [], "")
 
     while True:
         if len(reads) >= MAX_READS:
@@ -98,10 +129,14 @@ def run_loop(files: list[LoadedFile], ask) -> LoopResult:
         if action == "tool" and not reads:
             return LoopResult("delegate", "", list(decision.get("steps") or []), "")
         if action == "answer":
-            return LoopResult("answer", str(decision.get("answer") or ""), [], _notes(reads))
+            answer = _usable_answer(decision.get("answer"))
+            note = _notes(reads)
+            if answer:
+                return LoopResult("answer", answer, [], note)
+            return LoopResult("answer", _forced(reads), [], note)
         if action != "read":
             note = _notes(reads)
-            answer = str(decision.get("answer") or "").strip() or _forced(note)
+            answer = _usable_answer(decision.get("answer")) or _forced(reads)
             return LoopResult("answer", answer, [], note)
 
         reads.append(_perform(files, decision))
@@ -146,9 +181,13 @@ def _catalog_entry(file: LoadedFile) -> str:
 
 def _full_entry(file: LoadedFile) -> str:
     text = _scrub(file.extracted.text or "")
+    parts = [f"文件编号：{_scrub(file.file_id)}"]
+    if file.extracted.page_images:
+        parts.append(f"已附带{len(file.extracted.page_images)}页页面图，请直接识图阅读单据内容。")
     if text == "":
-        return ""
-    return f"文件编号：{_scrub(file.file_id)}\n{text}"
+        return "\n".join(parts) if file.extracted.page_images else ""
+    parts.append(text)
+    return "\n".join(parts)
 
 
 def _base_prompt(projection: Projection) -> str:
@@ -294,14 +333,95 @@ def _notes(reads: list[_Slice]) -> str:
     return "\n".join(notes)
 
 
-def _forced(note: str) -> str:
-    text = note.strip() or "已读过：本轮已读内容"
-    return f"根据已读内容回答。{text}"
+def _peel_answer(text: str) -> str:
+    """去掉泄漏的 think 包裹，只留员工可见正文。"""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    matched = _THINK_WRAP.match(raw)
+    if matched:
+        return (matched.group(2) or "").strip()
+    return raw
+
+
+def _usable_answer(value: object) -> str:
+    """过滤空串、内部备注口吻、英文 JSON 元指令，避免泄漏到聊天。"""
+    text = _peel_answer(str(value or ""))
+    if not text:
+        return ""
+    if text.startswith("根据已读内容回答"):
+        return ""
+    if text.startswith("已读过：") and len(text) < 80:
+        return ""
+    if _META_ANSWER.search(text):
+        return ""
+    return text
+
+
+def _slice_has_extractable_text(text: str) -> bool:
+    from oa_agent.chat.attachment_extract import NO_PAGE_TEXT
+
+    body = (text or "").strip()
+    if not body or body == NO_MORE:
+        return False
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if not lines:
+        return False
+    for line in lines:
+        # 「第N页」标题行不算正文
+        if re.fullmatch(r"第\d+页", line):
+            continue
+        if line != NO_PAGE_TEXT:
+            return True
+    return False
+
+
+def _reads_look_empty(reads: list[_Slice]) -> bool:
+    texts = [item.text for item in reads if item.text]
+    if not texts:
+        return True
+    return not any(_slice_has_extractable_text(text) for text in texts)
+
+
+def _files_are_scanned_without_image(files: list[LoadedFile]) -> bool:
+    """全部 PDF 页均为「没有可提取的文字」，且没有可送视觉的 PNG（含未渲染成功）。"""
+    from oa_agent.chat.attachment_extract import NO_PAGE_TEXT
+
+    if not files:
+        return False
+    saw_pages = False
+    for item in files:
+        extracted = item.extracted
+        # 已有页面图或单图 → 交给多模态，不要短路
+        if extracted.image_png or extracted.page_images:
+            return False
+        if extracted.unreadable:
+            continue
+        if extracted.sheets:
+            return False
+        pages = extracted.pages or []
+        if pages:
+            saw_pages = True
+            for page in pages:
+                if (page or "").strip() and (page or "").strip() != NO_PAGE_TEXT:
+                    return False
+            continue
+        text = (extracted.text or "").strip()
+        if text and text != NO_PAGE_TEXT:
+            return False
+    return saw_pages
+
+
+def _forced(reads: list[_Slice] | None = None) -> str:
+    # 只有真正读过、且读到的全是空页时，才用扫描件文案；无 read 的坏答案用通用兜底
+    if reads and _reads_look_empty(reads):
+        return SCANNED_FALLBACK
+    return GENERIC_FALLBACK
 
 
 def _closed(reads: list[_Slice]) -> LoopResult:
     note = _notes(reads)
-    return LoopResult("answer", _forced(note), [], note)
+    return LoopResult("answer", _forced(reads), [], note)
 
 
 def _answer_when_exhausted(ask, base: str, reads: list[_Slice]) -> LoopResult:
@@ -310,12 +430,18 @@ def _answer_when_exhausted(ask, base: str, reads: list[_Slice]) -> LoopResult:
     messages.append(
         {
             "role": "user",
-            "content": "没有更多可读内容。必须根据已读内容回答，不要再读。",
+            "content": (
+                "没有更多可读内容。必须用 action=answer 直接回复员工；"
+                "若正文是「没有可提取的文字」，说明是扫描件且当前不能 OCR，不要编造识别结果，"
+                "也不要把「已读过」备注写进 answer。"
+            ),
         }
     )
     decision = ask(messages)
-    if decision.get("action") == "answer" and str(decision.get("answer") or "").strip():
-        return LoopResult("answer", str(decision["answer"]), [], note)
+    if decision.get("action") == "answer":
+        answer = _usable_answer(decision.get("answer"))
+        if answer:
+            return LoopResult("answer", answer, [], note)
     if decision.get("action") == "tool" and not any(item.text != NO_MORE for item in reads):
         return LoopResult("delegate", "", list(decision.get("steps") or []), note)
-    return LoopResult("answer", _forced(note), [], note)
+    return LoopResult("answer", _forced(reads), [], note)

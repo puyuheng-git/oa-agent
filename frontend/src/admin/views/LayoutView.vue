@@ -334,7 +334,7 @@ async function changePassword() {
     </footer>
   </div>
 
-  <el-dialog v-model="pwdOpen" title="修改密码" width="420px">
+  <el-dialog v-model="pwdOpen" title="修改密码" width="420px" :teleported="true" append-to="body">
     <el-form label-width="90px">
       <el-form-item label="原密码"><el-input v-model="pwd.old_password" type="password" show-password /></el-form-item>
       <el-form-item label="新密码"><el-input v-model="pwd.new_password" type="password" show-password /></el-form-item>
@@ -587,7 +587,7 @@ async function changePassword() {
     0 0 60px rgba(34, 211, 238, 0.12),
     inset 0 0 80px rgba(34, 211, 238, 0.04);
   overflow: hidden;
-  contain: layout paint;
+  /* 禁止 contain/transform：否则未挂到 body 的弹层会相对本框定位，滚到底后看不见 */
 }
 .holo-head {
   display: flex;
@@ -723,9 +723,7 @@ async function changePassword() {
   flex: 1;
   overflow: auto;
   padding: 18px 20px 24px;
-  /* 独立合成层，滚动时不带动整页 WebGL/HUD 重绘 */
-  will-change: scroll-position;
-  contain: content;
+  /* 不用 contain：contain:layout 会把 position:fixed 弹层困在本滚动区，滚到底点编辑就看不到弹窗 */
 }
 
 .holo-enter-active {

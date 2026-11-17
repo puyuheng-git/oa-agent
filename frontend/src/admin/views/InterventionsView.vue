@@ -145,7 +145,7 @@ onMounted(load)
       @current-change="load"
     />
 
-    <el-drawer v-model="drawer" title="介入任务" size="560px">
+    <el-drawer v-model="drawer" title="介入任务" size="560px" :teleported="true" append-to="body">
       <el-skeleton v-if="!detail" :rows="6" />
       <template v-else>
         <el-descriptions :column="1" border size="small">

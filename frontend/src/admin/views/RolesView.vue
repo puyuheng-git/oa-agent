@@ -74,7 +74,7 @@ onMounted(load)
     </el-table>
   </el-card>
 
-  <el-dialog v-model="dialog" :title="editing ? '编辑角色' : '新增角色'" width="620px">
+  <el-dialog v-model="dialog" :title="editing ? '编辑角色' : '新增角色'" width="620px" :teleported="true" append-to="body">
     <el-form label-width="80px">
       <el-form-item label="编码"><el-input v-model="form.code" :disabled="!!editing" placeholder="小写字母开头，如 ops_viewer" /></el-form-item>
       <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>

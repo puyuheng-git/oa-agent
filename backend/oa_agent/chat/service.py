@@ -583,7 +583,8 @@ def _build_write_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession)
                                    int(setting(rt, "oa", "tool_remark_max_chars")),
                                    mcp_client=get_mcp_client(rt),
                                    builtin_runtime=build_builtin_runtime(rt),
-                                   hub=tool_connectors(rt)),
+                                   hub=tool_connectors(rt),
+                                   gateway_secret=load_settings(rt, "oa").get("gateway_secret")),
         write_executor=WriteToolExecutor(tool_clients(rt)),
         runs=rt.engine.runs,
         tenant_id=rt.tenant_id,
@@ -685,7 +686,8 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
                               int(setting(rt, "oa", "tool_remark_max_chars")),
                               mcp_client=get_mcp_client(rt),
                               builtin_runtime=build_builtin_runtime(rt),
-                              hub=tool_connectors(rt)),
+                              hub=tool_connectors(rt),
+                              gateway_secret=load_settings(rt, "oa").get("gateway_secret")),
         today=datetime.now(CHINA_TZ).date(),
         model=_model(rt, cfg),
         router_model=_router_model(rt, cfg, runtime_routing),
@@ -924,6 +926,13 @@ def user_reply_for(
         return {"type": "error", "content": mapped, "data": None, "error_code": code}
     if code == "ATTACHMENT_CORRUPT":
         return {"type": "error", "content": hint or message, "data": None, "error_code": code}
+    # token 过期 / 上游「请登录」：统一文案与 error_code，企微可据此自动续期
+    from oa_agent.integrations.open_oa import looks_like_login_hint
+
+    login_hint = looks_like_login_hint(hint) or looks_like_login_hint(message)
+    if code == "OFFICE_TOKEN_EXPIRED" or login_hint or http_status == 401:
+        content = text(rt, "office_token_expired").replace("{message}", message)
+        return {"type": "error", "content": content, "data": None, "error_code": "OFFICE_TOKEN_EXPIRED"}
     if hint:
         return {"type": "error", "content": f"业务系统提示：{hint}", "data": None, "error_code": code}
     key = USER_MESSAGE_KEYS.get(code) or ("upstream_unavailable" if code.startswith("UPSTREAM") else "generic_failure")

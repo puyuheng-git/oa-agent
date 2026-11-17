@@ -85,14 +85,15 @@ def test_ensure_restores_deleted_row_with_defaults(rt):
     assert _builtin_rows(rt)["builtin.calc"].enabled is True
 
 
-def test_sync_refresh_reensures(rt):
+def test_sync_refresh_does_not_restore_deleted_builtin(rt):
+    """管理员删除内置 Tool 后，从文件同步不应自动补回。"""
     from oa_agent.db.models import Tool
 
     with rt.session() as db, db.begin():
         db.execute(sa.delete(Tool).where(Tool.name == "builtin.export"))
     with rt.session() as db, db.begin():
         rt.engine.catalog.sync_tools(db, "tester")
-    assert "builtin.export" in _builtin_rows(rt)
+    assert "builtin.export" not in _builtin_rows(rt)
 
 
 # ---------------------------------------------------------------- Task 10：BuiltinRuntime + Executor 分发

@@ -16,14 +16,18 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 
 from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
-from oa_agent.db.models import McpServer, Skill, SkillVersion, Tool, ToolVersion
+from oa_agent.db.models import McpServer, Skill, SkillVersion, SkillVisibilityRule, Tool, ToolVersion
 from oa_agent.errors import AppError
-from oa_agent.integrations.open_oa import DEFAULT_UPSTREAM, OpenOaClient, OpenOaError, mint_base_url
+from oa_agent.integrations.open_oa import (
+    DEFAULT_UPSTREAM, INVOKE_PATH, LEGACY_UPSTREAM, OpenOaClient, OpenOaError, mint_base_url,
+)
 from oa_agent.executor import apipost
 from oa_agent.executor.builtin_catalog import TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_guide
 from oa_agent.executor.catalog import (
-    compare, normalize_open_oa_catalog_item, normalize_skill, normalize_tool_form, registration_blockers,
+    canonical_hash, compare, normalize_open_oa_catalog_item, normalize_skill, normalize_tool_form,
+    recover_open_oa_invoke_schema, registration_blockers,
 )
+# normalize_open_oa_catalog_item：向导 save 复用（由管理员填写的契约组装 Tool schema）
 from oa_agent.executor.contract_test import contract_check, is_activatable
 from oa_agent.executor.visibility import VisibilityService
 from oa_agent.runtime.llm import ModelCallError, build_chat_model, resolve_model
@@ -76,12 +80,37 @@ class ApipostIn(BaseModel):
     use_llm: bool = True
 
 
-class OpenOaCatalogImportIn(BaseModel):
-    """从 open-oa export-catalog 勾选导入；items 为空则导入清单全部可读条目。"""
+class ExportWizardServiceIn(BaseModel):
+    service: str = Field(min_length=1, max_length=128)
 
-    reason: str = Field(min_length=2, max_length=200)
-    items: list[dict[str, str]] = Field(default_factory=list, max_length=100)
-    # items 项：{"service": "...", "method": "..."}；空列表 = 导入全部
+
+class ExportWizardDescribeIn(ExportWizardServiceIn):
+    method: str = Field(min_length=1, max_length=128)
+
+
+class ExportWizardProbeIn(ExportWizardDescribeIn):
+    oa: str = Field(min_length=1, max_length=64)
+    args: dict[str, Any] = Field(default_factory=dict)
+    call: str = Field(default="one_by_params", max_length=32)
+    op: str = Field(default="read", max_length=16)
+    idempotency_key: str = Field(default="", max_length=128)
+
+
+class ExportWizardSaveIn(ReasonIn):
+    """测通后入库；服务端会用同一参数再 probe 一次。"""
+
+    service: str = Field(min_length=1, max_length=128)
+    method: str = Field(min_length=1, max_length=128)
+    oa: str = Field(min_length=1, max_length=64)
+    args: dict[str, Any] = Field(default_factory=dict)
+    call: str = Field(default="one_by_params", max_length=32)
+    op: str = Field(default="read", max_length=16)
+    risk: str = Field(default="low", max_length=16)
+    name: str = Field(min_length=1, max_length=64)
+    summary: str = Field(default="", max_length=255)
+    model_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    result: ToolResultIn = Field(default_factory=ToolResultIn)
+    idempotency_key: str = Field(default="", max_length=128)
 
 
 class SkillIn(ReasonIn):
@@ -200,7 +229,7 @@ def _mcp_guide(ctx: AdminCtx, tool: Tool, schema: dict | None) -> dict:
             "note": "MCP 原始返回会围栏为 text，不走 OA 字段白名单。",
         },
         "runtime": "McpRuntime（出站 MCP）",
-        "edit_hint": "实现在远端 MCP 服务；本系统只同步清单与启停。",
+        "edit_hint": "实现在远端 MCP；本系统可改摘要、启停与删除，定义以 MCP 同步为准。",
     }
 
 
@@ -229,7 +258,7 @@ def _open_oa_invoke_guide(tool: Tool, schema: dict | None) -> dict:
         "model_params": dict(schema.get("model_params") or {}),
         "result": dict(schema.get("result") or {}),
         "runtime": "OpenOaClient POST /agent/invoke",
-        "edit_hint": "参数定义来自 open-oa catalog；请用「从 open-oa 清单导入」覆盖更新，或用启停开关。",
+        "edit_hint": "可在本页编辑契约，也可用「接入 Export 向导」覆盖；支持删除。",
     }
 
 
@@ -246,7 +275,7 @@ def _tool_guide(ctx: AdminCtx, tool: Tool, schema: dict | None) -> dict | None:
                 "constraints": ["后台不能改实现代码"],
                 "sandbox_policy": dict(tool.sandbox_policy_json or {}) or None,
                 "runtime": "BuiltinRuntime（进程内）",
-                "edit_hint": "请用启停与 Skill 绑定控制是否开放。",
+                "edit_hint": "可改摘要、启停与删除；实现细节见代码 BuiltinRuntime。",
             }
         guide = dict(guide)
         guide["sandbox_policy"] = dict(tool.sandbox_policy_json or {}) or guide.get("default_sandbox_policy")
@@ -367,31 +396,96 @@ def sync_tools(ctx: AdminCtx = Depends(admin_write(TOOL))):
     return report
 
 
+def _upstream_configured(ctx: AdminCtx, upstream: str) -> bool:
+    """open_oa 与 office 互认：任一已配置即视为可用。"""
+    keys = {u["key"] for u in _upstreams(ctx)}
+    if upstream in keys:
+        return True
+    if upstream == DEFAULT_UPSTREAM and LEGACY_UPSTREAM in keys:
+        return True
+    if upstream == LEGACY_UPSTREAM and DEFAULT_UPSTREAM in keys:
+        return True
+    return False
+
+
 def _save_tool(ctx: AdminCtx, body: ToolIn, create: bool) -> dict:
-    spec, errors = normalize_tool_form(body.model_dump(exclude={"reason"}))
-    if errors:
-        raise AppError(422, "VALIDATION_ERROR", "".join(errors))
     engine = ctx.runtime.engine
     with ctx.db.begin():
-        exists = engine.catalog.exists(ctx.db, Tool, spec["name"])
-        if create and exists:
-            raise AppError(409, "ALREADY_EXISTS", f"Tool {spec['name']} 已存在，请改为编")
-        if not create and not exists:
-            raise AppError(404, "NOT_FOUND", "Tool 不存")
-        if exists and (_get_tool(ctx, spec["name"]).kind or "office") != "office":
-            raise AppError(422, "VALIDATION_ERROR",
-                           "内置 / MCP 工具不可改 method、path、builtin_id 等核心字段；请用启停开关或「MCP 连接」页同步")
-        upstream = spec.get("upstream", DEFAULT_UPSTREAM)
-        if upstream not in {u["key"] for u in _upstreams(ctx)}:
-            raise AppError(422, "VALIDATION_ERROR", f"业务上游 {upstream} 未在「连接配置 → 业务上游 / 连接器」中配置")
-        result = engine.catalog.save_tool(ctx.db, spec, ctx.user.username)
+        existing = None
+        form_data = body.model_dump(exclude={"reason"})
+        if not create:
+            existing = ctx.db.scalar(
+                sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id, Tool.name == body.name)
+            )
+            if existing is None:
+                raise AppError(404, "NOT_FOUND", "Tool 不存")
+            # 内置 / MCP：实现不在表单里，只改摘要等元数据
+            if (existing.kind or "office") in ("builtin", "mcp"):
+                before = {"summary": existing.summary}
+                existing.summary = body.summary.strip()
+                existing.updated_by = ctx.user.username
+                ctx.audit(
+                    "tool.update", "tool", existing.name,
+                    before=before,
+                    after={"summary": existing.summary, "kind": existing.kind or "builtin"},
+                    reason=body.reason,
+                )
+                name = existing.name
+                result = {"result": "updated"}
+            else:
+                # open-oa 调用：表单不展示 invoke；从当前或历史版本带回，避免被改成普通 GET
+                if (existing.kind or "office") == "open_oa_invoke" and existing.current_version_id:
+                    cur = ctx.db.get(ToolVersion, existing.current_version_id)
+                    schema = (cur.schema_json if cur else None) or {}
+                    schema, _ = recover_open_oa_invoke_schema(ctx.db, existing, schema)
+                    if schema.get("invoke_service") and schema.get("invoke_method"):
+                        form_data["invoke_service"] = schema["invoke_service"]
+                        form_data["invoke_method"] = schema["invoke_method"]
+                        form_data["method"] = "POST"
+                        form_data["path"] = INVOKE_PATH
+                existing = None  # 走下方契约保存
+        if existing is None or create:
+            spec, errors = normalize_tool_form(form_data)
+            if errors:
+                raise AppError(422, "VALIDATION_ERROR", "".join(errors))
+            exists = engine.catalog.exists(ctx.db, Tool, spec["name"])
+            if create and exists:
+                raise AppError(409, "ALREADY_EXISTS", f"Tool {spec['name']} 已存在，请改为编")
+            if not create and not exists:
+                raise AppError(404, "NOT_FOUND", "Tool 不存")
+            upstream = spec.get("upstream", DEFAULT_UPSTREAM)
+            if not _upstream_configured(ctx, upstream):
+                raise AppError(422, "VALIDATION_ERROR", f"业务上游 {upstream} 未在「连接配置 → 业务上游 / 连接器」中配置")
+            result = engine.catalog.save_tool(ctx.db, spec, ctx.user.username)
+            ctx.db.flush()
+            engine.catalog.revalidate_skills(ctx.db)
+            ctx.audit("tool.create" if create else "tool.update", "tool", spec["name"],
+                      after={"result": result["result"], "version_no": result.get("version_no"),
+                             "method": spec["method"], "upstream": upstream, "path": spec["path"]},
+                      reason=body.reason)
+            name = spec["name"]
+    engine.reload_catalog()
+    return {**result, "tool": _tool_view(ctx, _get_tool(ctx, name))}
+
+
+def _delete_tool(ctx: AdminCtx, name: str, reason: str) -> dict:
+    """删除 Tool 及其版本；依赖它的 Skill 会在重载后标为不可用。"""
+    engine = ctx.runtime.engine
+    with ctx.db.begin():
+        tool = _get_tool(ctx, name)
+        before = {
+            "name": tool.name, "kind": tool.kind or "office", "summary": tool.summary,
+            "enabled": tool.enabled,
+        }
+        versions = list(ctx.db.scalars(sa.select(ToolVersion).where(ToolVersion.tool_id == tool.id)).all())
+        for v in versions:
+            ctx.db.delete(v)
+        ctx.db.delete(tool)
         ctx.db.flush()
         engine.catalog.revalidate_skills(ctx.db)
-        ctx.audit("tool.create" if create else "tool.update", "tool", spec["name"],
-                  after={"result": result["result"], "version_no": result.get("version_no"),
-                         "method": spec["method"], "upstream": upstream, "path": spec["path"]}, reason=body.reason)
+        ctx.audit("tool.delete", "tool", name, before=before, reason=reason)
     engine.reload_catalog()
-    return {**result, "tool": _tool_view(ctx, _get_tool(ctx, spec["name"]))}
+    return {"ok": True, "name": name}
 
 
 def _draft_model(ctx: AdminCtx):
@@ -442,8 +536,8 @@ def import_apipost(body: ApipostIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
     return {"drafts": drafts, "errors": errors}
 
 
-def _open_oa_catalog_client(ctx: AdminCtx) -> tuple[OpenOaClient, str]:
-    """用 mint_base_url + gateway_secret 拉 export-catalog。"""
+def _open_oa_wizard_client(ctx: AdminCtx) -> tuple[OpenOaClient, str]:
+    """用 mint_base_url + gateway_secret 访问 open-oa 向导接口。"""
     from oa_agent.chat import service as chat_service
 
     oa = chat_service.load_settings(ctx.runtime, "oa")
@@ -459,82 +553,168 @@ def _open_oa_catalog_client(ctx: AdminCtx) -> tuple[OpenOaClient, str]:
         raise AppError(503, "OPEN_OA_NOT_CONFIGURED", exc.message) from exc
 
 
-@tools_router.get("/import/open-oa-catalog")
-def list_open_oa_catalog(ctx: AdminCtx = Depends(admin_read(TOOL))):
-    """预览 open-oa 可导入清单（管理端勾选用；只读，用网关密钥拉取）。
-    路径放在 /import/ 下，避免被 GET /{name} 当成 Tool 名。"""
-    client, secret = _open_oa_catalog_client(ctx)
+def _wizard_upstream_error(exc: OpenOaError) -> AppError:
+    return AppError(
+        502,
+        "IMPORT_FAILED",
+        f"调用 open-oa 失败：{exc.message}。"
+        "请核对 mint_base_url 与 AGENT_GATEWAY_SECRET 是否与 open-oa 一致。",
+    )
+
+
+def _added_invoke_methods(ctx: AdminCtx, service: str) -> dict[str, str]:
+    """当前租户已接入的 open_oa_invoke：invoke_method → tool.name。"""
+    rows = ctx.db.scalars(
+        sa.select(Tool).where(
+            Tool.tenant_id == ctx.runtime.tenant_id,
+            Tool.kind == "open_oa_invoke",
+        )
+    ).all()
+    mapping: dict[str, str] = {}
+    for tool in rows:
+        current = ctx.db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
+        schema = (current.schema_json if current else None) or {}
+        inv_s = str(schema.get("invoke_service") or "").strip()
+        inv_m = str(schema.get("invoke_method") or "").strip()
+        if inv_s == service and inv_m:
+            mapping[inv_m] = tool.name
+    return mapping
+
+
+@tools_router.post("/export-wizard/discover")
+def export_wizard_discover(body: ExportWizardServiceIn, ctx: AdminCtx = Depends(admin_read(TOOL))):
+    """向导：输入 a/b/c，列出 Export public 方法；并标记本系统已添加的方法。"""
+    service = body.service.strip()
+    client, secret = _open_oa_wizard_client(ctx)
     ctx.db.rollback()
     try:
-        items = client.get_export_catalog(gateway_secret=secret)
+        methods = client.discover_exports(service, gateway_secret=secret)
     except OpenOaError as exc:
-        raise AppError(
-            502,
-            "IMPORT_FAILED",
-            f"拉取 open-oa catalog 失败：{exc.message}。"
-            "请核对连接配置里的 mint_base_url（须指向 open-oa）与 AGENT_GATEWAY_SECRET 是否与 open-oa 环境变量一致。",
-        ) from exc
-    return {"items": items if isinstance(items, list) else []}
+        raise _wizard_upstream_error(exc) from exc
+    added = _added_invoke_methods(ctx, service)
+    enriched = []
+    for raw in methods if isinstance(methods, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        name = str(item.get("name") or "").strip()
+        tool_name = added.get(name)
+        item["already_added"] = bool(tool_name)
+        item["tool_name"] = tool_name
+        enriched.append(item)
+    return {"methods": enriched, "service": service}
 
 
-@tools_router.post("/import/open-oa-catalog")
-def import_open_oa_catalog(body: OpenOaCatalogImportIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
-    """从 open-oa GET /agent/export-catalog 勾选导入为 open_oa_invoke Tool（立即存版本，默认启用规范）。"""
-    client, secret = _open_oa_catalog_client(ctx)
+@tools_router.post("/export-wizard/describe")
+def export_wizard_describe(body: ExportWizardDescribeIn, ctx: AdminCtx = Depends(admin_read(TOOL))):
+    """向导：选中方法后拉取参数/call 草稿。"""
+    client, secret = _open_oa_wizard_client(ctx)
     ctx.db.rollback()
     try:
-        catalog_items = client.get_export_catalog(gateway_secret=secret)
+        draft = client.describe_export(body.service.strip(), body.method.strip(), gateway_secret=secret)
     except OpenOaError as exc:
-        raise AppError(
-            502,
-            "IMPORT_FAILED",
-            f"拉取 open-oa catalog 失败：{exc.message}。"
-            "请核对连接配置里的 mint_base_url（须指向 open-oa）与 AGENT_GATEWAY_SECRET 是否与 open-oa 环境变量一致。",
-        ) from exc
+        raise _wizard_upstream_error(exc) from exc
+    return draft
 
-    wanted = {(str(i.get("service") or "").strip(), str(i.get("method") or "").strip()) for i in body.items}
-    wanted.discard(("", ""))
-    selected = []
-    for item in catalog_items:
-        if not isinstance(item, dict):
+
+@tools_router.post("/export-wizard/probe")
+def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
+    """向导：指定测试员工试调。"""
+    client, secret = _open_oa_wizard_client(ctx)
+    ctx.db.rollback()
+    try:
+        data = client.probe_export(
+            service=body.service.strip(),
+            method=body.method.strip(),
+            oa=body.oa.strip(),
+            args=dict(body.args or {}),
+            call=body.call.strip() or "one_by_params",
+            op=body.op.strip() or "read",
+            gateway_secret=secret,
+            idempotency_key=body.idempotency_key.strip(),
+        )
+    except OpenOaError as exc:
+        raise _wizard_upstream_error(exc) from exc
+    return {"data": data}
+
+
+@tools_router.post("/export-wizard/save")
+def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
+    """向导：用同一参数再 probe 一次，成功后写入 open_oa_invoke Tool。"""
+    if not (body.result.fields or []):
+        raise AppError(422, "VALIDATION_ERROR", "入库前须配置 result.fields")
+    client, secret = _open_oa_wizard_client(ctx)
+    ctx.db.rollback()
+    try:
+        client.probe_export(
+            service=body.service.strip(),
+            method=body.method.strip(),
+            oa=body.oa.strip(),
+            args=dict(body.args or {}),
+            call=body.call.strip() or "one_by_params",
+            op=body.op.strip() or "read",
+            gateway_secret=secret,
+            idempotency_key=body.idempotency_key.strip(),
+        )
+    except OpenOaError as exc:
+        raise AppError(422, "PROBE_FAILED", f"测通失败，未入库：{exc.message}") from exc
+
+    params_list = []
+    for pname, rule in (body.model_params or {}).items():
+        if not isinstance(rule, dict):
             continue
-        key = (str(item.get("service") or "").strip(), str(item.get("method") or "").strip())
-        if wanted and key not in wanted:
-            continue
-        selected.append(item)
-    if wanted and not selected:
-        raise AppError(422, "IMPORT_FAILED", "未匹配到任何 catalog 条目，请核对 service/method")
+        row = {"name": pname, **rule}
+        params_list.append(row)
+    item = {
+        "service": body.service.strip(),
+        "method": body.method.strip(),
+        "tool_name": body.name.strip(),
+        "summary": body.summary.strip() or body.name.strip(),
+        "op": body.op.strip() or "read",
+        "risk": body.risk.strip() or "low",
+        "call": body.call.strip() or "one_by_params",
+        "params": params_list,
+        "returns": {
+            "kind": body.result.kind,
+            "fields": list(body.result.fields or []),
+            "labels": dict(body.result.labels or {}),
+            "list_columns": list(body.result.list_columns or []),
+        },
+    }
+    spec, errs = normalize_open_oa_catalog_item(item)
+    if errs or not spec:
+        raise AppError(422, "VALIDATION_ERROR", "；".join(errs or ["契约无效"]))
 
     engine = ctx.runtime.engine
-    imported: list[dict] = []
-    errors: list[str] = []
     with ctx.db.begin():
-        for item in selected:
-            spec, errs = normalize_open_oa_catalog_item(item)
-            if errs or not spec:
-                errors.append(f"{item.get('service')}.{item.get('method')}：" + "；".join(errs or ["无效条目"]))
-                continue
-            upstream = spec.get("upstream", DEFAULT_UPSTREAM)
-            if upstream not in {u["key"] for u in _upstreams(ctx)} and upstream != DEFAULT_UPSTREAM:
-                # 允许默认 open_oa：若目录尚无该 key，仍写入（运行时靠 mint_base_url / 兼容映射）
-                pass
-            result = engine.catalog.save_tool(ctx.db, spec, ctx.user.username)
-            tool = ctx.db.scalar(
-                sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id, Tool.name == spec["name"])
-            )
-            if tool is not None:
-                tool.kind = "open_oa_invoke"
-                tool.updated_by = ctx.user.username
-            imported.append({
-                "name": spec["name"], "result": result.get("result"), "version_no": result.get("version_no"),
-                "service": spec.get("invoke_service"), "method": spec.get("invoke_method"),
-            })
+        result = engine.catalog.save_tool(ctx.db, spec, ctx.user.username)
+        tool = ctx.db.scalar(
+            sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id, Tool.name == spec["name"])
+        )
+        if tool is not None:
+            tool.kind = "open_oa_invoke"
+            tool.updated_by = ctx.user.username
         engine.catalog.revalidate_skills(ctx.db)
-        ctx.audit("tool.import_open_oa_catalog", "tool", "*", after={
-            "imported": [i["name"] for i in imported], "errors": errors, "selected": len(selected),
-        }, reason=body.reason)
+        ctx.audit(
+            "tool.export_wizard_save",
+            "tool",
+            spec["name"],
+            after={
+                "result": result.get("result"),
+                "version_no": result.get("version_no"),
+                "service": spec.get("invoke_service"),
+                "method": spec.get("invoke_method"),
+                "call": spec.get("invoke_call"),
+            },
+            reason=body.reason,
+        )
     engine.reload_catalog()
-    return {"imported": imported, "errors": errors}
+    return {
+        "name": spec["name"],
+        "result": result.get("result"),
+        "version_no": result.get("version_no"),
+        "kind": "open_oa_invoke",
+    }
 
 
 @tools_router.post("")
@@ -547,6 +727,11 @@ def update_tool(name: str, body: ToolIn, ctx: AdminCtx = Depends(admin_write(TOO
     if body.name != name:
         raise AppError(422, "VALIDATION_ERROR", "Tool 名创建后不能修改")
     return _save_tool(ctx, body, create=False)
+
+
+@tools_router.delete("/{name}")
+def delete_tool(name: str, body: ReasonIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
+    return _delete_tool(ctx, name, body.reason)
 
 
 def _toggle(ctx: AdminCtx, name: str, enabled: bool, reason: str) -> dict:
@@ -578,20 +763,94 @@ def activate_tool_version(name: str, body: ActivateIn, ctx: AdminCtx = Depends(a
         tool = _get_tool(ctx, name)
         version = _tool_version(ctx, tool, body.version_no)
         schema = version.schema_json or {}
+        # open_oa_invoke：激活前尽量从历史补回 invoke，并允许 POST 激活
+        schema, repaired = recover_open_oa_invoke_schema(ctx.db, tool, schema)
+        if repaired:
+            version.schema_json = schema
+            if (tool.kind or "office") in ("office", "open_oa_invoke", None, ""):
+                tool.kind = "open_oa_invoke"
         check = contract_check(schema)
         for warning in check.warnings:
             log.warning("Tool %s v%s 契约检查：%s", name, body.version_no, warning)
         if not is_activatable(schema):
-            raise AppError(400, "CONTRACT_NOT_ACTIVATABLE", "契约检查未通过，不可激活该 Tool 版本")
+            raise AppError(
+                400, "CONTRACT_NOT_ACTIVATABLE",
+                "契约检查未通过，不可激活该 Tool 版本（GET 只读，或 POST 且须含 invoke_service/method）",
+            )
         before = _version_no(ctx, tool.current_version_id)
         try:
             engine.catalog.activate_version(ctx.db, tool, body.version_no, ctx.user.username)
         except LookupError:
             raise AppError(404, "NOT_FOUND", f"版本 v{body.version_no} 不存在") from None
         ctx.audit("tool.activate", "tool", name, before={"version_no": before},
-                  after={"version_no": body.version_no}, reason=body.reason)
+                  after={"version_no": body.version_no, "repaired_invoke": repaired}, reason=body.reason)
     _reload(ctx)
     return _tool_view(ctx, tool)
+
+
+class RepairOpenOaIn(ReasonIn):
+    """修复损坏的 open_oa_invoke：可从历史恢复，或显式指定 ANew 目标。"""
+
+    invoke_service: str | None = Field(default=None, max_length=128)
+    invoke_method: str | None = Field(default=None, max_length=128)
+
+
+@tools_router.post("/{name}/repair-open-oa")
+def repair_open_oa_tool(name: str, body: RepairOpenOaIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
+    """把缺 invoke 的 open_oa_invoke Tool 修回可注册状态（就地修补当前版本）。"""
+    with ctx.db.begin():
+        tool = _get_tool(ctx, name)
+        current = ctx.db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
+        if current is None:
+            raise AppError(404, "NOT_FOUND", "Tool 没有有效版本，请用「接入业务接口」重新入库")
+        schema = dict(current.schema_json or {})
+        inv_s = (body.invoke_service or "").strip()
+        inv_m = (body.invoke_method or "").strip()
+        source = "body"
+        if not inv_s or not inv_m:
+            schema, _ = recover_open_oa_invoke_schema(ctx.db, tool, schema)
+            inv_s = str(schema.get("invoke_service") or "").strip()
+            inv_m = str(schema.get("invoke_method") or "").strip()
+            source = "history"
+        if not inv_s or not inv_m:
+            raise AppError(
+                422, "VALIDATION_ERROR",
+                "无法自动恢复：请传入 invoke_service / invoke_method，"
+                "例如 out_attendance/go_out_application + searchApplicationList；"
+                "或用「接入业务接口」按同名覆盖。",
+            )
+        schema["invoke_service"] = inv_s
+        schema["invoke_method"] = inv_m
+        schema["method"] = "POST"
+        schema["path"] = INVOKE_PATH
+        schema.setdefault("name", tool.name)
+        schema.setdefault("summary", tool.summary or tool.name)
+        schema.setdefault("risk_level", tool.risk_level or "low")
+        schema.setdefault("requires_confirmation", bool(tool.requires_confirmation))
+        current.schema_json = schema
+        current.schema_hash = canonical_hash(schema)
+        tool.kind = "open_oa_invoke"
+        tool.spec_enabled = True
+        tool.summary = schema.get("summary") or tool.summary
+        tool.risk_level = schema["risk_level"]
+        tool.requires_confirmation = bool(schema["requires_confirmation"])
+        tool.pending_version_id = None
+        tool.updated_by = ctx.user.username
+        ctx.db.flush()
+        ctx.runtime.engine.catalog.revalidate_skills(ctx.db)
+        ctx.audit(
+            "tool.repair_open_oa", "tool", name,
+            after={"invoke_service": inv_s, "invoke_method": inv_m, "source": source},
+            reason=body.reason,
+        )
+    _reload(ctx)
+    view = _tool_view(ctx, _get_tool(ctx, name))
+    if not view.get("registered"):
+        raise AppError(
+            422, "VALIDATION_ERROR",
+            f"已写入 invoke，但仍未注册：{'；'.join(view.get('unregistered_reasons') or [])}",
+        )
+    return view
 
 
 # ---------------- Skill ----------------
@@ -683,6 +942,32 @@ def update_skill(name: str, body: SkillIn, ctx: AdminCtx = Depends(admin_write(S
     if body.name != name:
         raise AppError(422, "VALIDATION_ERROR", "Skill 名创建后不能修改")
     return _save_skill(ctx, body, create=False)
+
+
+def _delete_skill(ctx: AdminCtx, name: str, reason: str) -> dict:
+    """删除目录 Skill、版本与可见性规则。"""
+    engine = ctx.runtime.engine
+    with ctx.db.begin():
+        skill = _get_skill(ctx, name)
+        before = {"name": skill.name, "display_name": skill.display_name, "enabled": skill.enabled}
+        ctx.db.execute(
+            sa.delete(SkillVisibilityRule).where(
+                SkillVisibilityRule.tenant_id == ctx.runtime.tenant_id,
+                SkillVisibilityRule.skill_id == skill.id,
+            )
+        )
+        versions = list(ctx.db.scalars(sa.select(SkillVersion).where(SkillVersion.skill_id == skill.id)).all())
+        for v in versions:
+            ctx.db.delete(v)
+        ctx.db.delete(skill)
+        ctx.audit("skill.delete", "skill", name, before=before, reason=reason)
+    engine.reload_catalog()
+    return {"ok": True, "name": name}
+
+
+@skills_router.delete("/{name}")
+def delete_skill(name: str, body: ReasonIn, ctx: AdminCtx = Depends(admin_write(SKILL))):
+    return _delete_skill(ctx, name, body.reason)
 
 
 def _toggle_skill(ctx: AdminCtx, name: str, enabled: bool, reason: str) -> dict:
