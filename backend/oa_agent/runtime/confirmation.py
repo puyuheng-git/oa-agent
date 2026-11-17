@@ -49,23 +49,35 @@ def _token_hash(token: str) -> str:
 
 def issue(db: Session, tenant_id: str, *, run_id: str, oa: str, workflow_version: str, payload: dict,
           reason: str, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> IssuedConfirmation:
-    """创建 user_confirm 任务并返回明文令牌（只此一次可见）。调用方负责事务提交。"""
+    """创建 user_confirm 任务并返回明文令牌（只此一次可见）。调用方负责事务提交。
+
+    binding 内同时保存 payload 全文：Skill 确认等无 LangGraph interrupt 的场景需据此落盘；
+    行程报销等仍以 interrupt 中的 payload 为准做哈希校验。
+    """
     token = secrets.token_urlsafe(32)
     now = utcnow()
     expire_at = now + timedelta(seconds=ttl_seconds)
     task = InterventionTask(
         task_id=new_task_id(), tenant_id=tenant_id, run_id=run_id, kind=USER_CONFIRM, status=PENDING,
         reason=reason[:255], confirm_token_hash=_token_hash(token), expire_at=expire_at, created_at=now,
-        binding_snapshot_json={"oa": oa, "run_id": run_id, "workflow_version": workflow_version,
-                               "payload_hash": payload_hash(payload)},
+        binding_snapshot_json={
+            "oa": oa,
+            "run_id": run_id,
+            "workflow_version": workflow_version,
+            "payload_hash": payload_hash(payload),
+            "payload": payload,
+        },
     )
     db.add(task)
     return IssuedConfirmation(task.task_id, token, expire_at)
 
 
 def verify_and_consume(db: Session, *, task_id: str, token: str, oa: str, payload: dict,
-                       now: datetime | None = None) -> InterventionTask:
-    """校验并单次消费。失败抛 ConfirmationError，不改变任务状态。调用方负责事务提交。"""
+                       now: datetime | None = None, result: str = "confirmed") -> InterventionTask:
+    """校验并单次消费。失败抛 ConfirmationError，不改变任务状态。调用方负责事务提交。
+
+    result 一般为 confirmed；员工取消时传 rejected。
+    """
     task = db.scalar(sa.select(InterventionTask).where(InterventionTask.task_id == task_id))
     if task is None or task.kind != USER_CONFIRM:
         raise ConfirmationError("CONFIRMATION_NOT_FOUND", "确认请求不存在")
@@ -82,12 +94,20 @@ def verify_and_consume(db: Session, *, task_id: str, token: str, oa: str, payloa
         raise ConfirmationError("CONFIRMATION_INVALID", "确认令牌无效")
     if binding.get("payload_hash") != payload_hash(payload):
         raise ConfirmationError("CONFIRMATION_MISMATCH", "确认内容与发起时不一致")
+    outcome = result if result in ("confirmed", "rejected") else "confirmed"
     won = db.execute(
         sa.update(InterventionTask)
         .where(InterventionTask.task_id == task_id, InterventionTask.status == PENDING,
                InterventionTask.version == task.version)
-        .values(status=RESOLVED, result="confirmed", handled_by=f"employee:{oa}", handled_at=now,
+        .values(status=RESOLVED, result=outcome, handled_by=f"employee:{oa}", handled_at=now,
                 version=task.version + 1)).rowcount == 1
     if not won:
         raise ConfirmationError("CONFIRMATION_USED", "该确认已处理或已失效")
     return task
+
+
+def payload_from_binding(task: InterventionTask) -> dict | None:
+    """从确认任务 binding 取出签发时保存的 payload（Skill 确认等无 interrupt 场景）。"""
+    binding = task.binding_snapshot_json or {}
+    payload = binding.get("payload")
+    return payload if isinstance(payload, dict) else None

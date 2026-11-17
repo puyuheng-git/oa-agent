@@ -7,12 +7,15 @@ from typing import Literal
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
-from oa_agent.db.models import LlmModel, LlmProvider
+from oa_agent.db.models import LlmDefaults, LlmModel, LlmProvider, LlmRoute
 from oa_agent.errors import AppError
 from oa_agent.integrations.llm_check import check_model, check_provider
+from oa_agent.runtime.llm import CAPABILITIES
+
+DEFAULT_MAX_FAILOVER = 3
 
 router = APIRouter(prefix="/v1/admin/llm", tags=["admin-llm"])
 
@@ -34,6 +37,32 @@ class ModelIn(BaseModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
     purpose_tags: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=lambda: ["text"])
+    model_tier: Literal["large", "small"] = "large"
+    enabled: bool = True
+
+    @field_validator("capabilities")
+    @classmethod
+    def _check_capabilities(cls, v: list[str]) -> list[str]:
+        # 去重保序；不得为空，且必须落在允许集合内
+        out = list(dict.fromkeys(v))
+        if not out:
+            raise ValueError("capabilities 至少选择一项")
+        bad = [c for c in out if c not in CAPABILITIES]
+        if bad:
+            raise ValueError(f"不支持的能力：{', '.join(bad)}")
+        return out
+
+
+class DefaultsIn(BaseModel):
+    global_default_model_id: int | None = None
+    max_failover: int = Field(default=DEFAULT_MAX_FAILOVER, ge=1, le=10)
+
+
+class RouteIn(BaseModel):
+    capability: Literal["text", "vision", "multimodal", "embedding"]
+    model_tier: Literal["large", "small"]
+    model_ids: list[int] = Field(default_factory=list)
     enabled: bool = True
 
 
@@ -57,12 +86,66 @@ def _provider_summary(ctx: AdminCtx, p: LlmProvider) -> str:
     return json.dumps(v, ensure_ascii=False)
 
 
-def _model_view(m: LlmModel) -> dict:
+def _model_view(m: LlmModel, default_id: int | None = None) -> dict:
     return {
         "id": m.id, "provider_id": m.provider_id, "model_name": m.model_name, "display_name": m.display_name,
         "temperature": (m.params_json or {}).get("temperature"), "max_tokens": (m.params_json or {}).get("max_tokens"),
-        "purpose_tags": m.purpose_tags or [], "enabled": m.enabled, "updated_by": m.updated_by, "updated_at": m.updated_at,
+        "purpose_tags": m.purpose_tags or [], "capabilities": m.capabilities or ["text"],
+        "model_tier": m.model_tier or "large", "is_default": default_id is not None and m.id == default_id,
+        "enabled": m.enabled, "updated_by": m.updated_by, "updated_at": m.updated_at,
     }
+
+
+def _get_defaults(ctx: AdminCtx) -> LlmDefaults | None:
+    return ctx.db.scalar(sa.select(LlmDefaults).where(LlmDefaults.tenant_id == ctx.runtime.tenant_id))
+
+
+def _default_model_id(ctx: AdminCtx) -> int | None:
+    row = _get_defaults(ctx)
+    return row.global_default_model_id if row else None
+
+
+def _defaults_view(row: LlmDefaults | None) -> dict:
+    return {
+        "global_default_model_id": row.global_default_model_id if row else None,
+        "max_failover": row.max_failover if row else DEFAULT_MAX_FAILOVER,
+        "updated_by": row.updated_by if row else "", "updated_at": row.updated_at if row else None,
+    }
+
+
+def _upsert_defaults(ctx: AdminCtx) -> LlmDefaults:
+    # 安装/迁移可能已种下默认行：有则复用，无则新增
+    row = _get_defaults(ctx)
+    if row is None:
+        row = LlmDefaults(tenant_id=ctx.runtime.tenant_id, max_failover=DEFAULT_MAX_FAILOVER)
+        ctx.db.add(row)
+    return row
+
+
+def _defaults_summary(row: LlmDefaults | None) -> str:
+    v = _defaults_view(row)
+    return json.dumps({"global_default_model_id": v["global_default_model_id"], "max_failover": v["max_failover"]})
+
+
+def _route_view(r: LlmRoute, warnings: list[str] | None = None) -> dict:
+    v = {
+        "id": r.id, "capability": r.capability, "model_tier": r.model_tier, "model_ids": r.model_ids or [],
+        "enabled": r.enabled, "updated_by": r.updated_by, "updated_at": r.updated_at,
+    }
+    if warnings is not None:
+        v["warnings"] = warnings
+    return v
+
+
+def _route_summary(r: LlmRoute) -> str:
+    return json.dumps({"capability": r.capability, "model_tier": r.model_tier, "model_ids": r.model_ids or [],
+                       "enabled": r.enabled}, ensure_ascii=False)
+
+
+def _get_route(ctx: AdminCtx, capability: str, model_tier: str) -> LlmRoute | None:
+    return ctx.db.scalar(sa.select(LlmRoute).where(
+        LlmRoute.tenant_id == ctx.runtime.tenant_id, LlmRoute.capability == capability,
+        LlmRoute.model_tier == model_tier))
 
 
 def _get_provider(ctx: AdminCtx, provider_id: int) -> LlmProvider:
@@ -171,12 +254,14 @@ def list_remote_models(provider_id: int, ctx: AdminCtx = Depends(admin_read("sys
 def list_models(ctx: AdminCtx = Depends(admin_read("sys.setting.view"))):
     rows = ctx.db.scalars(sa.select(LlmModel).where(LlmModel.tenant_id == ctx.runtime.tenant_id)
                           .order_by(LlmModel.id)).all()
-    return {"items": [_model_view(m) for m in rows]}
+    default_id = _default_model_id(ctx)
+    return {"items": [_model_view(m, default_id) for m in rows]}
 
 
 def _apply_model(m: LlmModel, body: ModelIn, actor: str) -> None:
     m.provider_id, m.model_name = body.provider_id, body.model_name
     m.display_name = body.display_name or body.model_name
+    m.capabilities, m.model_tier = list(body.capabilities), body.model_tier
     m.params_json = {k: v for k, v in {"temperature": body.temperature, "max_tokens": body.max_tokens}.items()
                      if v is not None}
     m.purpose_tags = [t.strip() for t in body.purpose_tags if t.strip()]
@@ -200,8 +285,10 @@ def create_model(body: ModelIn, ctx: AdminCtx = Depends(admin_write("sys.setting
         _apply_model(m, body, ctx.user.username)
         ctx.db.add(m)
         ctx.db.flush()
-        ctx.audit("llm.model.create", "llm_model", m.id, after=json.dumps(_model_view(m), ensure_ascii=False, default=str))
-    return _model_view(m)
+        default_id = _default_model_id(ctx)
+        ctx.audit("llm.model.create", "llm_model", m.id,
+                  after=json.dumps(_model_view(m, default_id), ensure_ascii=False, default=str))
+    return _model_view(m, default_id)
 
 
 @router.put("/models/{model_id}")
@@ -211,21 +298,112 @@ def update_model(model_id: int, body: ModelIn, ctx: AdminCtx = Depends(admin_wri
         _get_provider(ctx, body.provider_id)
         if _model_dupe(ctx, body, exclude_id=m.id):
             raise AppError(409, "NAME_EXISTS", "该提供方下已有同名模型")
-        before = json.dumps(_model_view(m), ensure_ascii=False, default=str)
+        default_id = _default_model_id(ctx)
+        before = json.dumps(_model_view(m, default_id), ensure_ascii=False, default=str)
         _apply_model(m, body, ctx.user.username)
         ctx.db.flush()
         ctx.audit("llm.model.update", "llm_model", m.id, before=before,
-                  after=json.dumps(_model_view(m), ensure_ascii=False, default=str))
-    return _model_view(m)
+                  after=json.dumps(_model_view(m, default_id), ensure_ascii=False, default=str))
+    return _model_view(m, default_id)
 
 
 @router.delete("/models/{model_id}")
 def delete_model(model_id: int, ctx: AdminCtx = Depends(admin_write("sys.setting.edit"))):
     with ctx.db.begin():
         m = _get_model(ctx, model_id)
-        before = json.dumps(_model_view(m), ensure_ascii=False, default=str)
+        before = json.dumps(_model_view(m, _default_model_id(ctx)), ensure_ascii=False, default=str)
         ctx.db.delete(m)
         ctx.audit("llm.model.delete", "llm_model", model_id, before=before)
+    return {"ok": True}
+
+
+@router.post("/models/{model_id}/set-default")
+def set_default_model(model_id: int, ctx: AdminCtx = Depends(admin_write("sys.setting.edit"))):
+    with ctx.db.begin():
+        # 校验模型归属后，upsert 租户默认行
+        m = _get_model(ctx, model_id)
+        row = _upsert_defaults(ctx)
+        before = _defaults_summary(row if row.id else None)
+        row.global_default_model_id, row.updated_by = m.id, ctx.user.username
+        ctx.db.flush()
+        ctx.audit("llm.model.set_default", "llm_model", m.id, before=before, after=_defaults_summary(row))
+    return _defaults_view(row)
+
+
+# ---- defaults ----
+
+@router.get("/defaults")
+def get_defaults(ctx: AdminCtx = Depends(admin_read("sys.setting.view"))):
+    return _defaults_view(_get_defaults(ctx))
+
+
+@router.put("/defaults")
+def put_defaults(body: DefaultsIn, ctx: AdminCtx = Depends(admin_write("sys.setting.edit"))):
+    with ctx.db.begin():
+        # 指定默认模型时必须属于本租户；None = 清空
+        if body.global_default_model_id is not None:
+            _get_model(ctx, body.global_default_model_id)
+        row = _upsert_defaults(ctx)
+        before = _defaults_summary(row if row.id else None)
+        row.global_default_model_id, row.max_failover = body.global_default_model_id, body.max_failover
+        row.updated_by = ctx.user.username
+        ctx.db.flush()
+        ctx.audit("llm.defaults.update", "llm_defaults", row.id, before=before, after=_defaults_summary(row))
+    return _defaults_view(row)
+
+
+# ---- routes ----
+
+@router.get("/routes")
+def list_routes(ctx: AdminCtx = Depends(admin_read("sys.setting.view"))):
+    rows = ctx.db.scalars(sa.select(LlmRoute).where(LlmRoute.tenant_id == ctx.runtime.tenant_id)
+                          .order_by(LlmRoute.id)).all()
+    return {"items": [_route_view(r) for r in rows]}
+
+
+def _route_warnings(ctx: AdminCtx, body: RouteIn, model_ids: list[int]) -> list[str]:
+    # 一次性取回池内模型，校验归属并收集能力/规模不符警告（仍允许保存）
+    models = {m.id: m for m in ctx.db.scalars(sa.select(LlmModel).where(
+        LlmModel.tenant_id == ctx.runtime.tenant_id, LlmModel.id.in_(model_ids))).all()}
+    missing = [i for i in model_ids if i not in models]
+    if missing:
+        raise AppError(404, "NOT_FOUND", f"模型不存在：{', '.join(str(i) for i in missing)}")
+    warnings = []
+    for i in model_ids:
+        m = models[i]
+        if body.capability not in (m.capabilities or ["text"]):
+            warnings.append(f"模型 {i} 的 capabilities 不含 {body.capability}")
+        if (m.model_tier or "large") != body.model_tier:
+            warnings.append(f"模型 {i} 的 model_tier 不是 {body.model_tier}")
+    return warnings
+
+
+@router.put("/routes")
+def put_route(body: RouteIn, ctx: AdminCtx = Depends(admin_write("sys.setting.edit"))):
+    with ctx.db.begin():
+        # 去重保序后校验模型；覆盖或新建 (capability, model_tier) 池
+        model_ids = list(dict.fromkeys(body.model_ids))
+        warnings = _route_warnings(ctx, body, model_ids)
+        r = _get_route(ctx, body.capability, body.model_tier)
+        before = _route_summary(r) if r else None
+        if r is None:
+            r = LlmRoute(tenant_id=ctx.runtime.tenant_id, capability=body.capability, model_tier=body.model_tier)
+            ctx.db.add(r)
+        r.model_ids, r.enabled, r.updated_by = model_ids, body.enabled, ctx.user.username
+        ctx.db.flush()
+        ctx.audit("llm.route.put", "llm_route", r.id, before=before, after=_route_summary(r))
+    return _route_view(r, warnings)
+
+
+@router.delete("/routes/{capability}/{model_tier}")
+def delete_route(capability: str, model_tier: str, ctx: AdminCtx = Depends(admin_write("sys.setting.edit"))):
+    with ctx.db.begin():
+        r = _get_route(ctx, capability, model_tier)
+        if r is None:
+            raise AppError(404, "NOT_FOUND", "路由不存在")
+        before, route_id = _route_summary(r), r.id
+        ctx.db.delete(r)
+        ctx.audit("llm.route.delete", "llm_route", route_id, before=before)
     return {"ok": True}
 
 

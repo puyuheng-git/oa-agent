@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +16,12 @@ from oa_agent.db.models import SkillMarketListing, SkillPack, SkillPackVersion, 
 from oa_agent.db.types import utcnow
 from oa_agent.errors import AppError
 from oa_agent.skills.github_import import import_from_github
-from oa_agent.skills.parse import SkillMdError, parse_skill_md
+from oa_agent.skills.parse import (
+    SkillMdError,
+    invocation_flags_from_skill_md,
+    parse_skill_md,
+    truncate_catalog_description,
+)
 from oa_agent.skills.pack_store import load_bundle_files, save_pack_version
 
 log = logging.getLogger(__name__)
@@ -38,6 +44,9 @@ class SkillPackState:
     skill_md: str = ""
     loaded_body: bool = False
     files: list[str] = field(default_factory=list)
+    # DSH：模型目录/skill 工具 vs 用户 /name
+    disable_model_invocation: bool = False
+    user_invocable: bool = True
 
 
 def pack_bundle_dir(data_dir: Path, storage_path: str) -> Path:
@@ -53,6 +62,9 @@ def _version(db: Session, pack: SkillPack) -> SkillPackVersion | None:
 def _state(pack: SkillPack, version: SkillPackVersion | None, *, enabled: bool, origin: str) -> SkillPackState:
     meta = (version.bundle_meta or {}) if version else {}
     files = [f["path"] for f in (meta.get("files") or []) if isinstance(f, dict) and f.get("path")]
+    disable_model, user_invocable = False, True
+    if version and version.skill_md:
+        disable_model, user_invocable = invocation_flags_from_skill_md(version.skill_md)
     return SkillPackState(
         id=pack.id,
         name=pack.name,
@@ -68,6 +80,8 @@ def _state(pack: SkillPack, version: SkillPackVersion | None, *, enabled: bool, 
         storage_path=version.storage_path if version else "",
         skill_md="",
         files=files,
+        disable_model_invocation=disable_model,
+        user_invocable=user_invocable,
     )
 
 
@@ -697,49 +711,195 @@ def install_from_market(db: Session, *, tenant_id: str, oa: str, pack_id: int) -
     return row
 
 
-SKILL_CREATOR_MD = """---
-name: skill-creator
-display_name: Skill 创建助手
-description: Create a personal Agent Skill from natural language. Use when the employee wants to create a skill, write SKILL.md, teach the assistant a reusable personal workflow, or save instructions as their own Skill.
+# 薄层 OA 适配：不替代 Anthropic skill-creator；只约定落盘/确认/Memory 分流。
+# 种子包名 oa-skill-persist，避免覆盖管理员从 GitHub 导入的 anthropics/skills/skill-creator。
+OA_SKILL_PERSIST_MD = """---
+name: oa-skill-persist
+description: >-
+  OA 个人 Skill 落盘与修订适配。Use when the employee wants to save, create, update, or solidify a personal
+  Skill after drafting with skill-creator; or when deciding Skill vs Memory.
 ---
 
-# Skill Creator（创建个人 Skill）
+# OA 个人 Skill 落盘适配
 
-当员工要用自然语言创建**自己的** Skill 时按本说明执行。系统 Skill 由管理员配置，不要替员工创建系统包。
+本说明是 **Anthropic skill-creator 的运行时桥接**，不替代 skill-creator。
 
-## 步骤
+## 与 skill-creator 的分工
 
-1. 与员工确认：Skill 英文名（小写字母/数字/连字符，如 `my-leave-tips`）、一句话描述（何时使用）、正文指引。
-2. 起草完整 `SKILL.md`（必须含 YAML frontmatter）：
+1. **怎么写好 / 改好** → 遵循已安装的系统包 **skill-creator**（意图捕获、草稿、迭代 description）。
+2. **写到哪里 / 何时生效** → 本说明 + 工具 `builtin.skill_create` / `builtin.skill_update`。
+3. OA 聊天环境 **没有** Claude Code 式子代理 eval、`eval-viewer` 浏览器、可写技能目录；不要调用不存在的 eval 脚本，也不要往虚构路径写文件。
 
-```markdown
----
-name: example-skill
-description: Use when …（含触发关键词）
----
+## Skill vs Memory
 
-# 标题
+- **Memory**（`builtin.memory` / 「请记住」）：身份偏好、长期约束、短事实。
+- **个人 Skill**：有明确触发场景 + 可复用分步指引，要当「能力」反复用。
+- **不要固化**：一次性闲聊、未验证结论、纯叙事「这次怎么做的」。
 
-## 使用说明
+## 落盘步骤（强制）
 
-分步骤写给助手的指引。
-```
+1. 用 skill-creator（若已启用）起草完整 `SKILL.md`（含 YAML `name` / `description`）。
+2. 在对话中向员工展示草稿摘要；员工同意后再调工具。
+3. **新建** → `builtin.skill_create`，参数 `skill_md` = 全文。工具会发起确认卡，**未确认不入库**。
+4. **修改已有个人 Skill** → `builtin.skill_update`，参数 `name` + `skill_md`。同样走确认卡。
+5. 工具返回「待确认」后，告知员工在确认卡上点确认；不要谎称已写入。
 
-3. 调用工具 **builtin.skill_create**，参数 `skill_md` = 完整 Markdown 正文。
-4. 用返回的 `name` / `display_name` 向员工确认已创建；之后该 Skill 会出现在「我的 Skill」，并在对话中自动可用。
+## 禁止
 
-## 注意
+- 不要用短版自造流程替换 skill-creator 正文。
+- 不要在未获员工确认时声称 Skill 已创建或已更新。
+"""
 
-- 不要编造未确认的业务规则；不确定就先问员工。
-- 同名 Skill 已存在时工具会报错，请换名或让员工先在工作空间编辑已有 Skill。
-- 需要跑脚本的能力仍用其他系统 Skill + `builtin.skill_exec`；本工具只负责落盘个人 SKILL.md。
+# DSH 风格运行时口令：目录 → builtin.skill → 按正文；个人落盘另走确认工具
+OA_SKILL_PERSIST_PROMPT = """## Skill 渐进披露（DSH / agentskills）
+- 上方目录只有 name 与 description 摘要，不能当作操作步骤。
+- 任务匹配某 Skill 时，先调用 builtin.skill（参数 name=精确包名）加载完整 SKILL.md，再严格按正文执行。
+- 正文要求读 references/assets 时用 builtin.skill_read；跑 scripts 时用 builtin.skill_exec。
+- 创建/修订个人 Skill：遵循 skill-creator（若已启用），落盘用 builtin.skill_create / builtin.skill_update（须确认卡）。
+- 偏好/短事实用 Memory，不要建成 Skill。
 """
 
 
+def catalog_entries_for_model(packs: list[SkillPackState]) -> list[dict[str, str]]:
+    """模型可见目录：排除 disable-model-invocation；description 截断至 500。"""
+    out: list[dict[str, str]] = []
+    for pack in packs:
+        if pack.disable_model_invocation:
+            continue
+        out.append({
+            "name": pack.name,
+            "description": truncate_catalog_description(pack.description or ""),
+        })
+    return out
+
+
+def find_enabled_pack(packs: list[SkillPackState], name: str) -> SkillPackState | None:
+    key = (name or "").strip().lower()
+    if not key:
+        return None
+    for pack in packs:
+        if pack.name == key:
+            return pack
+    return None
+
+
+def render_skill_content(*, name: str, instructions: str, resource_hint: str = "") -> str:
+    """接近 DSH <skill_content> 的工具结果正文。"""
+    hint = (resource_hint or "").strip() or (
+        "Resources are under this skill pack root. "
+        "Read references/assets via builtin.skill_read(skill, path). "
+        "Run scripts via builtin.skill_exec(skill, script)."
+    )
+    return (
+        f'<skill_content name="{name}">\n'
+        f"<skill_resources>\n{hint}\n</skill_resources>\n\n"
+        f"<skill_instructions>\n{instructions}\n</skill_instructions>\n"
+        f"</skill_content>"
+    )
+
+
+_SLASH_SKILL_RE = re.compile(r"(?<!\S)/([a-z0-9]+(?:-[a-z0-9]+)*)(?!\S)")
+
+
+def resolve_slash_skills(
+    db: Session,
+    *,
+    data_dir: Path,
+    packs: list[SkillPackState],
+    message: str,
+) -> str:
+    """DSH user-explicit：空白边界的 /name 直注 user-invocable 包正文。"""
+    names = _SLASH_SKILL_RE.findall(message or "")
+    if not names:
+        return ""
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        pack = find_enabled_pack(packs, name)
+        if pack is None or not pack.user_invocable:
+            continue
+        try:
+            body = load_skill_body(db, data_dir, pack.id)
+        except AppError:
+            continue
+        hint = resource_hint_for_pack(pack)
+        blocks.append(render_skill_content(name=pack.name, instructions=body, resource_hint=hint))
+        bump_invoke(db, pack.id)
+    return "\n\n".join(blocks)
+
+
+SKILL_READ_MAX_CHARS = 200_000
+SKILL_READ_PREFIXES = ("references/", "assets/")
+SKILL_READ_ROOT_EXTS = frozenset({".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".tsv"})
+
+
+def assert_skill_read_relpath(rel: str) -> str:
+    """校验包内只读相对路径；拒绝穿越与非白名单路径。返回规范化 posix 相对路径。"""
+    raw = (rel or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("/") or ".." in raw.split("/"):
+        raise AppError(422, "INVALID_ARGUMENT", "Skill 资源路径无效")
+    parts = raw.split("/")
+    for i, part in enumerate(parts):
+        # 禁止隐藏目录段；文件名允许 .md 等扩展名
+        if part.startswith(".") and i < len(parts) - 1:
+            raise AppError(422, "INVALID_ARGUMENT", "Skill 资源路径无效")
+    lower = raw.lower()
+    if lower.startswith(SKILL_READ_PREFIXES):
+        return raw
+    if "/" not in raw and Path(raw).suffix.lower() in SKILL_READ_ROOT_EXTS:
+        return raw
+    raise AppError(
+        422,
+        "INVALID_ARGUMENT",
+        "只能读取 references/、assets/ 或包根文档；脚本请用 builtin.skill_exec",
+    )
+
+
+def read_skill_resource(bundle: Path, rel: str, *, max_chars: int = SKILL_READ_MAX_CHARS) -> dict[str, Any]:
+    """从包根安全读取白名单相对文件。"""
+    norm = assert_skill_read_relpath(rel)
+    root = bundle.resolve()
+    target = (root / norm).resolve()
+    if target != root and root not in target.parents:
+        raise AppError(403, "PATH_NOT_ALLOWED", "该路径不被允许")
+    if not target.is_file():
+        raise AppError(404, "NOT_FOUND", f"Skill 资源不存在：{norm}")
+    text = target.read_text(encoding="utf-8", errors="replace")
+    truncated = False
+    if len(text) > max_chars:
+        text = text[:max_chars]
+        truncated = True
+    return {"path": norm, "content": text, "truncated": truncated}
+
+
+def resource_hint_for_pack(pack: SkillPackState) -> str:
+    """加载结果中的资源指引（不枚举整包目录，对齐 DSH）。"""
+    has_scripts = any(
+        p.replace("\\", "/").startswith("scripts/") and p.lower().endswith((".py", ".js", ".mjs", ".cjs"))
+        for p in (pack.files or [])
+    )
+    has_refs = any(
+        p.replace("\\", "/").startswith("references/") or p.replace("\\", "/").startswith("assets/")
+        for p in (pack.files or [])
+    )
+    parts = [
+        f"Skill pack「{pack.name}」resource base is the pack bundle directory.",
+        "Follow SKILL.md; use relative paths from the skill root (one level deep).",
+    ]
+    if has_scripts:
+        parts.append("Scripts: call builtin.skill_exec with skill=" + pack.name + " and script=relative path under scripts/.")
+    if has_refs:
+        parts.append("References/assets: call builtin.skill_read with skill=" + pack.name + " and path=relative file.")
+    return "\n".join(parts)
+
+
 def ensure_system_skill_packs(db: Session, *, tenant_id: str, data_dir: Path) -> int:
-    """幂等写入内置系统包（如 skill-creator）；已存在则跳过。"""
+    """幂等写入内置系统包；已存在则跳过，绝不覆盖 Anthropic skill-creator。"""
     seeds = {
-        "skill-creator": SKILL_CREATOR_MD,
+        "oa-skill-persist": OA_SKILL_PERSIST_MD,
     }
     created = 0
     for name, skill_md in seeds.items():
@@ -756,7 +916,7 @@ def ensure_system_skill_packs(db: Session, *, tenant_id: str, data_dir: Path) ->
         pack = SkillPack(
             tenant_id=tenant_id,
             name=parsed["name"],
-            display_name="Skill 创建助手" if name == "skill-creator" else parsed["name"],
+            display_name="OA Skill 落盘适配" if name == "oa-skill-persist" else parsed["name"],
             description=parsed["description"],
             kind="system",
             source="builtin",
@@ -778,6 +938,49 @@ def ensure_system_skill_packs(db: Session, *, tenant_id: str, data_dir: Path) ->
         created += 1
         log.info("已写入系统 Skill 包：%s", name)
     return created
+
+
+def get_pack_by_name(db: Session, *, tenant_id: str, name: str) -> SkillPack | None:
+    """按租户 + Skill 名取包。"""
+    key = (name or "").strip().lower()
+    if not key:
+        return None
+    return db.scalar(
+        sa.select(SkillPack).where(SkillPack.tenant_id == tenant_id, SkillPack.name == key)
+    )
+
+
+def apply_skill_pack_payload(
+    db: Session,
+    *,
+    tenant_id: str,
+    oa: str,
+    data_dir: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """员工确认后执行 create/update；payload 来自确认任务 binding。"""
+    action = str(payload.get("action") or "").strip()
+    skill_md = payload.get("skill_md")
+    if not isinstance(skill_md, str) or len(skill_md.strip()) < 10:
+        raise AppError(422, "VALIDATION_ERROR", "确认载荷缺少有效 skill_md")
+    if action == "create":
+        pack = create_user_pack(db, tenant_id=tenant_id, oa=oa, data_dir=data_dir, skill_md=skill_md)
+    elif action == "update":
+        pack_id = payload.get("pack_id")
+        if not isinstance(pack_id, int) or pack_id < 1:
+            raise AppError(422, "VALIDATION_ERROR", "确认载荷缺少 pack_id")
+        pack = update_user_pack(
+            db, tenant_id=tenant_id, oa=oa, pack_id=pack_id, data_dir=data_dir, skill_md=skill_md,
+        )
+    else:
+        raise AppError(422, "VALIDATION_ERROR", f"未知 Skill 确认动作：{action}")
+    return {
+        "ok": True,
+        "action": action,
+        "id": pack.id,
+        "name": pack.name,
+        "display_name": pack.display_name or pack.name,
+    }
 
 
 def admin_list_packs(db: Session, *, tenant_id: str) -> list[dict[str, Any]]:

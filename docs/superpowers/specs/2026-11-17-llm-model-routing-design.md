@@ -1,7 +1,7 @@
 # LLM 模型默认、分类与同池顺延
 
 **日期：** 2026-11-17  
-**状态：** 设计待实现  
+**状态：** 已交付（见 [`docs/delivery/2026-11-17-llm-model-routing-delivery.md`](../../delivery/2026-11-17-llm-model-routing-delivery.md)）  
 **权威设计：** [`docs/design/2026-10-09-oa-langgraph-design.md`](../../design/2026-10-09-oa-langgraph-design.md)  
 **相关：** [`2026-10-28-llm-remote-models-design.md`](./2026-10-28-llm-remote-models-design.md)
 
@@ -72,8 +72,8 @@
 1. 调用方显式 `model_id`（如工作流 `llm_model_id`）：  
    - 配置可用 → 使用之；  
    - 配置不可用 → 不报错中断解析，进入 §4.4 的「同池后续」候选（从该 ID 在池中的下一位起）；若无匹配池则继续步骤 2。  
-2. 调用方指定 `(capability, model_tier)` → 查启用中的 route，按 `model_ids` 取第一个**配置可用**模型。  
-3. 否则 → `global_default_model_id`（若配置可用）。  
+2. 调用方指定 `(capability, model_tier)` → 查启用中的 route，按 `model_ids` 取第一个**配置可用**模型。若该池不存在、为空或无可用模型 → 返回 `None`（**不**落到全局默认，由调用方决定回退；如路由阶段回退主模型）。  
+3. 否则（调用方未指定 `(capability, model_tier)`）→ `global_default_model_id`（若配置可用）。  
 4. 否则 → 兼容旧逻辑：`purpose_tags` 匹配 → 任一启用模型。  
 5. 都没有 → `None`（上层走规则/降级，与今天一致）。
 
@@ -102,7 +102,7 @@
 | 场景 | 选模 |
 |------|------|
 | 对话主模型（未指定 ID） | 全局默认 |
-| 路由小模型（`stage=router`） | `(text, small)` 池；空则全局默认 |
+| 路由小模型（`stage=router`） | `(text, small)` 池（不继承发布配置的 `llm_model_id`）；池空/不可用则无候选，路由阶段回退主模型（即全局默认） |
 | 视觉 / 多模态 | 调用方传 `(vision\|multimodal, large\|small)` |
 | embedding | `(embedding, tier)` 按调用方 |
 
@@ -138,7 +138,7 @@
 
 - 按「能力 × 规模」管理池；从符合条件的启用模型中排序（拖拽或上下箭头）。  
 - 顶栏或 defaults 区展示/编辑 `max_failover`。  
-- 空池提示：该组合会落到全局默认或旧兼容链。
+- 空池提示：该组合无候选，调用方自行回退（路由阶段回退主模型）。
 
 ---
 
@@ -147,7 +147,7 @@
 1. `agent_llm_model` 增加 `capabilities`（默认 `["text"]`）、`model_tier`（默认 `large`）。  
 2. 创建 `agent_llm_route`、`agent_llm_defaults`。  
 3. **不**自动生成 route 行。  
-4. 迁移时：若该租户尚无 `agent_llm_defaults` 行或 `global_default_model_id` 为空，将「按 id 排序的第一个启用模型」写入一次；已有值不覆盖。
+4. 迁移时：若该租户尚无 `agent_llm_defaults` 行或 `global_default_model_id` 为空，将「带 `intent` 用途标签的第一个启用模型，否则按 id 排序的第一个启用模型」写入一次；已有值不覆盖。
 
 ---
 
@@ -157,7 +157,9 @@
 - 配置态跳过停用/无 Key；运行失败顺延（mock 第一次失败、第二次成功）。  
 - JSON 非法不顺延。  
 - 显式 ID 失败后从池内后续继续；不在池内不顺延。  
-- `(text, small)` 空池 → 全局默认。  
+- 指定 `(capability, tier)` 且池空/不可用 → 返回 `None`（不落全局默认）；路由阶段由调用方回退主模型。  
+- 发布配置固定 `llm_model_id` 时，路由候选仍以 `(text, small)` 池为首。  
+- 正文已流式输出后发生提供方错误 → 不顺延，直接抛错。  
 - `set-default`、改 route 写审计；无权限 403。
 
 ---
