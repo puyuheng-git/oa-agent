@@ -50,6 +50,7 @@ const editing = ref<string | null>(null)
 const form = ref<SkillForm>(emptySkillForm())
 const editReason = ref('')
 const saving = ref(false)
+const drafting = ref(false)
 const toolOptions = ref<ToolItem[]>([])
 
 const packs = ref<PackItem[]>([])
@@ -113,6 +114,40 @@ async function create() {
   editReason.value = ''
   editor.value = true
   await loadTools()
+}
+
+/** 先选 Tool，再调用小模型根据 Tool 契约填表（可再改）。 */
+async function draftFromTools() {
+  if (!form.value.tools.length) {
+    ElMessage.warning('请先选择至少一个可用 Tool')
+    return
+  }
+  drafting.value = true
+  try {
+    const r = await http.post<{
+      draft: {
+        name: string
+        display_name: string
+        description: string
+        instructions: string
+        examples: string[]
+        tools: string[]
+      }
+    }>('/v1/admin/skills/draft-from-tools', { tools: form.value.tools })
+    const d = r.draft
+    // 新建时写入建议名；编辑已有 Skill 时不改 name（主键不可改）
+    if (!editing.value && d.name) form.value.name = d.name
+    form.value.display_name = d.display_name || form.value.display_name
+    form.value.description = d.description || ''
+    form.value.instructions = d.instructions || ''
+    form.value.examplesText = (d.examples || []).join('\n')
+    if (d.tools?.length) form.value.tools = d.tools
+    ElMessage.success('已根据 Tool 生成草稿，请检查后再保存')
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    drafting.value = false
+  }
 }
 
 async function edit(skill: SkillItem) {
@@ -646,6 +681,12 @@ onMounted(() => {
               <span class="muted"> {{ t.summary }}<template v-if="!t.registered"> · 未注册</template></span>
             </el-option>
           </el-select>
+          <div style="margin-top: 8px">
+            <el-button :loading="drafting" :disabled="!form.tools.length" @click="draftFromTools">
+              根据 Tool 用小模型生成草稿
+            </el-button>
+            <span class="muted" style="margin-left: 8px">先选 Tool，再自动填名称/说明/指引/示例（可改）</span>
+          </div>
         </el-form-item>
         <el-form-item label="变更原因" required>
           <el-input v-model="editReason" maxlength="200" placeholder="写入审计，至少 2 个字" />

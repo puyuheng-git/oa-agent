@@ -32,7 +32,9 @@ export async function request<T = unknown>(
   extraHeaders: Record<string, string> = {},
 ): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json', ...extraHeaders }
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  // FormData 由浏览器自动带 multipart boundary，不能手设 Content-Type，也不能 JSON 序列化
+  const isForm = typeof FormData !== 'undefined' && body instanceof FormData
+  if (body !== undefined && !isForm) headers['Content-Type'] = 'application/json'
   if (method !== 'GET') {
     if (csrfToken) headers['X-CSRF-Token'] = csrfToken
     headers['Idempotency-Key'] = newIdempotencyKey()
@@ -41,7 +43,7 @@ export async function request<T = unknown>(
     method,
     headers,
     credentials: 'same-origin',
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: body === undefined ? undefined : isForm ? (body as FormData) : JSON.stringify(body),
   })
   const text = await resp.text()
   let data: any = null
@@ -71,6 +73,8 @@ export const http = {
     return request<T>('GET', qs ? `${url}?${qs}` : url)
   },
   post: <T = unknown>(url: string, body?: unknown) => request<T>('POST', url, body ?? {}),
+  /** multipart 上传：body 为 FormData。 */
+  postForm: <T = unknown>(url: string, form: FormData) => request<T>('POST', url, form),
   put: <T = unknown>(url: string, body?: unknown) => request<T>('PUT', url, body ?? {}),
   del: <T = unknown>(url: string, body?: unknown) => request<T>('DELETE', url, body),
 }

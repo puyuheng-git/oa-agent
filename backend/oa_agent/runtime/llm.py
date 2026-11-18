@@ -136,8 +136,10 @@ def resolve_model(db: Session, vault: SecretVault, tenant_id: str, model_id: int
 def build_chat_model(cfg: ModelConfig):
     from langchain_openai import ChatOpenAI
 
+    # 超时以后台 Provider 配置为准；复杂 ReAct / 附件任务可能需要数分钟
+    timeout_sec = max(1, int(cfg.timeout or 60))
     kwargs = {"model": cfg.model_name, "base_url": cfg.base_url, "api_key": cfg.api_key or "not-set",
-              "timeout": min(cfg.timeout, 30), "max_retries": 0, "stream_usage": True}
+              "timeout": timeout_sec, "max_retries": 0, "stream_usage": True}
     if "temperature" in cfg.params:
         kwargs["temperature"] = cfg.params["temperature"]
     if "max_tokens" in cfg.params:

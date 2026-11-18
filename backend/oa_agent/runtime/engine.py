@@ -30,6 +30,40 @@ WATCHDOG_INTERVAL = 30.0
 PURGE_INTERVAL = 3600.0
 
 
+def _fresh_turn_input(run_id: str, message: str, attachment_ids: list[str] | None = None) -> dict:
+    """新一轮员工消息的图输入：保留会话 history/memory（由 Checkpoint 合并），清零本轮 ReAct 累计。"""
+    return {
+        "run_id": run_id,
+        "message": message,
+        "attachment_ids": list(attachment_ids or []),
+        "react_round": 0,
+        "tool_call_count": 0,
+        "tool_retry_count": 0,
+        "recent_observation_ids": [],
+        "pending_execution_ids": [],
+        "recent_fingerprints": [],
+        "office_display_refs": [],
+        "finish_reason": None,
+        "task_started_at": None,
+        "task_status": None,
+        "meta_continue": False,
+        "meta_state": {},
+        "replan": False,
+        "chat_reply": None,
+        "tool_result": None,
+        "handoff": None,
+        "decision": None,
+        "steps": [],
+        "step_index": 0,
+        "step_results": [],
+        "chain_stop": None,
+        "intent": None,
+        "tool": None,
+        "params": {},
+        "missing": [],
+    }
+
+
 class LiveRegistry:
     """每次查找都读引擎当前注册表：停用立即对后续调用生效"""
 
@@ -222,9 +256,10 @@ class AgentEngine:
                attachment_ids: list[str] | None = None) -> dict:
         if self.checkpointer.get_tuple({"configurable": {"thread_id": thread_id}}) is not None:
             ctx.recorder.event("checkpoint_restored", metadata={"thread_id": thread_id})
+        # 新员工消息必须清零 ReAct 累计；否则上一轮耗尽的 react_round 会直接挡掉本轮导出/查询
         return self._run_graph(
             ctx,
-            {"run_id": ctx.recorder.run_id, "message": message, "attachment_ids": list(attachment_ids or [])},
+            _fresh_turn_input(ctx.recorder.run_id, message, attachment_ids),
             thread_id,
         )
 

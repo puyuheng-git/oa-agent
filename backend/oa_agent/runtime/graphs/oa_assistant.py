@@ -923,6 +923,89 @@ def _fill_export_step_args(
     return {**args, **_named_export_args(body, message, title=last_title)}, True
 
 
+def _prefer_outing_application(parsed: dict, message: str, tools: dict) -> dict:
+    """「外出申请列表」强制走外出申请工具，禁止落到行程报销 source=外出。"""
+    if not intent_rules.is_outing_application_query(message or ""):
+        return parsed
+    from oa_agent.executor.tool_routing import _find_outing_application_tool
+    name = _find_outing_application_tool(tools)
+    if not name:
+        return parsed
+    return {
+        "intent": TOOL,
+        "tool": name,
+        "params": {},
+        "missing": [],
+        "steps": [{"tool": name, "args": {}}],
+        "intent_source": "rules",
+        "chat_reply": None,
+    }
+
+
+def _tool_limit_cap(spec) -> int:
+    rule = (getattr(spec, "model_params", None) or {}).get("limit") or {}
+    try:
+        return max(1, int(rule.get("maximum") or rule.get("default") or 20))
+    except (TypeError, ValueError):
+        return 20
+
+
+def _apply_list_limit_from_message(parsed: dict, message: str, tools: dict, default_limit: int) -> dict:
+    """员工说「全部/N 条」时覆盖 limit；未说则在缺省时补发布配置默认条数。"""
+    if parsed.get("intent") != TOOL:
+        return parsed
+    name = parsed.get("tool")
+    if not name or name not in tools:
+        return parsed
+    spec = tools[name][0]
+    if "limit" not in (spec.model_params or {}):
+        return parsed
+    params = intent_rules.merge_list_limit_params(
+        message, parsed.get("params"), max_limit=_tool_limit_cap(spec),
+    )
+    if "limit" not in params:
+        params = {**params, "limit": int(default_limit)}
+    out = {**parsed, "params": params}
+    steps = list(parsed.get("steps") or [])
+    if steps:
+        first = dict(steps[0])
+        first_args = dict(first.get("args") or {})
+        first_args["limit"] = params["limit"]
+        first["args"] = first_args
+        out["steps"] = [first, *steps[1:]]
+    return out
+
+
+def _maybe_fetch_all_list_pages(ctx: "RunContext", name: str, spec, args: dict, result: dict,
+                               message: str) -> dict:
+    """员工要全部数据且本页未拿齐时，按页继续拉直到凑满 total（有上限防止死循环）。"""
+    if not intent_rules.wants_all_rows(message or ""):
+        return result
+    if "page" not in (spec.model_params or {}) or "limit" not in (spec.model_params or {}):
+        return result
+    data = dict(result.get("data") or {})
+    rows = list(data.get("list") or [])
+    total = data.get("total")
+    if not isinstance(total, int) or total <= len(rows):
+        return result
+    try:
+        limit = max(1, int(args.get("limit") or _tool_limit_cap(spec)))
+        page = max(1, int(args.get("page") or 1))
+    except (TypeError, ValueError):
+        return result
+    max_pages = 50
+    while len(rows) < total and page < max_pages:
+        page += 1
+        page_args = {**args, "page": page, "limit": limit}
+        more = ctx.executor.execute(name, page_args, ctx.identity, ctx.recorder, "call_tool")
+        more_rows = list((more.get("data") or {}).get("list") or [])
+        if not more_rows:
+            break
+        rows.extend(more_rows)
+    data["list"] = rows
+    return {**result, "data": data}
+
+
 def _prefer_export(parsed: dict, message: str, tools: dict, *, today: date,
                    rule_tool_map: dict | None, last_text: str | None,
                    last_title: str | None = None,
@@ -1346,6 +1429,26 @@ def _files_export_text(files) -> str | None:
     return None
 
 
+def _attachment_prompt_only(ctx: RunContext) -> dict | None:
+    """只加载已发送附件正文，不跑决策环（供 ReAct 后续轮注入，避免反复 delegate）。"""
+    rows = _sent_upload_rows(ctx)
+    if not rows:
+        return None
+    files, thread_files = _load_upload_files(ctx, rows)
+    from oa_agent.chat.attachment_loop import project
+
+    projection = project(files)
+    # 优先全文；过大时退回目录摘要，仍让模型知道会话里有哪些文件
+    raw = (projection.full_text or projection.catalog_text or "").strip()
+    prompt_block = _fence_attachment_text(raw) if raw else ""
+    return {
+        "thread_files": thread_files,
+        "parsed": None,
+        "export_fallback": _files_export_text(files),
+        "prompt_block": prompt_block,
+    }
+
+
 def _ask_about_files(state: TravelState, ctx: RunContext, files) -> dict:
     from oa_agent.chat.attachment_loop import project, run_loop
 
@@ -1462,8 +1565,8 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
     started_at = state.get("task_started_at")
     if not started_at:
         started_at = time.time()
-    # 已有 observation 说明刚完成一轮 Act，进入下一轮 Think 前检查轮次预算
-    if state.get("recent_observation_ids") and react_round > 0:
+    # 仅同轮 replan（刚完成 Act 再 Think）才查预算；新员工消息不得沿用上一轮耗尽状态
+    if state.get("replan") and state.get("recent_observation_ids") and react_round > 0:
         limits = BudgetLimits.from_config(ctx.config)
         verdict = check_budget_before_think(
             react_round=react_round, limits=limits, started_at=float(started_at),
@@ -1500,7 +1603,13 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
     }
     tools = ctx.tools()
     message = state.get("message") or ""
-    # 注入 Observation（压缩选文，State 只留 id）
+    # 每轮从基线记忆重建，避免 observation / 附件正文在多轮 ReAct 中重复叠加
+    if not hasattr(ctx, "_base_long_term_memory"):
+        ctx._base_long_term_memory = ctx.long_term_memory or ""
+    mem_parts: list[str] = []
+    base_ltm = str(getattr(ctx, "_base_long_term_memory", "") or "").strip()
+    if base_ltm:
+        mem_parts.append(base_ltm)
     obs_block = ""
     obs_ids = keep_react["recent_observation_ids"]
     if obs_ids and ctx.data_dir is not None:
@@ -1510,11 +1619,10 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
         max_chars = int(ctx.config.get("max_observation_tokens") or 24000)
         obs_block = compress_observations_for_prompt(obs_list, max_chars=max_chars)
         if obs_block:
-            prev = ctx.long_term_memory or ""
-            ctx.long_term_memory = (prev + "\n\n" + obs_block).strip() if prev else obs_block
-    # meta Tick / 已有 observation：跳过附件环，避免反复 delegate
+            mem_parts.append(obs_block)
+    # meta Tick / 已有 observation：跳过附件决策环（避免反复 delegate），但仍注入附件正文
     skip_attach = bool(state.get("meta_continue") or state.get("recent_observation_ids"))
-    guided = None if skip_attach else _guide_attachments(state, ctx)
+    guided = _attachment_prompt_only(ctx) if skip_attach else _guide_attachments(state, ctx)
     extra: dict = {}
     attachment_fallback = None
     if guided and "thread_files" in guided:
@@ -1522,8 +1630,14 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
         raw_fb = guided.get("export_fallback")
         attachment_fallback = raw_fb.strip() if isinstance(raw_fb, str) and raw_fb.strip() else None
     if guided and guided.get("parsed") is not None:
+        ctx.long_term_memory = "\n\n".join(mem_parts).strip()
         parsed = guided["parsed"]
     else:
+        # ReAct 后续轮：附件正文只注入一次块，不与历史轮次叠加重复
+        prompt_block = str((guided or {}).get("prompt_block") or "").strip() if guided else ""
+        if prompt_block:
+            mem_parts.append("## 本会话已发送的附件正文\n" + prompt_block)
+        ctx.long_term_memory = "\n\n".join(mem_parts).strip()
         parsed = _prefer_explicit_memory(_understand(state, ctx, tools), message)
         parsed = _apply_long_term_memory(parsed, ctx)
     # meta_search 单步未收敛：立即回主图，勿被 export/coerce 改写 intent
@@ -1540,7 +1654,8 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
             metadata={"metric": "meta_continue", "round": (out.get("meta_state") or {}).get("round")},
         )
         return out
-    # 附件环路也会走到这里：空 content 的 builtin.export 用近期结果/附件正文回填
+    # 外出申请优先于行程报销；附件环路的 export 再回填 content
+    parsed = _prefer_outing_application(parsed, message, tools)
     sources = _recent_export_sources(ctx)
     last_text, last_title = (sources[0][0], sources[0][1]) if sources else (None, None)
     bundle_text = _export_bundle_text(sources)
@@ -1560,9 +1675,9 @@ def understand(state: TravelState, ctx: RunContext) -> dict:
         parsed["params"] = intent_rules.merge_relative_date_params(
             message, ctx.today, parsed.get("params"),
         )
-    spec = tools[parsed["tool"]][0] if parsed.get("intent") == TOOL and parsed.get("tool") in tools else None
-    if spec is not None and "limit" in spec.model_params and "limit" not in parsed["params"]:
-        parsed["params"] = {**parsed["params"], "limit": ctx.num("list_default_limit")}
+    parsed = _apply_list_limit_from_message(
+        parsed, message, tools, ctx.num("list_default_limit"),
+    )
     if parsed.get("intent") == TOOL:
         steps = parsed.get("steps") or [{"tool": parsed["tool"], "args": {}}]
         parsed["steps"] = [{"tool": steps[0]["tool"], "args": parsed["params"]}, *steps[1:]]
@@ -2129,10 +2244,12 @@ def call_tool(state: TravelState, ctx: RunContext) -> dict:
     from oa_agent.runtime.react.budget import BudgetLimits, check_budget_before_act
     from oa_agent.runtime.react.constants import (
         COGNITIVE_TOOL_NAMES,
+        FINISH_ANSWER,
         FINISH_MAX_TOOL_CALLS,
         STEP_ERROR,
         STEP_SKIPPED,
         STEP_SUCCESS,
+        TASK_COMPLETED,
         TASK_PARTIAL,
         TASK_RUNNING,
     )
@@ -2254,8 +2371,13 @@ def call_tool(state: TravelState, ctx: RunContext) -> dict:
         )
         raise ToolError("TOOL_NOT_AVAILABLE", summary)
     if spec is not None:
-        if "limit" in spec.model_params and "limit" not in args:
-            args["limit"] = ctx.num("list_default_limit")
+        if "limit" in spec.model_params:
+            capped = intent_rules.merge_list_limit_params(
+                str(state.get("message") or ""), args, max_limit=_tool_limit_cap(spec),
+            )
+            if "limit" not in capped:
+                capped["limit"] = ctx.num("list_default_limit")
+            args = capped
         args, _ = validate_args(spec, args)
 
     # P4 重复调用保护：同轮同指纹直接拦截（写操作另有 Ledger；此处覆盖认知/只读滥调）
@@ -2332,18 +2454,42 @@ def call_tool(state: TravelState, ctx: RunContext) -> dict:
             pending = list(state.get("pending_execution_ids") or [])
             if execution_id not in pending:
                 pending.append(execution_id)
-            return {
-                "tool_result": {"data": {}, "message": summary},
+            # 复用已有成功结果：尽量还原 tool_result；批内还有后续步时不得提前结束
+            reused_data: dict = {}
+            rid = exec_rec.get("result_id")
+            if result_store is not None and rid:
+                rec = result_store.load(str(rid), tenant_id=ctx.tenant_id, owner_oa=ctx.identity.oa)
+                if isinstance(rec, dict):
+                    reused_data = dict(rec.get("data") or {})
+            display_refs = list(state.get("office_display_refs") or [])
+            more_steps = index + 1 < len(steps)
+            finish_now = (
+                name not in COGNITIVE_TOOL_NAMES
+                and exec_rec.get("status") == "succeeded"
+                and (bool(display_refs) or bool(reused_data))
+                and not more_steps
+            )
+            out_skip = {
+                "tool_result": {"data": reused_data, "message": summary},
                 "handoff": None, "tool": name, "params": args,
-                "step_index": index + 1, "step_results": results, "steps": steps,
+                "step_index": len(steps) if finish_now else index + 1,
+                "step_results": results, "steps": [] if finish_now else steps,
                 "tool_call_count": tool_call_count,
                 "recent_observation_ids": obs_ids,
                 "pending_execution_ids": pending[-32:],
                 "recent_fingerprints": recent_fps,
-                "replan": True,
-                "react_round": react_round + 1,
+                "office_display_refs": display_refs,
+                "intent": TOOL,
                 "task_status": TASK_RUNNING,
             }
+            if finish_now:
+                out_skip["replan"] = False
+                out_skip["finish_reason"] = FINISH_ANSWER
+                out_skip["task_status"] = TASK_COMPLETED
+            else:
+                out_skip["replan"] = True
+                out_skip["react_round"] = react_round + 1
+            return out_skip
         try:
             leased = ledger.acquire_lease(execution_id, owner=lease_owner)
             fencing_token = int(leased.get("fencing_token") or 0)
@@ -2380,6 +2526,11 @@ def call_tool(state: TravelState, ctx: RunContext) -> dict:
     error_info = None
     try:
         result = ctx.executor.execute(name, args, ctx.identity, ctx.recorder, "call_tool")
+        # 员工要「全部」且本页未拿齐：继续翻页合并（上游常默认每页 10）
+        if result and spec is not None:
+            result = _maybe_fetch_all_list_pages(
+                ctx, name, spec, args, result, str(state.get("message") or ""),
+            )
     except ToolError as exc:
         error_info = {"code": exc.code, "message": exc.message, "retryable": exc.retryable}
         if ledger is not None:
@@ -2531,11 +2682,18 @@ def call_tool(state: TravelState, ctx: RunContext) -> dict:
         "chain_stop": None,
     }
     if batch_done:
-        out["replan"] = True
-        out["react_round"] = react_round + 1
-        # 清空 steps，迫使下一轮 understand 重新决策（避免 respond 直接展示 skill 正文）
-        out["steps"] = []
-        out["step_index"] = 0
+        if name in COGNITIVE_TOOL_NAMES:
+            # 认知工具：回 understand 继续推理，禁止把 Skill 正文当最终回复
+            out["replan"] = True
+            out["react_round"] = react_round + 1
+            out["steps"] = []
+            out["step_index"] = 0
+        else:
+            # 业务查询/导出成功：直接 respond 展示表格，避免 ReAct 空转重复查询
+            out["replan"] = False
+            out["finish_reason"] = FINISH_ANSWER
+            out["intent"] = TOOL
+            out["task_status"] = TASK_COMPLETED
     else:
         out["replan"] = False
     return out
@@ -2701,7 +2859,17 @@ def _append_display_refs(reply: dict, state: TravelState, ctx: RunContext) -> di
     tools = ctx.tools()
     chunks = [reply.get("content") or ""]
     data_blocks = []
-    for ref in refs[-3:]:
+    # 按 result_id 去重，保留最近一次，避免 ReAct 重复查询把同一张表贴多遍
+    seen_ids: set[str] = set()
+    unique_refs: list[dict] = []
+    for ref in reversed(refs):
+        rid = str(ref.get("result_id") or "")
+        if not rid or rid in seen_ids:
+            continue
+        seen_ids.add(rid)
+        unique_refs.append(ref)
+    unique_refs.reverse()
+    for ref in unique_refs[-3:]:
         rid = ref.get("result_id")
         if not rid:
             continue
@@ -2806,7 +2974,12 @@ def _reply(state: TravelState, ctx: RunContext) -> dict:
     elif spec.result_kind == "text":
         reply = _text_reply(spec, title, data, result.get("message") or "")
     elif spec.result_kind == "list":
-        reply = _list_reply(spec, title, data, params, result.get("message") or "", ctx.num("max_table_rows"))
+        max_rows = ctx.num("max_table_rows")
+        # 员工明确要全部时，至少展示本次已取回的行（仍受 max_table_rows 配置上限约束时可再调大）
+        if intent_rules.wants_all_rows(str(state.get("message") or "")):
+            fetched = len(data.get("list") or [])
+            max_rows = max(int(max_rows or 0), fetched)
+        reply = _list_reply(spec, title, data, params, result.get("message") or "", max_rows)
     else:
         reply = _record_reply(spec, title, data, params, result.get("message") or "")
     return _with_chain(reply, state, tools)

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { errorMessage, http } from '@/shared/http'
 import { formatTime } from '@/shared/format'
@@ -18,7 +18,13 @@ function paramEntries(params: Record<string, { type?: string; label?: string; de
   }))
 }
 import AbilityHelpBanner from '../components/AbilityHelpBanner.vue'
-import { emptyParam, emptyToolForm, toolFormFromSchema, toolPayload, type ToolForm } from '../catalogForm'
+import SchemaTreeEditor from '../components/SchemaTreeEditor.vue'
+import SchemaValueEditor from '../components/SchemaValueEditor.vue'
+import { normalizeNode, type SchemaNode } from '../schemaTree'
+import { buildArgsFromValues, mergeValuesOnSchemaChange } from '../schemaValue'
+import { flattenBagSchema, unwrapBagArgs } from '../wizardCallArgs'
+import { mergeProbeResultFields } from '../probeResultFields'
+import { emptyToolForm, toolFormFromSchema, toolPayload, type ToolForm } from '../catalogForm'
 
 interface Upstream { key: string; label: string; base_url: string | null }
 
@@ -200,6 +206,12 @@ const editing = ref(false)
 const saving = ref(false)
 const form = ref<ToolForm>(emptyToolForm())
 const reason = ref('')
+// 顶层参数中填写了、但参数表里不存在的名称（toolPayload 会静默丢弃，这里提示）
+const unknownTopLevel = computed(() => {
+  const names = form.value.topLevelFields.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean)
+  const known = new Set(Object.keys(form.value.modelParams).map((k) => k.trim()))
+  return names.filter((n) => !known.has(n))
+})
 
 function create() {
   editing.value = false
@@ -282,22 +294,6 @@ interface WizardMethod {
   already_added?: boolean
   tool_name?: string | null
 }
-interface WizardObjectEntry {
-  key: string
-  value: string
-}
-interface WizardParamRow {
-  name: string
-  label: string
-  type: string
-  required: boolean
-  description: string
-  testValue: string
-  /** 对象/数组形参：键值对（数组类型只用 value） */
-  objectEntries: WizardObjectEntry[]
-  position?: number
-  kind?: string
-}
 interface WizardResultRow {
   field: string
   label: string
@@ -320,15 +316,8 @@ const RESULT_KIND_OPTIONS = [
   { value: 'list', label: '列表' },
   { value: 'object', label: '单条对象' },
 ]
-const PARAM_TYPE_OPTIONS = [
-  { value: 'string', label: '文本' },
-  { value: 'integer', label: '整数' },
-  { value: 'number', label: '数字' },
-  { value: 'boolean', label: '是/否' },
-  { value: 'object', label: '对象/字典' },
-  { value: 'array', label: '数组' },
-  { value: 'file', label: '文件路径/ID' },
-]
+// 返回字段名：单段或一层点号（与后端 RESULT_FIELD_RE 对齐），如 id、user.name
+const RESULT_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/
 
 const wizardOpen = ref(false)
 const wizardBusy = ref(false)
@@ -348,9 +337,18 @@ const wizard = ref({
   summary: '',
   oa: '',
   reason: '',
-  paramRows: [] as WizardParamRow[],
   resultKind: 'list',
   resultRows: [{ field: 'id', label: '编号' }] as WizardResultRow[],
+})
+// 请求参数 Schema（落库的 model_params）与试调值（仅本页，不落库）
+const wizardParams = ref<Record<string, SchemaNode>>({})
+const wizardValues = ref<Record<string, unknown>>({})
+// 可选：返回结构 Schema（落库为 result.schema）
+const wizardResultSchema = ref<SchemaNode | null>(null)
+
+// Schema 变更后迁移已填试调值（同名同类型保留，新增键补 default）
+watch(wizardParams, (next, prev) => {
+  wizardValues.value = mergeValuesOnSchemaChange(prev ?? {}, next ?? {}, wizardValues.value)
 })
 
 const wizardFilteredMethods = computed(() => {
@@ -371,7 +369,9 @@ function openExportWizard() {
   wizard.value.methods = []
   wizard.value.method = ''
   wizard.value.methodFilter = ''
-  wizard.value.paramRows = []
+  wizardParams.value = {}
+  wizardValues.value = {}
+  wizardResultSchema.value = null
   wizard.value.resultRows = [{ field: 'id', label: '编号' }]
 }
 
@@ -398,20 +398,33 @@ async function wizardDiscover() {
   }
 }
 
-function wizardDefaultEntriesFromDefault(def: unknown): WizardObjectEntry[] {
-  if (def && typeof def === 'object' && !Array.isArray(def)) {
-    return Object.entries(def as Record<string, unknown>).map(([key, value]) => ({
-      key,
-      value: value === undefined || value === null ? '' : String(value),
-    }))
+/** describe 返回的原始参数 → SchemaNode；object 默认值的键推断为子属性，便于在试调表单里直接填写。 */
+function wizardNodeFromDescribe(p: {
+  type?: string
+  label?: string
+  required?: boolean
+  description?: string
+  default?: unknown
+}): SchemaNode {
+  const raw: Record<string, unknown> = {
+    type: p.type || 'string',
+    label: p.label || '',
+    required: !!p.required,
+    description: p.description || '',
   }
-  if (Array.isArray(def)) {
-    return def.map((value) => ({
-      key: '',
-      value: value === undefined || value === null ? '' : String(value),
-    }))
+  const def = p.default
+  if (raw.type === 'object' && def && typeof def === 'object' && !Array.isArray(def)) {
+    // 未声明 properties 的对象无法填值：按默认值的键推断子属性（类型按值推断，默认回落为文本）
+    const props: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(def as Record<string, unknown>)) {
+      const t = typeof v === 'number' ? (Number.isInteger(v) ? 'integer' : 'number') : typeof v === 'boolean' ? 'boolean' : 'string'
+      props[k] = { type: t, default: v }
+    }
+    raw.properties = props
+  } else if (def !== undefined && def !== null && raw.type !== 'object') {
+    raw.default = def
   }
-  return [{ key: '', value: '' }]
+  return normalizeNode(raw)
 }
 
 async function wizardPickMethod(row: WizardMethod) {
@@ -443,90 +456,30 @@ async function wizardPickMethod(row: WizardMethod) {
     wizard.value.call = d.call_suggest || 'named_args'
     wizard.value.summary = d.summary || row.summary || row.name
     wizard.value.name = row.name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().slice(0, 64)
-    // 每个形参单独一行可配（含数组/对象/文件），不再过滤 params/data
-    wizard.value.paramRows = (d.params || [])
-      .filter((p) => !!p?.name)
-      .map((p) => {
-        const type = p.type || 'string'
-        const isBag = type === 'object' || type === 'array'
-        const defaultText =
-          p.default === undefined || p.default === null || isBag
-            ? ''
-            : String(p.default)
-        return {
-          name: p.name,
-          label: p.label || p.name,
-          type,
-          required: !!p.required,
-          description: p.description || '',
-          testValue: defaultText,
-          objectEntries: isBag ? wizardDefaultEntriesFromDefault(p.default) : [],
-          position: p.position,
-          kind: p.kind,
-        }
-      })
+    // 每个形参转为 SchemaNode；one_by_params/page_list 再把 params|data 袋摊到顶层
+    let params: Record<string, SchemaNode> = {}
+    for (const p of d.params || []) {
+      if (p?.name) params[p.name] = wizardNodeFromDescribe(p)
+    }
     if (wizard.value.call === 'page_list') {
-      const names = new Set(wizard.value.paramRows.map((p) => p.name))
-      if (!names.has('page')) {
-        wizard.value.paramRows.push({
-          name: 'page',
-          label: '页码',
-          type: 'integer',
-          required: false,
-          description: '从 1 开始',
-          testValue: '1',
-          objectEntries: [],
-        })
+      if (!params.page) {
+        params.page = normalizeNode({ type: 'integer', label: '页码', description: '从 1 开始', default: 1 })
       }
-      if (!names.has('limit')) {
-        wizard.value.paramRows.push({
-          name: 'limit',
-          label: '每页条数',
-          type: 'integer',
-          required: false,
-          description: '建议不超过 20',
-          testValue: '5',
-          objectEntries: [],
-        })
+      if (!params.limit) {
+        params.limit = normalizeNode({ type: 'integer', label: '每页条数', description: '建议不超过 20', default: 5 })
       }
       wizard.value.resultKind = 'list'
     }
+    params = flattenBagSchema(wizard.value.call, params)
+    // 先清空试调值，再换 Schema：watch 会按 default 补齐
+    wizardValues.value = {}
+    wizardParams.value = params
+    wizardResultSchema.value = null
   } catch (e) {
     wizardError.value = errorMessage(e)
   } finally {
     wizardBusy.value = false
   }
-}
-
-function wizardAddParamRow() {
-  wizard.value.paramRows.push({
-    name: '',
-    label: '',
-    type: 'string',
-    required: false,
-    description: '',
-    testValue: '',
-    objectEntries: [],
-  })
-}
-
-function wizardAddObjectEntry(row: WizardParamRow) {
-  if (!row.objectEntries) row.objectEntries = []
-  row.objectEntries.push({ key: '', value: '' })
-}
-
-function wizardRemoveObjectEntry(row: WizardParamRow, idx: number) {
-  row.objectEntries.splice(idx, 1)
-}
-
-function wizardOnParamTypeChange(row: WizardParamRow) {
-  if ((row.type === 'object' || row.type === 'array') && (!row.objectEntries || !row.objectEntries.length)) {
-    row.objectEntries = [{ key: '', value: '' }]
-  }
-}
-
-function wizardRemoveParamRow(idx: number) {
-  wizard.value.paramRows.splice(idx, 1)
 }
 
 function wizardAddResultRow() {
@@ -537,64 +490,44 @@ function wizardRemoveResultRow(idx: number) {
   wizard.value.resultRows.splice(idx, 1)
 }
 
+/** 试调值 → 调用 args；整包 call 时摊平 params|data，避免 PHP 多套一层。 */
 function wizardBuildArgs(): Record<string, unknown> {
-  const args: Record<string, unknown> = {}
-  for (const row of wizard.value.paramRows) {
-    const key = row.name.trim()
-    if (!key) continue
-    if (row.type === 'object') {
-      const obj: Record<string, string> = {}
-      for (const e of row.objectEntries || []) {
-        const k = (e.key || '').trim()
-        if (!k) continue
-        obj[k] = e.value
-      }
-      // 即使为空对象也传，便于 named_args 命中数组形参
-      args[key] = obj
-      continue
-    }
-    if (row.type === 'array') {
-      const list = (row.objectEntries || [])
-        .map((e) => e.value)
-        .filter((v) => v !== '')
-      args[key] = list
-      continue
-    }
-    const raw = row.testValue
-    if (raw === '' || raw === undefined) continue
-    if (row.type === 'integer') {
-      const n = Number.parseInt(raw, 10)
-      if (!Number.isNaN(n)) args[key] = n
-      continue
-    }
-    if (row.type === 'number') {
-      const n = Number(raw)
-      if (!Number.isNaN(n)) args[key] = n
-      continue
-    }
-    if (row.type === 'boolean') {
-      args[key] = raw === '1' || raw.toLowerCase() === 'true' || raw === '是'
-      continue
-    }
-    // string / file
-    args[key] = raw
-  }
-  return args
+  const raw = buildArgsFromValues(wizardParams.value, wizardValues.value)
+  return unwrapBagArgs(wizard.value.call, raw)
 }
 
-function wizardBuildModelParams(): Record<string, Record<string, unknown>> {
-  const mp: Record<string, Record<string, unknown>> = {}
-  for (const row of wizard.value.paramRows) {
-    const key = row.name.trim()
-    if (!key) continue
-    mp[key] = {
-      type: row.type || 'string',
-      label: row.label.trim() || key,
-      required: !!row.required,
-      description: row.description.trim(),
+/** 落库的 model_params：整包 call 再摊平袋字段，与运行时 args 形态一致。 */
+function wizardBuildModelParams(): Record<string, SchemaNode> {
+  return flattenBagSchema(wizard.value.call, wizardParams.value, wizardValues.value)
+}
+
+/** 递归收集必填但未填的参数路径（对象/对象数组内的必填子项也检查）。 */
+function wizardMissingRequired(schema: Record<string, SchemaNode>, args: Record<string, unknown>, prefix = ''): string[] {
+  const missing: string[] = []
+  for (const [key, node] of Object.entries(schema)) {
+    const path = prefix ? `${prefix}.${key}` : key
+    const v = args?.[key]
+    if (v === undefined) {
+      if (node.required) missing.push(path)
+      continue
+    }
+    if (node.type === 'object' && node.properties && v && typeof v === 'object' && !Array.isArray(v)) {
+      missing.push(...wizardMissingRequired(node.properties, v as Record<string, unknown>, path))
+    } else if (node.type === 'array' && node.items?.type === 'object' && node.items.properties && Array.isArray(v)) {
+      v.forEach((item, i) => {
+        if (item && typeof item === 'object') {
+          missing.push(...wizardMissingRequired(node.items!.properties!, item as Record<string, unknown>, `${path}[${i}]`))
+        }
+      })
     }
   }
-  return mp
+  return missing
+}
+
+/** 试调/入库前校验：必填参数不得为空；返回错误提示或空串。 */
+function wizardCheckRequired(args: Record<string, unknown>): string {
+  const missing = wizardMissingRequired(wizardParams.value, args)
+  return missing.length ? `必填参数未填写：${missing.join('、')}` : ''
 }
 
 async function wizardProbe() {
@@ -607,6 +540,12 @@ async function wizardProbe() {
     return
   }
   const args = wizardBuildArgs()
+  // 必填参数为空时不发起试调
+  const requiredErr = wizardCheckRequired(args)
+  if (requiredErr) {
+    ElMessage.warning(requiredErr)
+    return
+  }
   wizardBusy.value = true
   wizardError.value = ''
   wizardProbeOk.value = false
@@ -621,7 +560,18 @@ async function wizardProbe() {
     })
     wizardProbeOk.value = true
     wizardProbePreview.value = JSON.stringify(r.data, null, 2).slice(0, 4000)
-    ElMessage.success('测试成功，可以入库')
+    // 用返回样例自动补齐返回字段（保留已有 field 的手改 label）
+    const merged = mergeProbeResultFields(r.data, wizard.value.resultRows, wizard.value.resultKind)
+    if (merged.length) {
+      wizard.value.resultRows = merged
+      const payload = r.data
+      if (Array.isArray(payload) || (payload && typeof payload === 'object' && Array.isArray((payload as { list?: unknown }).list))) {
+        wizard.value.resultKind = 'list'
+      }
+      ElMessage.success(`测试成功，已根据返回自动填入 ${merged.length} 个字段，可改后再入库`)
+    } else {
+      ElMessage.success('测试成功，可以入库')
+    }
   } catch (e) {
     wizardProbeOk.value = false
     wizardError.value = errorMessage(e)
@@ -646,10 +596,23 @@ async function wizardSave() {
     ElMessage.warning('请至少添加一个返回字段')
     return
   }
+  // 字段名只允许 a 或 a.b（一层点号），与后端一致
+  const badField = resultRows.find((r) => !RESULT_FIELD_RE.test(r.field))
+  if (badField) {
+    ElMessage.warning(`返回字段名无效（仅支持 a 或 a.b 一层）：${badField.field}`)
+    return
+  }
   const fields = resultRows.map((r) => r.field)
   const labels: Record<string, string> = {}
   for (const r of resultRows) labels[r.field] = r.label || r.field
   const reasonText = wizard.value.reason.trim() || `接入方法 ${wizard.value.method}`
+  // 入库会再试调一次，同样要求必填参数已填
+  const args = wizardBuildArgs()
+  const requiredErr = wizardCheckRequired(args)
+  if (requiredErr) {
+    ElMessage.warning(requiredErr)
+    return
+  }
   wizardBusy.value = true
   wizardError.value = ''
   try {
@@ -658,7 +621,7 @@ async function wizardSave() {
       service: wizard.value.service.trim(),
       method: wizard.value.method.trim(),
       oa: wizard.value.oa.trim(),
-      args: wizardBuildArgs(),
+      args,
       call: wizard.value.call,
       op: wizard.value.op,
       risk: wizard.value.risk,
@@ -670,6 +633,7 @@ async function wizardSave() {
         fields,
         labels,
         list_columns: wizard.value.resultKind === 'list' ? fields.slice(0, 6) : [],
+        schema: wizardResultSchema.value ? normalizeNode(wizardResultSchema.value) : null,
       },
     })
     ElMessage.success('已入库，请到列表中启用')
@@ -1017,53 +981,14 @@ onMounted(load)
         </el-form-item>
 
         <h4 class="sec">模型可填的参数</h4>
-        <el-table :data="form.params" size="small" border>
-          <el-table-column label="参数名" width="130">
-            <template #default="{ row }"><el-input v-model="row.name" size="small" /></template>
-          </el-table-column>
-          <el-table-column label="显示名" width="110">
-            <template #default="{ row }"><el-input v-model="row.label" size="small" /></template>
-          </el-table-column>
-          <el-table-column label="类型" width="160">
-            <template #default="{ row }">
-              <el-select v-model="row.type" size="small" style="width: 76px">
-                <el-option label="文本" value="string" />
-                <el-option label="整数" value="integer" />
-              </el-select>
-              <el-select v-if="row.type === 'string'" v-model="row.format" size="small" style="width: 70px">
-                <el-option label="—" value="" />
-                <el-option label="日期" value="date" />
-              </el-select>
-            </template>
-          </el-table-column>
-          <el-table-column label="必填" width="56">
-            <template #default="{ row }"><el-checkbox v-model="row.required" /></template>
-          </el-table-column>
-          <el-table-column label="可选值" min-width="150">
-            <template #default="{ row }"><el-input v-model="row.enumText" size="small" placeholder="0=未报销, 1=已报销" /></template>
-          </el-table-column>
-          <el-table-column label="最小/最大" width="150">
-            <template #default="{ row }">
-              <el-input-number v-model="row.minimum" size="small" :controls="false" style="width: 60px" :value-on-clear="null" />
-              <el-input-number v-model="row.maximum" size="small" :controls="false" style="width: 60px" :value-on-clear="null" />
-            </template>
-          </el-table-column>
-          <el-table-column label="默认值" width="80">
-            <template #default="{ row }"><el-input v-model="row.defaultValue" size="small" /></template>
-          </el-table-column>
-          <el-table-column label="说明（给模型）" min-width="150">
-            <template #default="{ row }"><el-input v-model="row.description" size="small" /></template>
-          </el-table-column>
-          <el-table-column label="顶层" width="56">
-            <template #default="{ row }"><el-checkbox v-model="row.topLevel" /></template>
-          </el-table-column>
-          <el-table-column label="" width="56">
-            <template #default="{ $index }">
-              <el-button link type="danger" size="small" @click="form.params.splice($index, 1)">删除</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-        <el-button size="small" style="margin: 6px 0 4px" @click="form.params.push(emptyParam())">添加参数</el-button>
+        <SchemaTreeEditor v-model="form.modelParams" mode="params" />
+        <el-form-item label="顶层参数" style="margin-top: 8px">
+          <el-input v-model="form.topLevelFields" style="width: 320px" placeholder="如 limit, page，多个用逗号分隔" />
+          <span class="hint">这些参数直接作为查询参数传递；其余参数打包进「JSON 参数字段」。</span>
+          <div v-if="unknownTopLevel.length" class="hint" style="color: var(--el-color-warning)">
+            以下名称不在上方参数表中，保存时会被忽略：{{ unknownTopLevel.join(', ') }}
+          </div>
+        </el-form-item>
         <div class="hint">删除参数、新增必填参数、收紧可选值等属于不兼容变更，保存后需在详情中激活。</div>
 
         <h4 class="sec">返回结果</h4>
@@ -1073,9 +998,10 @@ onMounted(load)
             <el-radio value="object">单条记录（详情展示）</el-radio>
           </el-radio-group>
         </el-form-item>
-        <el-table :data="form.fields" size="small" border>
+        <SchemaTreeEditor v-model="form.resultSchema" mode="result-root" />
+        <el-table :data="form.fields" size="small" border style="margin-top: 8px">
           <el-table-column label="字段（office-api 返回的键）" min-width="200">
-            <template #default="{ row }"><el-input v-model="row.key" size="small" /></template>
+            <template #default="{ row }"><el-input v-model="row.key" size="small" placeholder="如 id、user.name（支持一层点路径）" /></template>
           </el-table-column>
           <el-table-column label="显示名称" min-width="160">
             <template #default="{ row }"><el-input v-model="row.label" size="small" placeholder="留空：详情中不显示" /></template>
@@ -1264,69 +1190,16 @@ onMounted(load)
           <el-form-item label="请求参数">
             <div style="width: 100%">
               <div class="hint" style="margin-bottom: 6px">
-                每个形参单独配置类型与测试值（含对象/数组/文件）。对象用键值对、数组用多行值；「测试值」仅本页试调。
+                左侧树配置参数结构（支持嵌套对象/数组/文件），将完整落库为 model_params；下方「测试值」仅本页试调，不落库。
               </div>
-              <el-table :data="wizard.paramRows" size="small" border empty-text="暂无参数，可点击下方添加">
-                <el-table-column label="#" width="48" align="center">
-                  <template #default="{ row }">{{ row.position || '' }}</template>
-                </el-table-column>
-                <el-table-column label="参数名" width="120">
-                  <template #default="{ row }"><el-input v-model="row.name" placeholder="英文名" /></template>
-                </el-table-column>
-                <el-table-column label="中文名" width="110">
-                  <template #default="{ row }"><el-input v-model="row.label" placeholder="展示名" /></template>
-                </el-table-column>
-                <el-table-column label="类型" width="130">
-                  <template #default="{ row }">
-                    <el-select v-model="row.type" style="width: 100%" @change="wizardOnParamTypeChange(row)">
-                      <el-option v-for="o in PARAM_TYPE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
-                    </el-select>
-                  </template>
-                </el-table-column>
-                <el-table-column label="必填" width="64" align="center">
-                  <template #default="{ row }"><el-checkbox v-model="row.required" /></template>
-                </el-table-column>
-                <el-table-column label="说明" min-width="100">
-                  <template #default="{ row }"><el-input v-model="row.description" placeholder="可选" /></template>
-                </el-table-column>
-                <el-table-column label="测试值" min-width="220">
-                  <template #default="{ row }">
-                    <template v-if="row.type === 'object' || row.type === 'array'">
-                      <div
-                        v-for="(e, i) in row.objectEntries"
-                        :key="i"
-                        style="display: flex; gap: 4px; margin-bottom: 4px; align-items: center"
-                      >
-                        <el-input
-                          v-if="row.type === 'object'"
-                          v-model="e.key"
-                          placeholder="键"
-                          style="width: 40%"
-                        />
-                        <el-input v-model="e.value" :placeholder="row.type === 'array' ? '数组项' : '值'" />
-                        <el-button link type="danger" @click="wizardRemoveObjectEntry(row, i)">删</el-button>
-                      </div>
-                      <el-button link type="primary" @click="wizardAddObjectEntry(row)">加一项</el-button>
-                    </template>
-                    <el-input
-                      v-else-if="row.type === 'boolean'"
-                      v-model="row.testValue"
-                      placeholder="true / false / 是"
-                    />
-                    <el-input
-                      v-else
-                      v-model="row.testValue"
-                      :placeholder="row.type === 'file' ? '文件路径或 ID' : '试调时用'"
-                    />
-                  </template>
-                </el-table-column>
-                <el-table-column label="" width="64">
-                  <template #default="{ $index }">
-                    <el-button link type="danger" @click="wizardRemoveParamRow($index)">删除</el-button>
-                  </template>
-                </el-table-column>
-              </el-table>
-              <el-button style="margin-top: 6px" @click="wizardAddParamRow">添加参数</el-button>
+              <SchemaTreeEditor v-model="wizardParams" mode="params" />
+            </div>
+          </el-form-item>
+
+          <el-form-item label="测试值">
+            <div style="width: 100%">
+              <div class="hint" style="margin-bottom: 6px">按上面的参数结构填写试调值；标记必填的参数为空时无法试调。</div>
+              <SchemaValueEditor v-model="wizardValues" :schema="wizardParams" />
             </div>
           </el-form-item>
 
@@ -1337,7 +1210,7 @@ onMounted(load)
           </el-form-item>
           <el-form-item label="返回字段" required>
             <div style="width: 100%">
-              <div class="hint" style="margin-bottom: 6px">白名单字段：只有这里列出的字段会回给模型。「字段名」为接口里的英文键，「中文名」用于展示。</div>
+              <div class="hint" style="margin-bottom: 6px">白名单字段：只有这里列出的字段会回给模型。「字段名」为接口里的英文键，支持一层点路径（如 user.name，不支持 a.b.c）；「中文名」用于展示。</div>
               <el-table :data="wizard.resultRows" size="small" border>
                 <el-table-column label="字段名" min-width="140">
                   <template #default="{ row }"><el-input v-model="row.field" placeholder="如 id、date" /></template>
@@ -1352,6 +1225,13 @@ onMounted(load)
                 </el-table-column>
               </el-table>
               <el-button style="margin-top: 6px" @click="wizardAddResultRow">添加返回字段</el-button>
+            </div>
+          </el-form-item>
+
+          <el-form-item label="返回结构">
+            <div style="width: 100%">
+              <div class="hint" style="margin-bottom: 6px">可选：描述接口返回的数据结构，落库为 result.schema，供模型理解返回内容。</div>
+              <SchemaTreeEditor v-model="wizardResultSchema" mode="result-root" />
             </div>
           </el-form-item>
 

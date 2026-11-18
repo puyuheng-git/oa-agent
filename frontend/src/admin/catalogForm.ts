@@ -1,22 +1,9 @@
 // Tool / Skill 后台表单 ↔ 接口定义的转换（纯函数，便于测试）
-
-export interface ParamRow {
-  name: string
-  label: string
-  type: 'string' | 'integer'
-  format: '' | 'date'
-  required: boolean
-  /** 可选值：`0=未报销, 1=已报销` 或 `1, 2`，逗号/分号/换行分隔 */
-  enumText: string
-  minimum: number | null
-  maximum: number | null
-  defaultValue: string
-  description: string
-  /** 作为顶层查询参数传递（否则放进 queryParams JSON） */
-  topLevel: boolean
-}
+import { normalizeNode } from './schemaTree'
+import type { SchemaNode } from './schemaTree'
 
 export interface FieldRow {
+  /** 返回字段键；允许一层点路径，如 `user.name` */
   key: string
   label: string
   inList: boolean
@@ -35,7 +22,12 @@ export interface ToolForm {
   /** 由服务端填入当前员工 oa 的普通查询参数名，逗号分隔，如 `user_id` */
   identityParams: string
   result_kind: 'list' | 'object'
-  params: ParamRow[]
+  /** 模型可填参数：参数名 → SchemaNode（支持 array / object / file 嵌套） */
+  modelParams: Record<string, SchemaNode>
+  /** 作为顶层查询参数传递的参数名，逗号分隔（其余放进 queryParams JSON） */
+  topLevelFields: string
+  /** 返回结果根 Schema；null 表示不声明 */
+  resultSchema: SchemaNode | null
   fields: FieldRow[]
 }
 
@@ -48,19 +40,13 @@ export interface SkillForm {
   tools: string[]
 }
 
-export function emptyParam(): ParamRow {
-  return {
-    name: '', label: '', type: 'string', format: '', required: false, enumText: '',
-    minimum: null, maximum: null, defaultValue: '', description: '', topLevel: false,
-  }
-}
-
 /** 与后端 DEFAULT_UPSTREAM 对齐；office 为历史别名，保存时会与 open_oa 视为同一上游 */
 export function emptyToolForm(defaultUpstream = 'open_oa'): ToolForm {
   return {
     name: '', summary: '', description: '', upstream: defaultUpstream || 'open_oa', path: '/',
     timeout_seconds: 10, injectOa: true,
-    query_params_field: 'queryParams', identityParams: '', result_kind: 'list', params: [], fields: [],
+    query_params_field: 'queryParams', identityParams: '', result_kind: 'list',
+    modelParams: {}, topLevelFields: '', resultSchema: null, fields: [],
   }
 }
 
@@ -68,52 +54,28 @@ export function emptySkillForm(): SkillForm {
   return { name: '', display_name: '', description: '', instructions: '', examplesText: '', tools: [] }
 }
 
-function typed(value: string, type: ParamRow['type']): string | number {
-  const n = Number(value)
-  return type === 'integer' && value.trim() !== '' && Number.isFinite(n) ? n : value
-}
-
-export function parseEnum(text: string, type: ParamRow['type']): {
-  enum?: (string | number)[]
-  enum_labels?: Record<string, string>
-} {
-  const items = text.split(/[,，;；\n]/).map((s) => s.trim()).filter(Boolean)
-  if (!items.length) return {}
-  const values: (string | number)[] = []
-  const labels: Record<string, string> = {}
-  for (const item of items) {
-    const i = item.indexOf('=')
-    const raw = (i >= 0 ? item.slice(0, i) : item).trim()
-    const value = typed(raw, type)
-    values.push(value)
-    if (i >= 0 && item.slice(i + 1).trim()) labels[String(value)] = item.slice(i + 1).trim()
-  }
-  return Object.keys(labels).length ? { enum: values, enum_labels: labels } : { enum: values }
-}
-
-export function enumText(rule: { enum?: unknown[]; enum_labels?: Record<string, string> }): string {
-  if (!rule.enum?.length) return ''
-  return rule.enum
-    .map((v) => (rule.enum_labels?.[String(v)] ? `${v}=${rule.enum_labels[String(v)]}` : String(v)))
-    .join(', ')
+/** 逗号 / 空白分隔的名称列表 */
+function splitNames(text: string): string[] {
+  return text.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean)
 }
 
 export function toolPayload(form: ToolForm): Record<string, unknown> {
-  const model_params: Record<string, Record<string, unknown>> = {}
-  for (const p of form.params) {
-    const name = p.name.trim()
-    if (!name) continue
-    const rule: Record<string, unknown> = { type: p.type, required: p.required }
-    if (p.format) rule.format = p.format
-    if (p.label.trim()) rule.label = p.label.trim()
-    if (p.description.trim()) rule.description = p.description.trim()
-    Object.assign(rule, parseEnum(p.enumText, p.type))
-    if (p.minimum !== null && p.minimum !== undefined) rule.minimum = p.minimum
-    if (p.maximum !== null && p.maximum !== undefined) rule.maximum = p.maximum
-    if (p.defaultValue.trim()) rule.default = typed(p.defaultValue.trim(), p.type)
-    model_params[name] = rule
+  // 参数：逐个规范化为 SchemaNode，丢弃空名；保留 array/object/file 原类型
+  const model_params: Record<string, SchemaNode> = {}
+  for (const [rawName, node] of Object.entries(form.modelParams)) {
+    const name = rawName.trim()
+    if (name) model_params[name] = normalizeNode(node)
   }
+  const topLevel = splitNames(form.topLevelFields).filter((k) => k in model_params)
+  // 返回：字段白名单（key 允许一层点路径）+ 可选根 Schema
   const fields = form.fields.filter((f) => f.key.trim())
+  const result: Record<string, unknown> = {
+    kind: form.result_kind,
+    fields: fields.map((f) => f.key.trim()),
+    labels: Object.fromEntries(fields.filter((f) => f.label.trim()).map((f) => [f.key.trim(), f.label.trim()])),
+    list_columns: form.result_kind === 'list' ? fields.filter((f) => f.inList).map((f) => f.key.trim()) : [],
+  }
+  if (form.resultSchema) result.schema = normalizeNode(form.resultSchema)
   return {
     name: form.name.trim(),
     summary: form.summary.trim(),
@@ -123,18 +85,11 @@ export function toolPayload(form: ToolForm): Record<string, unknown> {
     path: form.path.trim(),
     timeout_seconds: form.timeout_seconds,
     inject_identity_fields: form.injectOa ? ['oa'] : [],
-    top_level_fields: form.params.filter((p) => p.topLevel && p.name.trim()).map((p) => p.name.trim()),
+    top_level_fields: topLevel,
     query_params_field: form.query_params_field.trim() || null,
-    identity_params: Object.fromEntries(
-      form.identityParams.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean).map((k) => [k, 'oa']),
-    ),
+    identity_params: Object.fromEntries(splitNames(form.identityParams).map((k) => [k, 'oa'])),
     model_params,
-    result: {
-      kind: form.result_kind,
-      fields: fields.map((f) => f.key.trim()),
-      labels: Object.fromEntries(fields.filter((f) => f.label.trim()).map((f) => [f.key.trim(), f.label.trim()])),
-      list_columns: form.result_kind === 'list' ? fields.filter((f) => f.inList).map((f) => f.key.trim()) : [],
-    },
+    result,
   }
 }
 
@@ -156,19 +111,11 @@ export function toolFormFromSchema(schema: Record<string, any>): ToolForm {
     query_params_field: schema.query_params_field || '',
     identityParams: Object.keys(schema.identity_params || {}).join(', '),
     result_kind: result.kind === 'object' ? 'object' : 'list',
-    params: Object.entries<Record<string, any>>(schema.model_params || {}).map(([name, rule]) => ({
-      name,
-      label: rule.label || '',
-      type: rule.type === 'integer' ? 'integer' : 'string',
-      format: rule.format === 'date' ? 'date' : '',
-      required: !!rule.required,
-      enumText: enumText(rule),
-      minimum: rule.minimum ?? null,
-      maximum: rule.maximum ?? null,
-      defaultValue: rule.default === undefined || rule.default === null ? '' : String(rule.default),
-      description: rule.description || '',
-      topLevel: top.includes(name),
-    })),
+    modelParams: Object.fromEntries(
+      Object.entries<unknown>(schema.model_params || {}).map(([name, rule]) => [name, normalizeNode(rule)]),
+    ),
+    topLevelFields: top.join(', '),
+    resultSchema: result.schema ? normalizeNode(result.schema) : null,
     fields: (result.fields || []).map((key: string) => ({
       key,
       label: labels[key] || '',

@@ -54,5 +54,5 @@ STEP_SKIPPED = "skipped"
 STEP_CANCELLED = "cancelled"
 
 # 认知类工具：结果必须回灌模型，禁止当员工最终回复
-COGNITIVE_BUILTIN_IDS = frozenset({"sys.skill", "sys.skill_read"})
-COGNITIVE_TOOL_NAMES = frozenset({"builtin.skill", "builtin.skill_read"})
+COGNITIVE_BUILTIN_IDS = frozenset({"sys.skill", "sys.skill_read", "sys.skill_exec"})
+COGNITIVE_TOOL_NAMES = frozenset({"builtin.skill", "builtin.skill_read", "builtin.skill_exec"})
