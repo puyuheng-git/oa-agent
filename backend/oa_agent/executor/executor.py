@@ -17,6 +17,7 @@ from oa_agent.integrations.open_oa import (
     OfficeApiClient,
     OfficeApiError,
 )
+from oa_agent.executor.invoke_args import unwrap_bag_args
 from oa_agent.executor.registry import ToolRegistry, ToolSpec
 from oa_agent.observability.events import RunRecorder
 
@@ -125,6 +126,60 @@ def resolve_identity_binding(identity: Identity, source: str) -> str:
     return ""
 
 
+def _resolve_invoke_call(spec: ToolSpec) -> str:
+    """解析 open_oa invoke 的 call。含 page+limit 的列表必须用 page_list，
+    否则 page/limit 会被吞进 PHP $params，上游永远走默认每页 10 条。"""
+    call = (getattr(spec, "invoke_call", None) or "").strip()
+    model_params = getattr(spec, "model_params", None) or {}
+    if "page" in model_params and "limit" in model_params:
+        return "page_list"
+    return call or "one_by_params"
+
+
+def _check_node(path: str, rule: dict, value: object) -> object:
+    """递归粗检 object.properties / array.items；object 内未声明的键保留。"""
+    ptype = rule.get("type") or "string"
+    # None 一律视为缺失，避免被 str() 成 'None' 混过校验
+    if value is None:
+        raise ToolError("INVALID_ARGUMENT", f"缺少参数 {path}")
+    if ptype == "object":
+        if not isinstance(value, dict):
+            raise ToolError("INVALID_ARGUMENT", f"{path} 必须是对象")
+        out = dict(value)
+        for pk, pr in (rule.get("properties") or {}).items():
+            sub = value.get(pk)
+            if sub is None or sub == "":
+                # 缺失的子属性：必填则报错，否则跳过
+                if pr.get("required"):
+                    raise ToolError("INVALID_ARGUMENT", f"缺少参数 {path}.{pk}")
+                out.pop(pk, None)
+                continue
+            out[pk] = _check_node(f"{path}.{pk}", pr, sub)
+        return out
+    if ptype == "array":
+        if not isinstance(value, list):
+            raise ToolError("INVALID_ARGUMENT", f"{path} 必须是数组")
+        item_rule = rule.get("items") or {"type": "string"}
+        return [_check_node(f"{path}[]", item_rule, v) for v in value]
+    if ptype in ("integer", "number"):
+        try:
+            value = int(value) if ptype == "integer" else float(value)
+        except (TypeError, ValueError):
+            raise ToolError("INVALID_ARGUMENT", f"{path} 必须是{'整数' if ptype == 'integer' else '数字'}") from None
+    elif ptype == "boolean":
+        if not isinstance(value, bool):
+            value = bool(value) if isinstance(value, (int, float)) else str(value).strip().lower() in ("1", "true", "yes", "y", "是")
+    elif ptype == "file":
+        value = str(value).strip()
+        if not value:
+            raise ToolError("INVALID_ARGUMENT", f"缺少参数 {path}")
+    else:
+        value = str(value).strip()
+    if "enum" in rule and value not in rule["enum"]:
+        raise ToolError("INVALID_ARGUMENT", f"{path} 取值无效")
+    return value
+
+
 def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
     """返回 (清洗后的参数, 被丢弃的字段)。身份字段与未声明字段一律丢弃。"""
     clean: dict = {}
@@ -162,12 +217,8 @@ def validate_args(spec: ToolSpec, args: dict) -> tuple[dict, list[str]]:
                 value = bool(value)
             else:
                 value = str(value).strip().lower() in ("1", "true", "yes", "y", "是")
-        elif ptype == "object":
-            if not isinstance(value, dict):
-                raise ToolError("INVALID_ARGUMENT", f"{key} 必须是对象")
-        elif ptype == "array":
-            if not isinstance(value, list):
-                raise ToolError("INVALID_ARGUMENT", f"{key} 必须是数组")
+        elif ptype in ("object", "array"):
+            value = _check_node(key, rule, value)  # 递归粗检嵌套 properties / items
         elif ptype == "file":
             value = str(value).strip()
             if not value:
@@ -213,7 +264,16 @@ def build_request(spec: ToolSpec, args: dict, identity: Identity) -> dict:
 
 
 def _pick(row: dict, fields: tuple[str, ...], remark_limit: int = REMARK_LIMIT) -> dict:
-    out = {f: row.get(f) for f in fields if f in row}
+    out: dict = {}
+    for f in fields:
+        if f in row:
+            out[f] = row[f]
+        elif "." in f:
+            # 一层点路径：user.name → row["user"]["name"]，输出键保留点号
+            left, right = f.split(".", 1)
+            nested = row.get(left)
+            if isinstance(nested, dict) and right in nested:
+                out[f] = nested[right]
     if isinstance(out.get("remark"), str) and len(out["remark"]) > remark_limit:
         out["remark"] = out["remark"][:remark_limit] + "…"
     return out
@@ -362,7 +422,9 @@ class ToolExecutor:
         connector_id = spec.upstream or DEFAULT_UPSTREAM
         service = (spec.invoke_service or "").strip()
         method = (spec.invoke_method or "").strip()
-        call = (spec.invoke_call or "one_by_params").strip() or "one_by_params"
+        call = _resolve_invoke_call(spec)
+        # 兼容旧契约仍带 params|data 袋：整包 call 摊平后再发给 Service
+        clean = unwrap_bag_args(call, clean)
         op = (spec.invoke_op or "read").strip() or "read"
         if not service or not method:
             raise ToolError("TOOL_NOT_AVAILABLE", f"open_oa_invoke 未配置 service/method：{spec.name}",

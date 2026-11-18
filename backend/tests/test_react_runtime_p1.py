@@ -115,6 +115,13 @@ def test_after_tool_routes_to_understand():
         "steps": [{"tool": "a"}, {"tool": "b"}],
         "step_index": 1,
     }) == "call_tool"
+    # 业务工具成功写 finish_reason 后应直接 respond，不再空转 understand
+    assert _after_tool({
+        "replan": False,
+        "finish_reason": "answer",
+        "steps": [],
+        "step_index": 0,
+    }) == "respond"
 
 
 def test_fingerprint_stable():

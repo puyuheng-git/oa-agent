@@ -38,6 +38,8 @@ log = logging.getLogger(__name__)
 OPENAPI_DIR = REPO_ROOT / "openapi"
 SKILLS_DIR = REPO_ROOT / "skills"
 PARAM_TYPES = {"string", "integer", "number", "boolean", "object", "array", "file"}
+SCHEMA_MAX_DEPTH = 8
+RESULT_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 IDENTITY_FIELDS = {"oa"}
 RESULT_KINDS = {"list", "object"}
 RISK_LEVELS = {"low", "medium", "high"}
@@ -122,27 +124,69 @@ def canonical_hash(value: Any) -> str:
 
 # ---------------- Tool：解析与规范化 ----------------
 
-def _normalize_param(name: str, rule: Any, errors: list[str], op: str) -> dict:
+def _normalize_schema_node(path: str, rule: Any, errors: list[str], depth: int = 0) -> dict:
+    """递归规范化 SchemaNode（object.properties / array.items / file.accept），深度上限 SCHEMA_MAX_DEPTH。
+
+    path 为错误文案前缀（model_params 与 result.schema 共用）。
+    """
     if not isinstance(rule, dict):
-        errors.append(f"{op}.model_params.{name} 必须是对象")
+        errors.append(f"{path} 必须是对象")
+        return {}
+    # 超过深度上限：记错并不再下钻
+    if depth > SCHEMA_MAX_DEPTH:
+        errors.append(f"{path} 嵌套深度超过 {SCHEMA_MAX_DEPTH}")
         return {}
     out = {k: rule[k] for k in ("type", "format", "enum", "minimum", "maximum", "default", "required", "description",
-                                "label", "enum_labels")
+                                "label", "enum_labels", "accept", "multiple")
            if k in rule and rule[k] not in (None, "", [], {})}
     if out.get("type", "string") not in PARAM_TYPES:
-        errors.append(
-            f"{op}.model_params.{name}.type 只支持 string / integer / number / boolean / object / array / file"
-        )
+        errors.append(f"{path}.type 只支持 string / integer / number / boolean / object / array / file")
     out.setdefault("type", "string")
     out["required"] = bool(out.get("required", False))
     if "enum" in out and not isinstance(out["enum"], list):
-        errors.append(f"{op}.model_params.{name}.enum 必须是数组")
+        errors.append(f"{path}.enum 必须是数组")
     if "enum_labels" in out:
         if not isinstance(out["enum_labels"], dict):
-            errors.append(f"{op}.model_params.{name}.enum_labels 必须是 取值→名称 的对象")
+            errors.append(f"{path}.enum_labels 必须是 取值→名称 的对象")
         else:
             out["enum_labels"] = {str(k): str(v) for k, v in out["enum_labels"].items()}
+    if "accept" in out:
+        if not isinstance(out["accept"], list):
+            errors.append(f"{path}.accept 必须是数组")
+            out.pop("accept", None)
+        else:
+            out["accept"] = [str(x) for x in out["accept"] if str(x).strip()]
+    # file + multiple → array of file
+    if out.get("type") == "file" and out.pop("multiple", False):
+        items = {"type": "file"}
+        if "accept" in out:
+            items["accept"] = out.pop("accept")
+        out = {k: v for k, v in out.items() if k in ("label", "description", "required")}
+        out["type"] = "array"
+        out["items"] = items
+        out["required"] = bool(rule.get("required", False))
+    if out.get("type") == "object":
+        props_raw = rule.get("properties") or {}
+        if props_raw and not isinstance(props_raw, dict):
+            errors.append(f"{path}.properties 必须是对象")
+        elif isinstance(props_raw, dict) and props_raw:
+            out["properties"] = {
+                str(k): _normalize_schema_node(f"{path}.{k}", v, errors, depth + 1)
+                for k, v in props_raw.items()
+            }
+    if out.get("type") == "array":
+        items_raw = rule.get("items")
+        if items_raw is None and "items" not in out:
+            out["items"] = {"type": "string"}
+        elif items_raw is not None:
+            out["items"] = _normalize_schema_node(f"{path}[]", items_raw, errors, depth + 1)
+    out.pop("multiple", None)
     return out
+
+
+def _normalize_param(name: str, rule: Any, errors: list[str], op: str, depth: int = 0) -> dict:
+    """规范化单个 model_params 条目（递归见 _normalize_schema_node）。"""
+    return _normalize_schema_node(f"{op}.model_params.{name}", rule, errors, depth)
 
 
 def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, list[str]]:
@@ -172,7 +216,14 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
     kind = result.get("kind", "object")
     if kind not in RESULT_KINDS:
         errors.append(f"{name}.result.kind 只支持 list / object")
-    fields = list(result.get("fields") or [])
+    fields_raw = list(result.get("fields") or [])
+    # 字段名只允许单段或一层点号（如 user.name）；非法字段记错并丢弃
+    fields = []
+    for f in fields_raw:
+        if isinstance(f, str) and RESULT_FIELD_RE.fullmatch(f):
+            fields.append(f)
+        else:
+            errors.append(f"{name}.result.fields 字段名无效（仅支持 a 或 a.b 一层）：{f}")
     if not fields:
         errors.append(f"{name}.result.fields 不能为空（只返回白名单字段）")
     labels = result.get("labels") or {}
@@ -230,6 +281,9 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
         "result": {"kind": kind, "fields": fields, "labels": labels,
                    "list_columns": [c for c in columns if c in fields]},
     }
+    # result.schema：可选的返回结构说明，递归规范化
+    if result.get("schema"):
+        spec["result"]["schema"] = _normalize_schema_node(f"{name}.result.schema", result["schema"], errors)
     if bindings_explicit:
         # 仅显式声明写入 schema（哈希）；inject 合成留给 to_tool_spec
         spec["identity_bindings"] = bindings
@@ -275,14 +329,11 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
         if not pname or not FIELD_RE.match(pname):
             errors.append(f"{name}.params 含无效字段名")
             continue
-        rule: dict[str, Any] = {
-            "type": raw.get("type") or "string",
-            "label": raw.get("label") or pname,
-            "required": bool(raw.get("required")),
-        }
-        for key in ("format", "enum", "minimum", "maximum", "default", "description", "enum_labels"):
-            if raw.get(key) not in (None, "", [], {}):
-                rule[key] = raw[key]
+        # 保留完整 SchemaNode（properties / items / accept / multiple 等），后续由 _normalize_schema_node 递归规范化
+        rule: dict[str, Any] = {k: v for k, v in raw.items() if k != "name"}
+        rule["type"] = raw.get("type") or "string"
+        rule["label"] = raw.get("label") or pname
+        rule["required"] = bool(raw.get("required"))
         model_params[pname] = rule
     returns = item.get("returns") if isinstance(item.get("returns"), dict) else {}
     risk = str(item.get("risk") or "low")
@@ -302,6 +353,7 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
             "fields": list(returns.get("fields") or []),
             "labels": dict(returns.get("labels") or {}),
             "list_columns": list(returns.get("list_columns") or []),
+            "schema": returns.get("schema"),
         },
     }
     if risk not in RISK_LEVELS:
@@ -359,7 +411,8 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
         "identity_params": form.get("identity_params") or {},
         "model_params": form.get("model_params") or {},
         "result": {"kind": result.get("kind") or "object", "fields": result.get("fields") or [],
-                   "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or []},
+                   "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or [],
+                   "schema": result.get("schema")},
     }
     if is_invoke:
         xa["invoke_service"] = inv_s
@@ -497,7 +550,8 @@ def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
         add("result.fields", "removed", removed, None, True)
     if added:
         add("result.fields", "added", None, added)
-    for key in ("labels", "list_columns"):
+    # schema 仅为返回结构元数据，变更可见但不算 breaking
+    for key in ("labels", "list_columns", "schema"):
         if old_res.get(key) != new_res.get(key):
             add(f"result.{key}", "changed", old_res.get(key), new_res.get(key))
     return (BREAKING if breaking else COMPATIBLE), diff

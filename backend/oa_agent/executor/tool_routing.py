@@ -798,10 +798,35 @@ def _router_then_fill(
     return dec
 
 
+def _find_outing_application_tool(tools: dict) -> str | None:
+    """可见工具里找「外出申请列表」能力（优先固定名，再按摘要/Skill 名匹配）。"""
+    if "search_application_list" in tools:
+        return "search_application_list"
+    for name, (spec, skill) in tools.items():
+        parts = [
+            name,
+            getattr(spec, "summary", "") or "",
+            getattr(spec, "description", "") or "",
+            getattr(skill, "name", "") or "",
+            getattr(skill, "display_name", "") or "",
+            getattr(skill, "description", "") or "",
+        ]
+        blob = " ".join(str(p) for p in parts)
+        if "外出申请" in blob:
+            return name
+    return None
+
+
 def _try_deterministic(
     message: str, today: date, tools: dict, rule_tool_map: dict[str, str],
 ) -> dict | None:
     """规则 + plan_list_then_detail 真正调用。命中则返回 understand 形态 dict。"""
+    # 「我的外出申请列表」不得落到行程报销 list（source=外出）
+    if intent_rules.is_outing_application_query(message or ""):
+        app_tool = _find_outing_application_tool(tools)
+        if app_tool:
+            return {"intent": TOOL, "tool": app_tool, "params": {}, "intent_source": "rules"}
+
     parsed = intent_rules.parse(message, today)
     intent = parsed.get("intent")
     params = parsed.get("params") or {}

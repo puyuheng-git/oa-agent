@@ -7,14 +7,16 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any, Literal
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile
 from pydantic import BaseModel, Field
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from oa_agent.admin.wizard_temp_upload import save_wizard_temp_file
 from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
 from oa_agent.db.models import McpServer, Skill, SkillVersion, SkillVisibilityRule, Tool, ToolVersion
 from oa_agent.errors import AppError
@@ -30,6 +32,8 @@ from oa_agent.executor.catalog import (
 # normalize_open_oa_catalog_item：向导 save 复用（由管理员填写的契约组装 Tool schema）
 from oa_agent.executor.contract_test import contract_check, is_activatable
 from oa_agent.executor.visibility import VisibilityService
+from oa_agent.executor.invoke_args import unwrap_bag_args
+from oa_agent.executor.skill_draft import draft_skill_from_tools
 from oa_agent.runtime.llm import ModelCallError, build_chat_model, resolve_model
 
 tools_router = APIRouter(prefix="/v1/admin/tools", tags=["admin-tools"])
@@ -50,11 +54,16 @@ class ActivateIn(ReasonIn):
     version_no: int = Field(ge=1)
 
 
-class ToolResultIn(BaseModel):
-    kind: str = "object"
-    fields: list[str] = Field(default_factory=list, max_length=100)
-    labels: dict[str, str] = Field(default_factory=dict)
-    list_columns: list[str] = Field(default_factory=list, max_length=20)
+with warnings.catch_warnings():
+    # 契约字段名即 schema，pydantic 会提示其遮蔽 BaseModel.schema（已弃用），此处有意为之
+    warnings.filterwarnings("ignore", message='Field name "schema"')
+
+    class ToolResultIn(BaseModel):
+        kind: str = "object"
+        fields: list[str] = Field(default_factory=list, max_length=100)
+        labels: dict[str, str] = Field(default_factory=dict)
+        list_columns: list[str] = Field(default_factory=list, max_length=20)
+        schema: dict[str, Any] | None = None  # 可选：返回结构说明，由 normalize 递归规范化
 
 
 class ToolIn(ReasonIn):
@@ -622,13 +631,16 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
     """向导：指定测试员工试调。"""
     client, secret = _open_oa_wizard_client(ctx)
     ctx.db.rollback()
+    call = body.call.strip() or "one_by_params"
+    # 整包 call 摊平 params|data，避免业务方法多套一层
+    args = unwrap_bag_args(call, dict(body.args or {}))
     try:
         data = client.probe_export(
             service=body.service.strip(),
             method=body.method.strip(),
             oa=body.oa.strip(),
-            args=dict(body.args or {}),
-            call=body.call.strip() or "one_by_params",
+            args=args,
+            call=call,
             op=body.op.strip() or "read",
             gateway_secret=secret,
             idempotency_key=body.idempotency_key.strip(),
@@ -638,6 +650,23 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
     return {"data": data}
 
 
+@tools_router.post("/export-wizard/upload-temp")
+async def export_wizard_upload_temp(file: UploadFile = File(...), ctx: AdminCtx = Depends(admin_write(TOOL))):
+    """向导：文件型参数测试用，上传到本机临时目录并返回 ref。"""
+    # 读取并校验大小（空文件/超 20MB 拒绝）
+    data = await file.read()
+    if not data:
+        raise AppError(400, "VALIDATION_ERROR", "空文件")
+    if len(data) > 20 * 1024 * 1024:
+        raise AppError(400, "VALIDATION_ERROR", "文件过大，上限 20MB")
+    out = save_wizard_temp_file(data, file.filename or "file")
+    # 审计：仅记元数据，不记路径外内容
+    with ctx.db.begin():
+        ctx.audit("tool.export_wizard_upload_temp", "tool", "export-wizard",
+                  after={"filename": out["filename"], "sha256": out["sha256"], "size": out["size"]})
+    return {"data": out}
+
+
 @tools_router.post("/export-wizard/save")
 def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
     """向导：用同一参数再 probe 一次，成功后写入 open_oa_invoke Tool。"""
@@ -645,13 +674,15 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
         raise AppError(422, "VALIDATION_ERROR", "入库前须配置 result.fields")
     client, secret = _open_oa_wizard_client(ctx)
     ctx.db.rollback()
+    call = body.call.strip() or "one_by_params"
+    args = unwrap_bag_args(call, dict(body.args or {}))
     try:
         client.probe_export(
             service=body.service.strip(),
             method=body.method.strip(),
             oa=body.oa.strip(),
-            args=dict(body.args or {}),
-            call=body.call.strip() or "one_by_params",
+            args=args,
+            call=call,
             op=body.op.strip() or "read",
             gateway_secret=secret,
             idempotency_key=body.idempotency_key.strip(),
@@ -663,6 +694,13 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
     for pname, rule in (body.model_params or {}).items():
         if not isinstance(rule, dict):
             continue
+        # 落库不再保留整包袋名，避免 Agent 再套一层
+        if call in ("one_by_params", "page_list") and pname in ("params", "data"):
+            if rule.get("type") == "object" and isinstance(rule.get("properties"), dict):
+                for ck, cv in rule["properties"].items():
+                    if isinstance(cv, dict):
+                        params_list.append({"name": str(ck), **cv})
+            continue
         row = {"name": pname, **rule}
         params_list.append(row)
     item = {
@@ -672,13 +710,14 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
         "summary": body.summary.strip() or body.name.strip(),
         "op": body.op.strip() or "read",
         "risk": body.risk.strip() or "low",
-        "call": body.call.strip() or "one_by_params",
+        "call": call,
         "params": params_list,
         "returns": {
             "kind": body.result.kind,
             "fields": list(body.result.fields or []),
             "labels": dict(body.result.labels or {}),
             "list_columns": list(body.result.list_columns or []),
+            "schema": body.result.schema,
         },
     }
     spec, errs = normalize_open_oa_catalog_item(item)
@@ -909,6 +948,53 @@ def sync_skills(ctx: AdminCtx = Depends(admin_write(SKILL))):
             "files": [{"file": f["file"], "ok": f["ok"]} for f in report["files"]], "skills": report["skills"]})
     engine.reload_catalog()
     return report
+
+
+class SkillDraftFromToolsIn(BaseModel):
+    """先选 Tool，再让小模型根据契约生成 Skill 表单草稿。"""
+
+    tools: list[str] = Field(min_length=1, max_length=20)
+
+
+def _draft_skill_model(ctx: AdminCtx):
+    """优先 text/small；没有小模型则回落默认模型。"""
+    rt = ctx.runtime
+    try:
+        with rt.session() as db:
+            cfg = resolve_model(db, rt.vault, rt.tenant_id, capability="text", model_tier="small")
+            if cfg is None:
+                cfg = resolve_model(db, rt.vault, rt.tenant_id)
+    except SQLAlchemyError:
+        return None
+    return build_chat_model(cfg) if cfg else None
+
+
+@skills_router.post("/draft-from-tools")
+def draft_skill_from_tools_api(body: SkillDraftFromToolsIn, ctx: AdminCtx = Depends(admin_write(SKILL))):
+    """根据已选 Tool 当前契约，调用小模型生成 Skill 草稿（不落库）。"""
+    names = [n.strip() for n in body.tools if n and n.strip()]
+    if not names:
+        raise AppError(422, "VALIDATION_ERROR", "请至少选择一个 Tool")
+    schemas: list[dict] = []
+    for name in names:
+        tool = _get_tool(ctx, name)
+        current = ctx.db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
+        schema = dict(current.schema_json or {}) if current else {}
+        schema.setdefault("name", tool.name)
+        if not schema.get("summary"):
+            schema["summary"] = tool.summary or tool.name
+        schemas.append(schema)
+    model = _draft_skill_model(ctx)
+    if model is None:
+        raise AppError(422, "LLM_NOT_CONFIGURED", "未配置可用的文本模型（建议配置 text/small），无法自动生成")
+    try:
+        draft = draft_skill_from_tools(model, schemas)
+    except ModelCallError as exc:
+        raise AppError(422, "LLM_FAILED", f"模型生成失败：{exc}") from None
+    with ctx.db.begin():
+        ctx.audit("skill.draft_from_tools", "skill", draft.get("name") or "*", after={
+            "tools": names, "draft_name": draft.get("name")})
+    return {"draft": draft}
 
 
 def _save_skill(ctx: AdminCtx, body: SkillIn, create: bool) -> dict:

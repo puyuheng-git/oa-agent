@@ -25,3 +25,5 @@ frontend/dist/
 .cursor/
 .superpowers/
 .ui-shots/
+
+runtime/wizard-temp/

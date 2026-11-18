@@ -30,6 +30,17 @@ describe('http', () => {
     expect(fn.mock.calls[0][1].headers['Idempotency-Key']).not.toBe(fn.mock.calls[1][1].headers['Idempotency-Key'])
   })
 
+  it('postForm 直接发送 FormData，不设 Content-Type', async () => {
+    const fn = mockFetch(200, { data: {} })
+    const form = new FormData()
+    form.append('file', new Blob(['x']), 'a.txt')
+    await http.postForm('/v1/up', form)
+    const init = fn.mock.calls[0][1]
+    expect(init.body).toBe(form)
+    expect(init.headers['Content-Type']).toBeUndefined()
+    expect(init.headers['Idempotency-Key']).toBeTruthy()
+  })
+
   it('统一错误体转换为 ApiError', async () => {
     mockFetch(403, { error: { code: 'FORBIDDEN', message: '无权限：sys.setting.edit' } })
     await expect(http.get('/v1/z')).rejects.toMatchObject({ status: 403, code: 'FORBIDDEN' })

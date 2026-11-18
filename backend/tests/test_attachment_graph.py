@@ -122,6 +122,66 @@ def test_bound_csv_answer_includes_amount_and_read_range(chat, monkeypatch):
     assert "已阅读全文" in content or "已读过" in content
 
 
+def test_attach_delegate_keeps_file_text_on_next_understand(chat, monkeypatch):
+    """附件环先 delegate 认知工具后，下一轮 understand 仍须带上附件正文（勿因 skip_attach 丢文件）。"""
+    marker = "FILEMARK_ATTACH_KEEP_991"
+    csv_body = f"金额,1\n{marker}\n".encode()
+    skill_action = json.dumps(
+        {"action": "tool", "steps": [{"tool": "builtin.skill", "args": {"name": "docx"}}]},
+        ensure_ascii=False,
+    )
+    calls: list = []
+    after_tool = json.dumps(
+        {"action": "chat", "reply": f"已看到标记 {marker}"},
+        ensure_ascii=False,
+    )
+    lost = json.dumps({"action": "chat", "reply": "未读到文件"}, ensure_ascii=False)
+
+    def invoke(messages):
+        calls.append(messages)
+        text = _text_of(messages)
+        if "你正在查看员工已经发送的文件" in text:
+            return SimpleNamespace(
+                content=skill_action,
+                response_metadata={"token_usage": {"prompt_tokens": 3, "completion_tokens": 2}},
+            )
+        if marker in text:
+            return SimpleNamespace(
+                content=after_tool,
+                response_metadata={"token_usage": {"prompt_tokens": 3, "completion_tokens": 2}},
+            )
+        return SimpleNamespace(
+            content=lost,
+            response_metadata={"token_usage": {"prompt_tokens": 3, "completion_tokens": 2}},
+        )
+
+    cfg = ModelConfig("fake", "http://llm", None, 10, "fake-model", {})
+    monkeypatch.setattr(
+        "oa_agent.chat.service._model",
+        lambda rt, config: (SimpleNamespace(invoke=invoke), cfg),
+    )
+    headers = open_chat(chat)
+    uploaded = chat.post(
+        "/v1/chat/attachments",
+        headers=headers,
+        files=[("files", ("note.csv", csv_body, "text/csv"))],
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    file_id = uploaded.json()["files"][0]["file_id"]
+    _bind(chat, headers, file_id)
+
+    resp = send(chat, headers, "请根据附件说明一下")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["run_status"] == "succeeded", body
+    assert len(calls) >= 2, calls
+    second = _text_of(calls[1])
+    assert marker in second, second
+    content = (body.get("reply") or {}).get("content") or ""
+    assert "未读到文件" not in content
+    assert marker in content
+
+
 def test_next_turn_tool_action_reaches_call_tool(chat, office, monkeypatch):
     route = office.post(INVOKE_URL).mock(return_value=httpx.Response(
         200, json={"code": 0, "data": {"list": [ROW], "total": 1}},
@@ -139,8 +199,12 @@ def test_next_turn_tool_action_reaches_call_tool(chat, office, monkeypatch):
     assert second.status_code == 200, second.text
     body = second.json()
     data = body["reply"].get("data") or {}
-    assert data.get("tool") == TOOL
-    assert data.get("kind") == "table"
+    if data.get("kind") == "bundle":
+        tools = [item.get("tool") for item in (data.get("items") or [])]
+        assert TOOL in tools, data
+    else:
+        assert data.get("tool") == TOOL
+        assert data.get("kind") == "table"
     assert "已阅读全文" not in (body["reply"].get("content") or "")
     assert route.called
     assert len(calls) > before
