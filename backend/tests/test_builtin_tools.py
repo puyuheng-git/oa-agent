@@ -86,7 +86,7 @@ def test_ensure_restores_deleted_row_with_defaults(rt):
 
 
 def test_sync_refresh_does_not_restore_deleted_builtin(rt):
-    """管理员删除内置 Tool 后，从文件同步不应自动补回。"""
+    """管理员删除内置 Tool 后，YAML 同步路径不应自动补回。"""
     from oa_agent.db.models import Tool
 
     with rt.session() as db, db.begin():

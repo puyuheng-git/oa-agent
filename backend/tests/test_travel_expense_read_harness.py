@@ -18,11 +18,11 @@ from oa_agent.runtime import intent_rules
 from oa_agent.runtime.graphs import travel_query as tq
 from oa_agent.runtime.intent_rules import DETAIL as INTENT_DETAIL
 from oa_agent.runtime.intent_rules import LIST as INTENT_LIST
-from oa_agent.settings import REPO_ROOT
+from tests.catalog_fixtures import OPENAPI_DIR, SKILLS_DIR
 from tests.test_chat import INVOKE_URL, chat, office, open_chat, send  # noqa: F401
 
-OPENAPI = REPO_ROOT / "openapi" / "travel_expense.yaml"
-SKILL = REPO_ROOT / "skills" / "travel_expense_query.yaml"
+OPENAPI = OPENAPI_DIR / "travel_expense.yaml"
+SKILL = SKILLS_DIR / "travel_expense_query.yaml"
 
 LIST = "query_my_travel_expense_list"
 DETAIL = "query_my_travel_expense_detail"

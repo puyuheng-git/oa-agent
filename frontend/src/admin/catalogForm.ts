@@ -37,6 +37,8 @@ export interface SkillForm {
   description: string
   instructions: string
   examplesText: string
+  /** 空串不限制可绑 Tool 类型 */
+  category?: string
   tools: string[]
 }
 
@@ -51,7 +53,10 @@ export function emptyToolForm(defaultUpstream = 'open_oa'): ToolForm {
 }
 
 export function emptySkillForm(): SkillForm {
-  return { name: '', display_name: '', description: '', instructions: '', examplesText: '', tools: [] }
+  return {
+    name: '', display_name: '', description: '', instructions: '', examplesText: '',
+    category: '', tools: [],
+  }
 }
 
 /** 逗号 / 空白分隔的名称列表 */
@@ -131,6 +136,7 @@ export function skillPayload(form: SkillForm): Record<string, unknown> {
     description: form.description.trim(),
     instructions: form.instructions.trim(),
     examples: form.examplesText.split('\n').map((s) => s.trim()).filter(Boolean),
+    category: (form.category || '').trim(),
     tools: form.tools,
   }
 }

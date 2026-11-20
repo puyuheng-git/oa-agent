@@ -69,8 +69,9 @@ def test_tool_on_other_upstream_uses_employee_token(admin, chat, office, monkeyp
 
     r = admin.post("/v1/admin/tools", json=HR_TOOL)
     assert r.status_code == 200, r.text
-    assert r.json()["tool"]["upstream"] == "hr" and r.json()["tool"]["registered"] is True
+    assert r.json()["tool"]["upstream"] == "hr" and r.json()["tool"]["enabled"] is False
     assert admin.post("/v1/admin/skills", json=LEAVE_SKILL).status_code == 200
+    assert admin.post("/v1/admin/tools/query_my_leave_list/enable", json={"reason": "绑定后启用"}).status_code == 200
     after = audit_rows(admin, action="tool.create")[0]["after_summary"]
     assert "'upstream': 'hr'" in after
 
@@ -110,6 +111,7 @@ def test_missing_upstream_at_runtime_fails_clearly(admin, chat, office, monkeypa
     set_upstreams(admin, [OFFICE_UPSTREAM, HR_UPSTREAM], default="office")
     admin.post("/v1/admin/tools", json=HR_TOOL)
     admin.post("/v1/admin/skills", json=LEAVE_SKILL)
+    assert admin.post("/v1/admin/tools/query_my_leave_list/enable", json={"reason": "绑定后启用"}).status_code == 200
     rt = runtime(chat)
     with rt.session() as db, db.begin():
         row = db.scalar(sa.select(Setting).where(Setting.setting_key == "upstreams"))

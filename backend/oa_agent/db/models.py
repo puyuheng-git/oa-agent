@@ -439,6 +439,8 @@ class McpServer(Base):
     name: Mapped[str] = mapped_column(sa.String(64))
     display_name: Mapped[str] = mapped_column(sa.String(128), default="")
     enabled: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # 管理员确认后才对员工放开该连接下的 MCP Tool；同步阶段保持 False
+    employee_open: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
     transport: Mapped[str] = mapped_column(sa.String(16))  # stdio | sse | http
     command: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
     args_json: Mapped[Any] = mapped_column(sa.JSON, nullable=True)

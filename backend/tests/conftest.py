@@ -78,6 +78,8 @@ def installed(settings):
     with TestClient(create_app(settings)) as c:
         r = c.post("/v1/setup/install", json=install_payload(settings))
         assert r.status_code == 200, r.text
+        from tests.catalog_fixtures import seed_catalog
+        seed_catalog(c)
         yield c
 
 

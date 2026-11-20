@@ -43,7 +43,6 @@ const mainTab = ref<'catalog' | 'packs' | 'market'>('catalog')
 const items = ref<SkillItem[]>([])
 const loading = ref(false)
 const loadError = ref('')
-const syncing = ref(false)
 
 const editor = ref(false)
 const editing = ref<string | null>(null)
@@ -81,21 +80,6 @@ async function loadPacks() {
     ElMessage.error(errorMessage(e))
   } finally {
     packsLoading.value = false
-  }
-}
-
-async function sync() {
-  syncing.value = true
-  try {
-    const r = await http.post<{ files: { file: string; ok: boolean; errors: string[] }[] }>('/v1/admin/skills/sync')
-    const failed = r.files.filter((f) => !f.ok)
-    if (failed.length) ElMessage.warning(`有 ${failed.length} 个文件解析失败：${failed.map((f) => f.errors.join('；')).join(' / ')}`)
-    else ElMessage.success('导入完成')
-    await load()
-  } catch (e) {
-    ElMessage.error(errorMessage(e))
-  } finally {
-    syncing.value = false
   }
 }
 
@@ -158,6 +142,7 @@ async function edit(skill: SkillItem) {
     description: skill.description || '',
     instructions: skill.instructions || '',
     examplesText: (skill.examples || []).join('\n'),
+    category: skill.category || '',
     tools: skill.tools.map((t) => t.name),
   }
   editReason.value = ''
@@ -467,9 +452,6 @@ onMounted(() => {
         />
         <div style="margin-bottom: 12px">
           <el-button type="primary" @click="create">新建 Skill</el-button>
-          <el-tooltip content="批量导入仓库 skills/*.yaml（同名 Skill 会被文件内容覆盖为新版本）">
-            <el-button :loading="syncing" @click="sync">从文件导入</el-button>
-          </el-tooltip>
           <el-button @click="load">刷新</el-button>
         </div>
         <el-result v-if="loadError" icon="error" :title="loadError" />
@@ -673,6 +655,14 @@ onMounted(() => {
         </el-form-item>
         <el-form-item label="示例问题">
           <el-input v-model="form.examplesText" type="textarea" :rows="3" placeholder="每行一条，最多 10 条；显示在员工欢迎页" />
+        </el-form-item>
+        <el-form-item label="种类">
+          <el-select v-model="form.category" clearable placeholder="不限制可绑 Tool 类型" style="width: 100%">
+            <el-option label="OA 查询（office / open_oa_invoke）" value="oa_query" />
+            <el-option label="OA 调用（office / open_oa_invoke）" value="oa_invoke" />
+            <el-option label="外部 MCP（mcp）" value="external_mcp" />
+            <el-option label="平台（builtin）" value="platform" />
+          </el-select>
         </el-form-item>
         <el-form-item label="可用 Tool" required>
           <el-select v-model="form.tools" multiple filterable style="width: 100%" placeholder="选择该 Skill 可调用的 Tool">

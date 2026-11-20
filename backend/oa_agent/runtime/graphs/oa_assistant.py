@@ -112,7 +112,7 @@ DEFAULT_CONFIG: dict = {
     "max_tool_steps": 3,            # 一次提问最多串联的工具步数" = 不串"
     "stream_output": True,
     # 工具路由（发布快照优先；缺省时运行时再叠 runtime 全局默认）
-    "tool_routing_mode": "legacy_prompt",
+    "tool_routing_mode": "deterministic_first",
     "prompt_topk": 8,
     "routing_skill_method": "rules_then_llm",
     "retrieve_topk": 8,
@@ -331,6 +331,18 @@ class RunContext:
                 edit_spec = registry.get(SKILL_EDIT_TOOL)
                 if edit_spec is not None and SKILL_EDIT_TOOL not in out:
                     out[SKILL_EDIT_TOOL] = (edit_spec, _skill_edit_skill())
+        # 未绑到 Skill 的普通 builtin（如计算）仍可进候选。
+        # 加载/读取/执行/创建/更新只由上面的 skill_packs 与系统包块注入。
+        pack_gated = (
+            SKILL_LOAD_TOOL, SKILL_READ_TOOL, SKILL_EXEC_TOOL,
+            SKILL_CREATE_TOOL, SKILL_EDIT_TOOL,
+        )
+        for name in registry.names():
+            if name in out or name in pack_gated:
+                continue
+            spec = registry.get(name)
+            if spec is not None and getattr(spec, "kind", None) == "builtin":
+                out[name] = (spec, None)
         return out
 
     def num(self, key: str) -> int:
