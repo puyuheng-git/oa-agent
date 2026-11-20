@@ -43,7 +43,6 @@ const mainTab = ref<'catalog' | 'packs' | 'market'>('catalog')
 const items = ref<SkillItem[]>([])
 const loading = ref(false)
 const loadError = ref('')
-const syncing = ref(false)
 
 const editor = ref(false)
 const editing = ref<string | null>(null)
@@ -81,21 +80,6 @@ async function loadPacks() {
     ElMessage.error(errorMessage(e))
   } finally {
     packsLoading.value = false
-  }
-}
-
-async function sync() {
-  syncing.value = true
-  try {
-    const r = await http.post<{ files: { file: string; ok: boolean; errors: string[] }[] }>('/v1/admin/skills/sync')
-    const failed = r.files.filter((f) => !f.ok)
-    if (failed.length) ElMessage.warning(`有 ${failed.length} 个文件解析失败：${failed.map((f) => f.errors.join('；')).join(' / ')}`)
-    else ElMessage.success('导入完成')
-    await load()
-  } catch (e) {
-    ElMessage.error(errorMessage(e))
-  } finally {
-    syncing.value = false
   }
 }
 
@@ -467,9 +451,6 @@ onMounted(() => {
         />
         <div style="margin-bottom: 12px">
           <el-button type="primary" @click="create">新建 Skill</el-button>
-          <el-tooltip content="批量导入仓库 skills/*.yaml（同名 Skill 会被文件内容覆盖为新版本）">
-            <el-button :loading="syncing" @click="sync">从文件导入</el-button>
-          </el-tooltip>
           <el-button @click="load">刷新</el-button>
         </div>
         <el-result v-if="loadError" icon="error" :title="loadError" />

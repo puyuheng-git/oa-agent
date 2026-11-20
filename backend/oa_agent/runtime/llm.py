@@ -385,8 +385,8 @@ def complete_json(chat_model, messages: list) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise ModelCallError(f"{type(exc).__name__}: {exc}") from exc
     parsed = _parse_json(_final_text(resp.content))
-    if parsed is None:
-        raise ModelCallError("模型输出不是合法 JSON")
+    if not isinstance(parsed, dict):
+        raise ModelCallError("模型输出不是合法 JSON 对象")
     return parsed
 
 

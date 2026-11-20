@@ -1,10 +1,9 @@
 """Tool / Skill 注册表（设计 §8、§13 P4）。
 
-- Tool 来源：管理后台表单（source_file = "admin"），或从 openapi/*.yaml 的 operation（x-agent 扩展）导入。
-  两者走同一套 规范化 → 校验 → 哈希 → 与当前版本比较：unchanged 不动；compatible 自动生效；
-  breaking 存为待激活版本，需管理员激活。首次启动表为空时从文件导入一次，之后以后台为准。
-- 文件解析/校验失败：该文件的 Tool 记录失败原因，保留最后有效版本（导入失败不覆盖）。
-- 运行时注册表只包含：管理员启用 + 规范启用 + 低风险免确认 + GET 只读 + 有当前版本 的 Tool。
+- Tool / Skill 以管理后台为准（source_file = "admin"）；也可由测试夹具通过 sync_* 批量写入。
+  规范化 → 校验 → 哈希 → 与当前版本比较：unchanged 不动；compatible 自动生效；
+  breaking 存为待激活版本，需管理员激活。
+- 运行时注册表只包含：管理员启用 + 规范启用 + 低风险免确认 + 有当前版本 的 Tool。
 - Skill 声明说明、填参指引、示例问题与可用 Tool；依赖不可用时 Skill 校验失败，对话不会使用它。
 """
 
@@ -918,7 +917,7 @@ class Catalog:
         return db.scalar(sa.select(model.id).where(model.tenant_id == self.tenant, model.name == name)) is not None
 
     def save_tool(self, db: Session, spec: dict, operator: str) -> dict:
-        """后台保存：与文件导入同一套版本规则（兼容变更立即生效，不兼容变更待激活）。"""
+        """后台保存：兼容变更立即生效，不兼容变更待激活。"""
         return self._sync_tool(db, ADMIN_SOURCE, ADMIN_SOURCE, spec, operator, utcnow())
 
     def save_skill(self, db: Session, content: dict, operator: str) -> Skill:
@@ -1017,11 +1016,6 @@ class Catalog:
         return states
 
     def bootstrap(self) -> None:
-        """首次启动（表为空）时从仓库文件同步一次，保证开箱即用。"""
+        """启动时确保内置 Tool 存在；业务 Tool/Skill 由管理后台维护。"""
         with self._sf() as db, db.begin():
-            if db.scalar(sa.select(sa.func.count()).select_from(Tool).where(Tool.tenant_id == self.tenant)) == 0:
-                report = self.sync_tools(db, "system")
-                log.info("首次同步 Tool：%s", [t["name"] for t in report["tools"]])
-            if db.scalar(sa.select(sa.func.count()).select_from(Skill).where(Skill.tenant_id == self.tenant)) == 0:
-                self.sync_skills(db, "system")
             ensure_builtin_tools(db, self.tenant)

@@ -314,9 +314,6 @@ oa-langGraph/
 │   ├── src/setup/
 │   └── public/              # 构建期静态资源（对话页已外置）
 ├── packs/                   # 领域包（如 oa_travel、demo_http）
-├── openapi/                 # Tool 契约 YAML（表空时导入）
-├── skills/                  # Skill YAML（表空时导入）
-├── contracts/               # 写类等契约
 ├── scripts/                 # start.ps1 / start.sh
 ├── data/                    # 运行时密钥与检查点（勿提交）
 └── docs/

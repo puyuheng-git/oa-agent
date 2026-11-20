@@ -1,15 +1,12 @@
 """固定写 Workflow 白名单 Tool：仅 POST，只带 Authorization，不注入 oa query。
 
-不进入 Catalog 自由注册表；规格来自 openapi/travel_expense_write.yaml。
+不进入 Catalog 自由注册表；规格以内联常量维护。
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from pathlib import Path
-
-import yaml
 
 from oa_agent.executor.executor import (
     Identity,
@@ -22,11 +19,8 @@ from oa_agent.executor.executor import (
 )
 from oa_agent.integrations.office_api import DEFAULT_UPSTREAM, OfficeApiClient, OfficeApiError
 from oa_agent.observability.events import RunRecorder
-from oa_agent.settings import REPO_ROOT
 
-WRITE_OPENAPI = REPO_ROOT / "contracts" / "travel_expense_write.yaml"
-
-# 固定 Workflow 可调用的写 Tool 名称（与契约 operationId 一致）
+# 固定 Workflow 可调用的写 Tool 名称
 WRITE_TOOL_WHITELIST = frozenset({
     "create_travel_expense_submit_draft",
     "submit_travel_expense_reimbursement",
@@ -44,6 +38,46 @@ class WriteToolSpec:
     idempotent: bool
     upstream: str = DEFAULT_UPSTREAM
     summary: str = ""
+
+
+_WRITE_SPECS: dict[str, WriteToolSpec] = {
+    "create_travel_expense_submit_draft": WriteToolSpec(
+        name="create_travel_expense_submit_draft",
+        path="/out_attendance/go_out_travel_expense/submit/draft",
+        version="1.0.0",
+        timeout_seconds=15,
+        model_params={
+            "source_expense_id": {
+                "type": "integer", "minimum": 1, "required": True, "label": "行程报销单号",
+            },
+        },
+        result_fields=("draft_id", "source_expense_id", "total_amount", "status", "status_text"),
+        idempotent=False,
+        summary="创建行程报销提交草稿",
+    ),
+    "submit_travel_expense_reimbursement": WriteToolSpec(
+        name="submit_travel_expense_reimbursement",
+        path="/out_attendance/go_out_travel_expense/submit",
+        version="1.0.0",
+        timeout_seconds=20,
+        model_params={
+            "draft_id": {
+                "type": "integer", "minimum": 1, "required": True, "label": "草稿号",
+            },
+        },
+        result_fields=("submit_id", "draft_id", "status", "status_text"),
+        idempotent=True,
+        summary="确认后提交行程报销",
+    ),
+}
+
+
+def _parse_write_openapi() -> dict[str, WriteToolSpec]:
+    """返回写 Tool 规格（历史名保留；现为内联常量，不再读 YAML）。"""
+    missing = WRITE_TOOL_WHITELIST - _WRITE_SPECS.keys()
+    if missing:
+        raise ToolError("WRITE_SPEC_INVALID", f"写操作契约缺少：{', '.join(sorted(missing))}")
+    return dict(_WRITE_SPECS)
 
 
 def _as_read_spec(spec: WriteToolSpec) -> ToolSpec:
@@ -66,49 +100,6 @@ def _as_read_spec(spec: WriteToolSpec) -> ToolSpec:
         summary=spec.summary,
         upstream=spec.upstream,
     )
-
-
-def _parse_write_openapi(path: Path = WRITE_OPENAPI) -> dict[str, WriteToolSpec]:
-    try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        raise ToolError("WRITE_SPEC_INVALID", f"无法解析写操作契约：{type(exc).__name__}") from exc
-    if not isinstance(doc, dict) or not isinstance(doc.get("paths"), dict):
-        raise ToolError("WRITE_SPEC_INVALID", "写操作契约缺少 paths")
-    version = str((doc.get("info") or {}).get("version", "1"))
-    tools: dict[str, WriteToolSpec] = {}
-    for api_path, methods in doc["paths"].items():
-        if not isinstance(methods, dict):
-            continue
-        post = methods.get("post")
-        if not isinstance(post, dict):
-            continue
-        name = post.get("operationId")
-        if not isinstance(name, str) or name not in WRITE_TOOL_WHITELIST:
-            continue
-        xa = post.get("x-agent") or {}
-        if xa.get("enabled") is not True:
-            continue
-        params = xa.get("model_params") or {}
-        result = xa.get("result") or {}
-        fields = tuple(result.get("fields") or ())
-        if not fields:
-            raise ToolError("WRITE_SPEC_INVALID", f"{name} 缺少 result.fields")
-        tools[name] = WriteToolSpec(
-            name=name,
-            path=api_path,
-            version=version,
-            timeout_seconds=float(xa.get("timeout_seconds") or 15),
-            model_params={k: v for k, v in params.items() if isinstance(v, dict)},
-            result_fields=fields,
-            idempotent=bool(xa.get("idempotent")),
-            upstream=str(xa.get("upstream") or DEFAULT_UPSTREAM),
-            summary=str(post.get("summary") or "")[:255],
-        )
-    missing = WRITE_TOOL_WHITELIST - tools.keys()
-    if missing:
-        raise ToolError("WRITE_SPEC_INVALID", f"写操作契约缺少：{', '.join(sorted(missing))}")
-    return tools
 
 
 class WriteToolExecutor:
