@@ -30,7 +30,7 @@ BASIC, DIALOG, MEMORY, OUTPUT, ROUTING = "基础", "对话与角色", "多轮对
 GROUPS = (BASIC, DIALOG, MEMORY, OUTPUT, ROUTING)
 
 ROUTING_MODE_OPTIONS = [
-    {"value": "legacy_prompt", "label": "提示词海选（兼容）"},
+    {"value": "legacy_prompt", "label": "提示词海选（兼容/待迁移）"},
     {"value": "skill_then_tool", "label": "先选 Skill 再选 Tool"},
     {"value": "retrieve_then_tool", "label": "检索召回再精选"},
     {"value": "meta_search", "label": "元工具渐进披露"},
@@ -120,7 +120,7 @@ FIELDS = (
      "help": "本工作流「发布后」绑定的选 Tool 策略，一次运行从头到尾只用这一份，中途改配置不影响已绑定的运行。"
              "写进发布快照后优先于「连接配置 → 运行参数」里的全局默认；草稿里若不写路由相关项，新运行仍可读全局默认。"
              "固定写流程（如报销提交）不走本项。"
-             "模式白话——提示词海选：说明书一次塞给模型（默认兼容）；先选 Skill 再选 Tool：先定业务类再选接口；"
+             "模式白话——提示词海选：说明书一次塞给模型（兼容/待迁移）；先选 Skill 再选 Tool：先定业务类再选接口；"
              "检索召回再精选：先捞候选再精选（Tool 多时更合适）；"
              "元工具渐进披露：先搜能力再拉参数说明（受元工具往返上限约束），不一次塞入全部说明书；"
              "确定性优先：规则/固定串联能定就不调选 Tool 模型；小路由大填参：先定唯一 Tool 再只带一份说明书填参"},
@@ -240,6 +240,20 @@ def diff_content(old: dict | None, new: dict | None) -> list[dict]:
     old, new = old or {}, new or {}
     return [{"key": k, "old": old.get(k), "new": new.get(k)}
             for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
+
+
+# 契约默认：迁移草稿时写入这三项；已发布快照不在这里改
+CONTRACT_MODE = "deterministic_first"
+CONTRACT_FALLBACK = "skill_then_tool"
+
+
+def apply_contract_routing(content: dict | None) -> dict:
+    """复制配置并写入契约默认路由键，不修改入参。"""
+    out = dict(content or {})
+    out["tool_routing_mode"] = CONTRACT_MODE
+    out["deterministic_fallback_mode"] = CONTRACT_FALLBACK
+    out["routing_clarify_on_low_confidence"] = True
+    return out
 
 
 # 工具路由键：未写入发布快照时不从 DEFAULT 填死，运行时叠 runtime 全局默认（热生效）

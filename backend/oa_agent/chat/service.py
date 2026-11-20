@@ -719,7 +719,10 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
                    *,
                    message: str = "") -> travel_query.RunContext:
     runtime_routing = _runtime_routing_defaults(rt)
+    # 对话路径禁止 skills=None：None 会让 RunContext.tools() 暴露全注册表。空列表表示没有可见 Skill。
     skills = visible_skills_for(rt, session.oa, office_token=session.office_token)
+    if skills is None:
+        skills = []
     skill_packs = _load_skill_packs(rt, session.oa)
     forced_skill = resolve_slash_skill_injection(rt, session.oa, message) if message else ""
     cfg = dict(config)
@@ -727,6 +730,8 @@ def _build_context(rt: AppRuntime, rec: RunRecorder, session: ChatSession, confi
     if domain is not None:
         domain_name = domain.name
         skills = multi_agent.filter_skills(skills, domain)
+        if skills is None:
+            skills = []
         if domain.system_extra:
             extra = (cfg.get("chat_instructions") or "").strip()
             cfg["chat_instructions"] = (extra + "\n" + domain.system_extra).strip() if extra else domain.system_extra

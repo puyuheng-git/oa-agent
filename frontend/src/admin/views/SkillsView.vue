@@ -142,6 +142,7 @@ async function edit(skill: SkillItem) {
     description: skill.description || '',
     instructions: skill.instructions || '',
     examplesText: (skill.examples || []).join('\n'),
+    category: skill.category || '',
     tools: skill.tools.map((t) => t.name),
   }
   editReason.value = ''
@@ -654,6 +655,14 @@ onMounted(() => {
         </el-form-item>
         <el-form-item label="示例问题">
           <el-input v-model="form.examplesText" type="textarea" :rows="3" placeholder="每行一条，最多 10 条；显示在员工欢迎页" />
+        </el-form-item>
+        <el-form-item label="种类">
+          <el-select v-model="form.category" clearable placeholder="不限制可绑 Tool 类型" style="width: 100%">
+            <el-option label="OA 查询（office / open_oa_invoke）" value="oa_query" />
+            <el-option label="OA 调用（office / open_oa_invoke）" value="oa_invoke" />
+            <el-option label="外部 MCP（mcp）" value="external_mcp" />
+            <el-option label="平台（builtin）" value="platform" />
+          </el-select>
         </el-form-item>
         <el-form-item label="可用 Tool" required>
           <el-select v-model="form.tools" multiple filterable style="width: 100%" placeholder="选择该 Skill 可调用的 Tool">

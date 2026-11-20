@@ -1,5 +1,6 @@
-"""/v1/admin/routing：调用过程明细与路由统计（只读，ops.run.view）。
+"""/v1/admin/routing：调用过程明细、路由统计，以及配置真相与单项迁移。
 
+统计与真相只读（ops.run.view）。迁移只改工作流草稿的路由键，不改已发布快照。
 不伪造指标；无数据返回空列表 / 暂无数据口径由前端展示。
 事件来自 agent_run_event（routing_* / tool_call_*）；不新表。
 """
@@ -15,20 +16,28 @@ from typing import Any
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
 
-from oa_agent.auth.rbac import AdminCtx, admin_read
-from oa_agent.db.models import Run, RunEvent
+from oa_agent.auth.rbac import AdminCtx, admin_read, admin_read_any, admin_write
+from oa_agent.db.models import AuditLog, ConfigRelease, Run, RunEvent, WorkflowVersion
 from oa_agent.db.types import utcnow
 from oa_agent.errors import AppError
 from oa_agent.observability.run_stats import P95_MIN_SAMPLES
+from oa_agent.runtime.graphs.travel_query import resolve_workflow_id
+from oa_agent.runtime.releases import ReleaseService, apply_contract_routing
 
 router = APIRouter(prefix="/v1/admin/routing", tags=["admin-routing"])
 
 VIEW = "ops.run.view"
+EDIT = "ops.config.edit"
+SETTING_VIEW = "sys.setting.view"
+TRUTH_NOTE = "单次对话以会话绑定 release 快照为准"
+ACK_KEEP_LEGACY = "routing.snapshot.ack_keep_legacy"
 MAX_RANGE = timedelta(days=92)
 DEFAULT_RANGE = timedelta(hours=24)
 STATS_CACHE_SECONDS = 30
-ROUTING_TYPES = ("routing_start", "routing_stage", "routing_decision", "routing_clarify")
+# config_resolved 在 routing_start 之前发出，调用过程时间线需一并展示
+ROUTING_TYPES = ("config_resolved", "routing_start", "routing_stage", "routing_decision", "routing_clarify")
 TOOL_TYPES = ("tool_call_start", "tool_call_end")
 
 _stats_lock = threading.Lock()
@@ -439,3 +448,168 @@ def routing_stats(start: datetime | None = None, end: datetime | None = None,
             cache.clear()
         cache[key] = (time.monotonic(), data)
     return data
+
+
+class ConfirmReasonIn(BaseModel):
+    confirm: bool
+    reason: str = Field(min_length=2, max_length=200)
+
+
+def _global_routing(ctx: AdminCtx) -> tuple[str, str]:
+    cfg = ctx.runtime.settings_svc.effective(ctx.db, "runtime")
+    mode = cfg.get("tool_routing_mode") or "deterministic_first"
+    fallback = cfg.get("deterministic_fallback_mode") or "skill_then_tool"
+    return str(mode), str(fallback)
+
+
+def _acked_release_ids(ctx: AdminCtx) -> set[str]:
+    rows = ctx.db.scalars(
+        sa.select(AuditLog.resource_id).where(
+            AuditLog.tenant_id == ctx.runtime.tenant_id,
+            AuditLog.action == ACK_KEEP_LEGACY,
+            AuditLog.result == "success",
+        )
+    ).all()
+    return {rid for rid in rows if rid}
+
+
+def _content_dict(raw: Any) -> dict:
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _snapshot_mode(content: dict, global_mode: str) -> tuple[str, str | None]:
+    """返回（生效模式, 快照里显式写出的模式）。没写键则回落全局。"""
+    explicit = content.get("tool_routing_mode")
+    if isinstance(explicit, str) and explicit:
+        return explicit, explicit
+    return global_mode, None
+
+
+def _release_svc(ctx: AdminCtx, workflow_id: str) -> ReleaseService:
+    svc: ReleaseService = ctx.runtime.engine.release_provider
+    if resolve_workflow_id(workflow_id) != svc.workflow_id:
+        raise AppError(404, "NOT_FOUND", "Workflow 不存在")
+    return svc
+
+
+def _load_release(ctx: AdminCtx, release_id: str) -> tuple[ConfigRelease, WorkflowVersion]:
+    row = ctx.db.execute(
+        sa.select(ConfigRelease, WorkflowVersion)
+        .join(WorkflowVersion, WorkflowVersion.version_id == ConfigRelease.workflow_version_id)
+        .where(ConfigRelease.tenant_id == ctx.runtime.tenant_id, ConfigRelease.release_id == release_id)
+    ).first()
+    if row is None:
+        raise AppError(404, "NOT_FOUND", "发布不存在")
+    return row[0], row[1]
+
+
+def _draft_view(version: WorkflowVersion) -> dict:
+    return {
+        "version_id": version.version_id,
+        "version_no": version.version_no,
+        "status": version.status,
+        "content": version.content_json,
+        "content_hash": version.content_hash,
+    }
+
+
+def _require_confirm(body: ConfirmReasonIn) -> None:
+    if not body.confirm:
+        raise AppError(422, "VALIDATION_ERROR", "请确认后再操作")
+
+
+@router.get("/config-truth")
+def config_truth(
+    include_acked: bool = False,
+    ctx: AdminCtx = Depends(admin_read_any(VIEW, SETTING_VIEW)),
+):
+    """在用工作流的发布快照与全局默认是否一致；海选清单可滤掉已确认保留的项。"""
+    global_mode, global_fallback = _global_routing(ctx)
+    acked = _acked_release_ids(ctx)
+    rows = ctx.db.execute(
+        sa.select(ConfigRelease, WorkflowVersion)
+        .join(WorkflowVersion, WorkflowVersion.version_id == ConfigRelease.workflow_version_id)
+        .where(ConfigRelease.tenant_id == ctx.runtime.tenant_id)
+        .order_by(ConfigRelease.id.desc())
+    ).all()
+    active: list[dict] = []
+    legacy: list[dict] = []
+    seen: set[str] = set()
+    for release, version in rows:
+        content = _content_dict(version.content_json)
+        mode, explicit = _snapshot_mode(content, global_mode)
+        if release.workflow_id in seen:
+            continue
+        # 每个工作流只取最新一条发布。历史版本已冻结，不进待迁移清单。
+        seen.add(release.workflow_id)
+        active.append({
+            "workflow_id": release.workflow_id,
+            "release_id": release.release_id,
+            "tool_routing_mode": mode,
+            "matches_global": mode == global_mode,
+        })
+        if explicit != "legacy_prompt":
+            continue
+        if release.release_id in acked and not include_acked:
+            continue
+        legacy.append({
+            "workflow_id": release.workflow_id,
+            "release_id": release.release_id,
+            "version_no": release.version_no,
+            "tool_routing_mode": explicit,
+            "matches_global": explicit == global_mode,
+        })
+    return {
+        "global_mode": global_mode,
+        "global_fallback": global_fallback,
+        "active_workflows": active,
+        "legacy_prompt_releases": legacy,
+        "note": TRUTH_NOTE,
+    }
+
+
+@router.post("/releases/{release_id}/migrate-contract")
+def migrate_contract(release_id: str, body: ConfirmReasonIn, ctx: AdminCtx = Depends(admin_write(EDIT))):
+    """把契约默认路由键写入工作流草稿。已发布 content 保持原样，发布由管理员另做。"""
+    _require_confirm(body)
+    with ctx.db.begin():
+        release, version = _load_release(ctx, release_id)
+        svc = _release_svc(ctx, release.workflow_id)
+        draft = svc.draft(ctx.db)
+        # 已有草稿只改路由键；没有草稿则从该发布快照复制，避免改到冻结行
+        base = _content_dict(draft.content_json if draft is not None else version.content_json)
+        before_mode = base.get("tool_routing_mode")
+        content = apply_contract_routing(base)
+        saved = svc.save_draft(ctx.db, content, ctx.user.username)
+        ctx.audit(
+            "routing.snapshot.migrate",
+            "config_release",
+            release.release_id,
+            before={"tool_routing_mode": before_mode, "content_hash": version.content_hash},
+            after={
+                "tool_routing_mode": content["tool_routing_mode"],
+                "deterministic_fallback_mode": content["deterministic_fallback_mode"],
+                "routing_clarify_on_low_confidence": content["routing_clarify_on_low_confidence"],
+                "draft_version_id": saved.version_id,
+                "content_hash": saved.content_hash,
+            },
+            reason=body.reason,
+        )
+    return {"draft_version": _draft_view(saved), "next_step": "publish"}
+
+
+@router.post("/releases/{release_id}/ack-keep-legacy")
+def ack_keep_legacy(release_id: str, body: ConfirmReasonIn, ctx: AdminCtx = Depends(admin_write(EDIT))):
+    """确认这版继续用海选。只记审计，清单默认不再列出；不改快照。"""
+    _require_confirm(body)
+    with ctx.db.begin():
+        release, version = _load_release(ctx, release_id)
+        content = _content_dict(version.content_json)
+        ctx.audit(
+            ACK_KEEP_LEGACY,
+            "config_release",
+            release.release_id,
+            after={"tool_routing_mode": content.get("tool_routing_mode"), "keep_legacy": True},
+            reason=body.reason,
+        )
+    return {"release_id": release_id, "acked": True}

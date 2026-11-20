@@ -49,7 +49,7 @@ ROUTING_KEYS = (
 )
 
 ROUTING_DEFAULTS: dict[str, Any] = {
-    "tool_routing_mode": "legacy_prompt",
+    "tool_routing_mode": "deterministic_first",
     "prompt_topk": 8,
     "routing_skill_method": "rules_then_llm",
     "retrieve_topk": 8,
@@ -164,14 +164,21 @@ def resolve_routing_config(workflow_config: dict | None, runtime_defaults: dict 
             out[key] = rt[key]
         if key in wf and wf[key] is not None:
             out[key] = wf[key]
-    mode = out.get("tool_routing_mode") or "legacy_prompt"
+    mode = out.get("tool_routing_mode") or "deterministic_first"
     if mode not in MODES:
-        mode = "legacy_prompt"
+        mode = "deterministic_first"
     out["tool_routing_mode"] = mode
     fallback = out.get("deterministic_fallback_mode") or "skill_then_tool"
     if fallback == "deterministic_first" or fallback not in MODES:
         fallback = "skill_then_tool"
     out["deterministic_fallback_mode"] = fallback
+    # 只看 tool_routing_mode 写在哪一层；快照里的其它键不算 release
+    if "tool_routing_mode" in wf:
+        out["config_source"] = "release"
+    elif "tool_routing_mode" in rt:
+        out["config_source"] = "global"
+    else:
+        out["config_source"] = "code_default"
     return out
 
 
@@ -202,6 +209,11 @@ def route(
     trace = bool(cfg.get("routing_trace_enabled", True))
     resolved_map = _resolve_rule_tool_map(rule_tool_map)
     t0 = time.perf_counter()
+    _emit(recorder, trace, "config_resolved", metadata={
+        "mode": mode,
+        "source": cfg["config_source"],
+        "fallback_mode": cfg.get("deterministic_fallback_mode"),
+    })
     _emit(recorder, trace, "routing_start", metadata={
         "mode": mode,
         "message_chars": len(message or ""),
@@ -415,7 +427,11 @@ def _deterministic_first(
     hit = _try_deterministic(message, today, tools, rule_tool_map)
     _stage(recorder, trace, "deterministic", duration_ms=int((time.perf_counter() - t0) * 1000),
            candidates=[hit["tool"]] if hit and hit.get("tool") else [],
-           metadata={"hit": bool(hit), "plan": "plan_list_then_detail" if hit and hit.get("steps") else "rules"})
+           metadata={
+               "hit": bool(hit),
+               "plan": "plan_list_then_detail" if hit and hit.get("steps") else "rules",
+               "source": "deterministic",
+           })
     if hit:
         return RoutingDecision(
             mode="deterministic_first",

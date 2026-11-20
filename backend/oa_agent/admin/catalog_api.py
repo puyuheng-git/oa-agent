@@ -26,8 +26,10 @@ from oa_agent.integrations.open_oa import (
 from oa_agent.executor import apipost
 from oa_agent.executor.builtin_catalog import TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_guide
 from oa_agent.executor.catalog import (
-    canonical_hash, compare, normalize_open_oa_catalog_item, normalize_skill, normalize_tool_form,
-    recover_open_oa_invoke_schema, registration_blockers,
+    OrphanToolError, assert_tool_bound_for_enable, canonical_hash, compare,
+    enabled_orphans_after_skill_tools, iter_skill_tool_bindings,
+    normalize_open_oa_catalog_item, normalize_skill, normalize_tool_form,
+    recover_open_oa_invoke_schema, registration_blockers, skill_category_kind_errors,
 )
 # normalize_open_oa_catalog_item：向导 save 复用（由管理员填写的契约组装 Tool schema）
 from oa_agent.executor.contract_test import contract_check, is_activatable
@@ -129,6 +131,8 @@ class SkillIn(ReasonIn):
     instructions: str = Field("", max_length=2000)
     examples: list[str] = Field(default_factory=list, max_length=10)
     tools: list[str] = Field(min_length=1, max_length=20)
+    # 空串不限制 Tool.kind；写入 content_json.category
+    category: str = Field(default="", max_length=32)
 
 
 class VisibilityRuleIn(BaseModel):
@@ -349,6 +353,26 @@ def list_tools(kind: Literal["office", "open_oa_invoke", "builtin", "mcp"] | Non
     if ups and default_key not in {u["key"] for u in ups}:
         default_key = ups[0]["key"]
     return {"items": [_tool_view(ctx, t) for t in tools], "upstreams": ups, "default_upstream_key": default_key}
+
+
+@tools_router.get("/orphans")
+def list_orphan_tools(ctx: AdminCtx = Depends(admin_read(TOOL))):
+    """未出现在任何 Skill 当前 tools 里的非 builtin Tool。
+
+    必须注册在 /{name} 之前，否则 orphans 会被当成 Tool 名。
+    """
+    bindings = iter_skill_tool_bindings(ctx.db, ctx.runtime.tenant_id)
+    tools = ctx.db.scalars(
+        sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id).order_by(Tool.name)
+    ).all()
+    items = []
+    for tool in tools:
+        kind = tool.kind or "office"
+        # builtin 允许不绑 Skill；已有引用的业务 Tool 也不是孤儿
+        if kind == "builtin" or tool.name in bindings:
+            continue
+        items.append({"name": tool.name, "kind": kind, "enabled": bool(tool.enabled)})
+    return {"items": items}
 
 
 @tools_router.get("/{name}")
@@ -762,8 +786,19 @@ def delete_tool(name: str, body: ReasonIn, ctx: AdminCtx = Depends(admin_write(T
 def _toggle(ctx: AdminCtx, name: str, enabled: bool, reason: str) -> dict:
     with ctx.db.begin():
         tool = _get_tool(ctx, name)
+        # 启用非 builtin 前必须已有 Skill 引用；停用不设这道闸
+        if enabled:
+            try:
+                assert_tool_bound_for_enable(
+                    ctx.db, ctx.runtime.tenant_id, tool.name, tool.kind or "office",
+                )
+            except OrphanToolError as exc:
+                raise AppError(400, "TOOL_UNBOUND", str(exc)) from None
         before = tool.enabled
         tool.enabled, tool.updated_by = enabled, ctx.user.username
+        # 绑定发生在停用期间时，启用后重算 Skill 校验，否则功能仍不可用
+        if enabled:
+            ctx.runtime.engine.catalog.revalidate_skills(ctx.db)
         ctx.audit("tool.enable" if enabled else "tool.disable", "tool", name, before={"enabled": before},
                   after={"enabled": enabled}, reason=reason)
     _reload(ctx)
@@ -897,6 +932,7 @@ def _skill_view(ctx: AdminCtx, skill: Skill) -> dict:
         "validation_errors": skill.validation_errors or [],
         "current_version_no": current.version_no if current else None,
         "workflow": (current.content_json or {}).get("workflow") if current else None,
+        "category": (current.content_json or {}).get("category") or "" if current else "",
         "description": (current.content_json or {}).get("description") if current else None,
         "instructions": (current.content_json or {}).get("instructions") or "" if current else "",
         "examples": (current.content_json or {}).get("examples") or [] if current else [],
@@ -1000,6 +1036,24 @@ def _save_skill(ctx: AdminCtx, body: SkillIn, create: bool) -> dict:
         unknown = [t for t in content["tools"] if not engine.catalog.exists(ctx.db, Tool, t)]
         if unknown:
             raise AppError(422, "VALIDATION_ERROR", f"Tool 不存在：{', '.join(unknown)}")
+        # 非空种类按已入库 Tool.kind 收紧；空种类不查
+        if content.get("category"):
+            kind_rows = ctx.db.scalars(
+                sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id, Tool.name.in_(list(content["tools"])))
+            ).all()
+            kind_by_name = {row.name: (row.kind or "office") for row in kind_rows}
+            pairs = [(name, kind_by_name[name]) for name in content["tools"] if name in kind_by_name]
+            kind_errors = skill_category_kind_errors(content["category"], pairs)
+            if kind_errors:
+                raise AppError(422, "VALIDATION_ERROR", "；".join(kind_errors))
+        # 拿掉某 Tool 后若再无 Skill 引用、且该 Tool 仍启用，先让管理员改绑或禁用
+        if not create:
+            orphaned = enabled_orphans_after_skill_tools(
+                ctx.db, ctx.runtime.tenant_id, content["name"], list(content["tools"]),
+            )
+            if orphaned:
+                names = "、".join(orphaned)
+                raise AppError(400, "TOOL_WOULD_BE_ORPHAN", f"请先改绑或先禁用 Tool：{names}")
         skill = engine.catalog.save_skill(ctx.db, content, ctx.user.username)
         ctx.audit("skill.create" if create else "skill.update", "skill", skill.name,
                   after={"result": skill.last_sync_result, "tools": content["tools"]}, reason=body.reason)
