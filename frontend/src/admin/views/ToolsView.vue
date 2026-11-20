@@ -40,8 +40,6 @@ const KIND_LABEL: Record<ToolKind, string> = {
 }
 const loading = ref(false)
 const loadError = ref('')
-const syncing = ref(false)
-const report = ref<{ files: { file: string; ok: boolean; errors: string[] }[]; tools: any[] } | null>(null)
 
 const drawer = ref(false)
 const detail = ref<ToolDetail | null>(null)
@@ -65,18 +63,6 @@ async function load() {
     loadError.value = errorMessage(e)
   } finally {
     loading.value = false
-  }
-}
-
-async function sync() {
-  syncing.value = true
-  try {
-    report.value = await http.post('/v1/admin/tools/sync')
-    await load()
-  } catch (e) {
-    ElMessage.error(errorMessage(e))
-  } finally {
-    syncing.value = false
   }
 }
 
@@ -561,7 +547,8 @@ async function wizardProbe() {
     wizardProbeOk.value = true
     wizardProbePreview.value = JSON.stringify(r.data, null, 2).slice(0, 4000)
     // 用返回样例自动补齐返回字段（保留已有 field 的手改 label）
-    const merged = mergeProbeResultFields(r.data, wizard.value.resultRows, wizard.value.resultKind)
+    const resultKind = wizard.value.resultKind === 'object' ? 'object' : 'list'
+    const merged = mergeProbeResultFields(r.data, wizard.value.resultRows, resultKind)
     if (merged.length) {
       wizard.value.resultRows = merged
       const payload = r.data
@@ -681,7 +668,7 @@ async function edit(name: string) {
       return
     }
     if (!d.current_schema) {
-      ElMessage.warning('该 Tool 没有有效版本，无法编辑（可尝试「从文件导入」或「接入业务接口」）')
+      ElMessage.warning('该 Tool 没有有效版本，无法编辑（可尝试「接入业务接口」或「从 Apipost 导入」）')
       return
     }
     editing.value = true
@@ -744,7 +731,7 @@ async function removeTool(row: ToolItem) {
   if (!reasonText) return
   try {
     await ElMessageBox.confirm(
-      `确定删除「${row.name}」？依赖它的 Skill 将变为不可用。内置 Tool 删除后不会在「从文件导入」时自动恢复。`,
+      `确定删除「${row.name}」？依赖它的 Skill 将变为不可用。内置 Tool 删除后不会自动恢复。`,
       '删除 Tool',
       { type: 'warning' },
     )
@@ -815,9 +802,6 @@ onMounted(load)
       <el-tooltip content="填写服务路径，点选 Export 公开方法，表单配置后测试入库">
         <el-button @click="openExportWizard">接入业务接口</el-button>
       </el-tooltip>
-      <el-tooltip content="从仓库 openapi/*.yaml 批量导入；同名 Tool 会被文件中的定义覆盖（按版本规则）">
-        <el-button :loading="syncing" @click="sync">从文件导入</el-button>
-      </el-tooltip>
       <el-button @click="load">刷新</el-button>
       <el-radio-group v-model="kindFilter" style="margin-left: 12px" @change="load">
         <el-radio-button value="">全部</el-radio-button>
@@ -827,15 +811,6 @@ onMounted(load)
         <el-radio-button value="mcp">MCP</el-radio-button>
       </el-radio-group>
     </div>
-
-    <el-alert v-if="report" type="success" :closable="true" style="margin-bottom: 12px" @close="report = null">
-      <template #title>导入完成</template>
-      <div v-for="f in report.files" :key="f.file">
-        {{ f.file }}：<b :style="{ color: f.ok ? 'var(--tech-success)' : 'var(--tech-danger)' }">{{ f.ok ? '解析成功' : '解析失败（已保留旧版本）' }}</b>
-        <div v-for="e in f.errors" :key="e" style="color: var(--tech-danger)">· {{ e }}</div>
-      </div>
-      <div v-for="t in report.tools" :key="t.name">{{ t.name }}：{{ syncTag(t.result).label }}<template v-if="t.version_no"> v{{ t.version_no }}</template></div>
-    </el-alert>
 
     <el-result v-if="loadError" icon="error" :title="loadError" />
     <el-table v-else v-loading="loading" :data="items" empty-text="暂无数据">

@@ -1,7 +1,7 @@
-"""/v1/admin/tools"v1/admin/skills：新"编辑、从文件导入、启停、版本与 diff（设"§9 ops.tool.manage / ops.skill.manage）"
+"""/v1/admin/tools、/v1/admin/skills：新建/编辑、启停、版本与 diff（§9 ops.tool.manage / ops.skill.manage）。
 
-变更提交后立即重载运行时注册表（停用即拒绝调用）；全部写操作带审计，审计与变更同事务"
-后台编辑与文件导入走同一套校验与版本规则：兼容变更立即生效，不兼容变更存为待激活版本"
+变更提交后立即重载运行时注册表（停用即拒绝调用）；全部写操作带审计，审计与变更同事务。
+兼容变更立即生效，不兼容变更存为待激活版本。
 """
 
 from __future__ import annotations
@@ -389,20 +389,6 @@ def tool_diff(name: str, from_no: int, to_no: int, ctx: AdminCtx = Depends(admin
     a, b = _tool_version(ctx, tool, from_no), _tool_version(ctx, tool, to_no)
     level, diff = compare(a.schema_json, b.schema_json)
     return {"from": from_no, "to": to_no, "compat_level": level, "changes": diff}
-
-
-@tools_router.post("/sync")
-def sync_tools(ctx: AdminCtx = Depends(admin_write(TOOL))):
-    engine = ctx.runtime.engine
-    with ctx.db.begin():
-        report = engine.catalog.sync_tools(ctx.db, ctx.user.username)
-        ctx.db.flush()
-        engine.catalog.revalidate_skills(ctx.db)
-        ctx.audit("tool.sync", "tool", "*", after={
-            "files": [{"file": f["file"], "ok": f["ok"]} for f in report["files"]],
-            "tools": report["tools"]})
-    engine.reload_catalog()
-    return report
 
 
 def _upstream_configured(ctx: AdminCtx, upstream: str) -> bool:
@@ -920,36 +906,6 @@ def _skill_view(ctx: AdminCtx, skill: Skill) -> dict:
     }
 
 
-@skills_router.get("")
-def list_skills(ctx: AdminCtx = Depends(admin_read(SKILL))):
-    skills = ctx.db.scalars(sa.select(Skill).where(Skill.tenant_id == ctx.runtime.tenant_id)
-                            .order_by(Skill.name)).all()
-    return {"items": [_skill_view(ctx, s) for s in skills]}
-
-
-@skills_router.get("/{name}")
-def skill_detail(name: str, ctx: AdminCtx = Depends(admin_read(SKILL))):
-    skill = _get_skill(ctx, name)
-    out = _skill_view(ctx, skill)
-    versions = ctx.db.scalars(sa.select(SkillVersion).where(SkillVersion.skill_id == skill.id)
-                              .order_by(SkillVersion.version_no.desc())).all()
-    out["versions"] = [{"version_no": v.version_no, "spec_version": v.spec_version, "content": v.content_json,
-                        "content_hash": v.content_hash[:16], "created_by": v.created_by, "created_at": v.created_at}
-                       for v in versions]
-    return out
-
-
-@skills_router.post("/sync")
-def sync_skills(ctx: AdminCtx = Depends(admin_write(SKILL))):
-    engine = ctx.runtime.engine
-    with ctx.db.begin():
-        report = engine.catalog.sync_skills(ctx.db, ctx.user.username)
-        ctx.audit("skill.sync", "skill", "*", after={
-            "files": [{"file": f["file"], "ok": f["ok"]} for f in report["files"]], "skills": report["skills"]})
-    engine.reload_catalog()
-    return report
-
-
 class SkillDraftFromToolsIn(BaseModel):
     """先选 Tool，再让小模型根据契约生成 Skill 表单草稿。"""
 
@@ -957,16 +913,32 @@ class SkillDraftFromToolsIn(BaseModel):
 
 
 def _draft_skill_model(ctx: AdminCtx):
-    """优先 text/small；没有小模型则回落默认模型。"""
+    """优先 text/small；没有小模型则回落默认模型。复用请求 session，避免嵌套连接。"""
     rt = ctx.runtime
     try:
-        with rt.session() as db:
-            cfg = resolve_model(db, rt.vault, rt.tenant_id, capability="text", model_tier="small")
-            if cfg is None:
-                cfg = resolve_model(db, rt.vault, rt.tenant_id)
-    except SQLAlchemyError:
+        # 读路径可能留下隐式事务；解析模型前先干净回滚
+        ctx.db.rollback()
+        cfg = resolve_model(ctx.db, rt.vault, rt.tenant_id, capability="text", model_tier="small")
+        if cfg is None:
+            cfg = resolve_model(ctx.db, rt.vault, rt.tenant_id)
+        ctx.db.rollback()
+    except Exception:  # noqa: BLE001 — vault/路由异常统一视为未配置，由上层给可操作提示
+        log.exception("resolve draft skill model failed")
         return None
-    return build_chat_model(cfg) if cfg else None
+    if cfg is None:
+        return None
+    try:
+        return build_chat_model(cfg)
+    except Exception:  # noqa: BLE001 — 客户端构造失败也按未配置/不可用处理
+        log.exception("build_chat_model for skill draft failed")
+        return None
+
+
+@skills_router.get("")
+def list_skills(ctx: AdminCtx = Depends(admin_read(SKILL))):
+    skills = ctx.db.scalars(sa.select(Skill).where(Skill.tenant_id == ctx.runtime.tenant_id)
+                            .order_by(Skill.name)).all()
+    return {"items": [_skill_view(ctx, s) for s in skills]}
 
 
 @skills_router.post("/draft-from-tools")
@@ -979,7 +951,9 @@ def draft_skill_from_tools_api(body: SkillDraftFromToolsIn, ctx: AdminCtx = Depe
     for name in names:
         tool = _get_tool(ctx, name)
         current = ctx.db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
-        schema = dict(current.schema_json or {}) if current else {}
+        # schema_json 可能非 dict（坏数据）；兜底成空契约再补 name/summary
+        raw = current.schema_json if current else None
+        schema = dict(raw) if isinstance(raw, dict) else {}
         schema.setdefault("name", tool.name)
         if not schema.get("summary"):
             schema["summary"] = tool.summary or tool.name
@@ -991,10 +965,25 @@ def draft_skill_from_tools_api(body: SkillDraftFromToolsIn, ctx: AdminCtx = Depe
         draft = draft_skill_from_tools(model, schemas)
     except ModelCallError as exc:
         raise AppError(422, "LLM_FAILED", f"模型生成失败：{exc}") from None
+    except Exception as exc:  # noqa: BLE001 — 契约畸形等不得冒成 INTERNAL_ERROR
+        log.exception("draft_skill_from_tools failed")
+        raise AppError(422, "LLM_FAILED", f"模型生成失败：{type(exc).__name__}: {exc}") from None
     with ctx.db.begin():
         ctx.audit("skill.draft_from_tools", "skill", draft.get("name") or "*", after={
             "tools": names, "draft_name": draft.get("name")})
     return {"draft": draft}
+
+
+@skills_router.get("/{name}")
+def skill_detail(name: str, ctx: AdminCtx = Depends(admin_read(SKILL))):
+    skill = _get_skill(ctx, name)
+    out = _skill_view(ctx, skill)
+    versions = ctx.db.scalars(sa.select(SkillVersion).where(SkillVersion.skill_id == skill.id)
+                              .order_by(SkillVersion.version_no.desc())).all()
+    out["versions"] = [{"version_no": v.version_no, "spec_version": v.spec_version, "content": v.content_json,
+                        "content_hash": v.content_hash[:16], "created_by": v.created_by, "created_at": v.created_at}
+                       for v in versions]
+    return out
 
 
 def _save_skill(ctx: AdminCtx, body: SkillIn, create: bool) -> dict:
