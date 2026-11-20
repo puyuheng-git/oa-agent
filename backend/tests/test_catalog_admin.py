@@ -73,11 +73,16 @@ def fake_model(monkeypatch, reply: dict, prompts: list):
 def test_admin_created_tool_is_used_without_code_change(admin, chat, office, monkeypatch):
     r = admin.post("/v1/admin/tools", json=LEAVE_TOOL)
     assert r.status_code == 200, r.text
-    assert r.json()["result"] == "initial" and r.json()["tool"]["registered"] is True
+    assert r.json()["result"] == "initial" and r.json()["tool"]["enabled"] is False
+    assert r.json()["tool"]["registered"] is False
     assert r.json()["tool"]["source_file"] == "admin"
     r = admin.post("/v1/admin/skills", json=LEAVE_SKILL)
     assert r.status_code == 200, r.text
-    assert r.json()["validation_status"] == "valid" and r.json()["examples"] == LEAVE_SKILL["examples"]
+    assert r.json()["examples"] == LEAVE_SKILL["examples"]
+    enabled = admin.post("/v1/admin/tools/query_my_leave_list/enable", json={"reason": "绑定后启用"})
+    assert enabled.status_code == 200 and enabled.json()["enabled"] is True
+    skill = admin.get("/v1/admin/skills/leave_query")
+    assert skill.status_code == 200 and skill.json()["validation_status"] == "valid"
 
     route = office.get(LEAVE_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {
         "list": [{"id": 9, "start_date": "2026-03-02", "days": 2, "leave_type_text": "年假", "secret": "x"}],
@@ -139,6 +144,9 @@ def test_tool_edit_follows_version_rules(admin):
     _ensure_office_upstream(admin)
     created = admin.post("/v1/admin/tools", json=LEAVE_TOOL)
     assert created.status_code == 200, created.text
+    assert created.json()["tool"]["enabled"] is False
+    assert admin.post("/v1/admin/skills", json=LEAVE_SKILL).status_code == 200
+    assert admin.post("/v1/admin/tools/query_my_leave_list/enable", json={"reason": "绑定后启用"}).status_code == 200
     relabel = {**LEAVE_TOOL, "result": {**LEAVE_TOOL["result"], "labels": {"days": "请假天数"}}, "reason": "改名称"}
     r = admin.put("/v1/admin/tools/query_my_leave_list", json=relabel)
     assert r.status_code == 200 and r.json()["result"] == "compatible" and r.json()["tool"]["current_version_no"] == 2
@@ -151,7 +159,7 @@ def test_tool_edit_follows_version_rules(admin):
     assert r.json()["result"] == "breaking_pending" and r.json()["tool"]["pending_version_no"] == 3
     assert "leave_type" in runtime(admin.client).engine.registry.get("query_my_leave_list").model_params
 
-    skill = admin.post("/v1/admin/skills", json=LEAVE_SKILL).json()
+    skill = admin.get("/v1/admin/skills/leave_query").json()
     assert skill["current_version_no"] == 1
     r = admin.put("/v1/admin/skills/leave_query", json={**LEAVE_SKILL, "examples": ["查请假"], "reason": "改示例"})
     assert r.status_code == 200 and r.json()["current_version_no"] == 2 and r.json()["examples"] == ["查请假"]

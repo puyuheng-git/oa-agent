@@ -129,9 +129,40 @@ class LlmModel(Base):
     display_name: Mapped[str] = mapped_column(sa.String(128), default="")
     params_json: Mapped[dict] = mapped_column(sa.JSON, default=dict)
     purpose_tags: Mapped[list] = mapped_column(sa.JSON, default=list)
+    capabilities: Mapped[list] = mapped_column(sa.JSON, default=lambda: ["text"])
+    model_tier: Mapped[str] = mapped_column(sa.String(16), default="large")
     enabled: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     updated_by: Mapped[str] = mapped_column(sa.String(64), default="")
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+
+class LlmRoute(Base):
+    __tablename__ = "agent_llm_route"
+    __table_args__ = (
+        sa.UniqueConstraint("tenant_id", "capability", "model_tier", name="uk_llm_route_cap_tier"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(sa.String(32), default=DEFAULT_TENANT)
+    capability: Mapped[str] = mapped_column(sa.String(32))
+    model_tier: Mapped[str] = mapped_column(sa.String(16))
+    model_ids: Mapped[list] = mapped_column(sa.JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    updated_by: Mapped[str] = mapped_column(sa.String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+
+class LlmDefaults(Base):
+    __tablename__ = "agent_llm_defaults"
+    __table_args__ = (sa.UniqueConstraint("tenant_id", name="uk_llm_defaults_tenant"),)
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(sa.String(32), default=DEFAULT_TENANT)
+    global_default_model_id: Mapped[int | None] = mapped_column(BigIntPK, nullable=True)
+    max_failover: Mapped[int] = mapped_column(sa.Integer, default=3)
+    updated_by: Mapped[str] = mapped_column(sa.String(64), default="")
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
 
@@ -408,6 +439,8 @@ class McpServer(Base):
     name: Mapped[str] = mapped_column(sa.String(64))
     display_name: Mapped[str] = mapped_column(sa.String(128), default="")
     enabled: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # 管理员确认后才对员工放开该连接下的 MCP Tool；同步阶段保持 False
+    employee_open: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
     transport: Mapped[str] = mapped_column(sa.String(16))  # stdio | sse | http
     command: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
     args_json: Mapped[Any] = mapped_column(sa.JSON, nullable=True)

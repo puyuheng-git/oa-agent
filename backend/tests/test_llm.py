@@ -34,6 +34,7 @@ def test_provider_and_model_connection_tests(admin):
     m = admin.post("/v1/admin/llm/models", json={
         "provider_id": p["id"], "model_name": "deepseek-chat", "temperature": 0.2, "purpose_tags": ["intent"]}).json()
     assert m["temperature"] == 0.2 and m["purpose_tags"] == ["intent"]
+    assert m["capabilities"] == ["text"] and m["model_tier"] == "large"
 
     respx.post("https://llm.example.com/v1/chat/completions").mock(
         return_value=httpx.Response(200, json={"usage": {"prompt_tokens": 3, "completion_tokens": 1}}))

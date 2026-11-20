@@ -407,3 +407,135 @@ def test_sync_and_test_404_permission_and_remote_allowlist(admin, installed):
     assert admin.post(URL, json=http_body()).status_code == 200
     set_allowlist(admin, ["https://other.example.internal"])
     assert admin.post(f"{URL}/demo_http/test").status_code == 422
+
+
+# ---------------- Task 6：Server Skill + 确认开放 ----------------
+
+def _skill_binding(installed, server_name: str) -> dict:
+    from oa_agent.db.models import McpServer, Skill, SkillVersion
+
+    rt = installed.app.state.runtime
+    with rt.session() as db:
+        server = db.scalar(sa.select(McpServer).where(McpServer.name == server_name))
+        assert server is not None
+        skill = db.scalar(sa.select(Skill).where(Skill.tenant_id == rt.tenant_id,
+                                                 Skill.source_file == f"mcp:server:{server.id}"))
+        content = {}
+        if skill is not None and skill.current_version_id:
+            content = db.get(SkillVersion, skill.current_version_id).content_json or {}
+        return {
+            "server_id": server.id,
+            "employee_open": server.employee_open,
+            "skill_name": None if skill is None else skill.name,
+            "source_file": None if skill is None else skill.source_file,
+            "category": content.get("category"),
+            "tools": list(content.get("tools") or []),
+        }
+
+
+def test_sync_binds_server_skill_but_tools_stay_out_of_runtime(admin, installed):
+    """同步后工具名进入 Server Skill；employee_open 前 enabled=false，不进运行时、员工不可见。"""
+    from oa_agent.chat.service import visible_skills_for
+
+    _fake(installed)
+    assert admin.post(URL, json=stdio_body(name="ext-mcp", tool_prefix="ext_")).status_code == 200
+    created = admin.get(f"{URL}/ext-mcp").json()
+    assert created["employee_open"] is False
+    r = admin.post(f"{URL}/ext-mcp/sync")
+    assert r.status_code == 200, r.text
+    bound = _skill_binding(installed, "ext-mcp")
+    assert bound["skill_name"] == "mcp_ext_mcp"
+    assert bound["source_file"] == f"mcp:server:{bound['server_id']}"
+    assert bound["category"] == "external_mcp"
+    assert sorted(bound["tools"]) == ["ext_add", "ext_echo"]
+    assert bound["employee_open"] is False
+    assert [(n, e) for n, _, e, _ in _tools(installed)] == [("ext_add", False), ("ext_echo", False)]
+    # 再同步一次：工具列表不重复，仍停用
+    again = admin.post(f"{URL}/ext-mcp/sync")
+    assert again.status_code == 200 and again.json()["created"] == []
+    assert sorted(_skill_binding(installed, "ext-mcp")["tools"]) == ["ext_add", "ext_echo"]
+    rt = installed.app.state.runtime
+    rt.engine.reload_catalog()
+    assert "ext_echo" not in set(rt.engine.registry.names())
+    assert "mcp_ext_mcp" not in {s.name for s in visible_skills_for(rt, "alice")}
+
+
+def test_open_to_employees_enables_tools_and_audits(admin, installed):
+    """确认开放：employee_open 与 Tool.enabled 同时打开，工具进入运行时，员工可见。"""
+    from oa_agent.chat.service import skill_menu, visible_skills_for
+
+    _fake(installed)
+    assert admin.post(URL, json=stdio_body(name="ext-mcp", tool_prefix="ext_")).status_code == 200
+    assert admin.post(f"{URL}/ext-mcp/sync").status_code == 200
+    r = admin.post(f"{URL}/ext-mcp/open-to-employees")
+    assert r.status_code == 200, r.text
+    assert r.json()["employee_open"] is True
+    assert dict((n, e) for n, _, e, _ in _tools(installed)) == {"ext_add": True, "ext_echo": True}
+    assert _skill_binding(installed, "ext-mcp")["employee_open"] is True
+    rt = installed.app.state.runtime
+    rt.engine.reload_catalog()
+    assert {"ext_add", "ext_echo"} <= set(rt.engine.registry.names())
+    visible = [s for s in visible_skills_for(rt, "alice") if s.name == "mcp_ext_mcp"]
+    assert visible
+    menu = [s for s in skill_menu(rt, oa="alice") if s["name"] == "mcp_ext_mcp"]
+    assert menu
+    surface = f"{menu[0]['display_name']}\n{menu[0]['description']}"
+    assert "mcp" not in surface.lower()
+    assert menu[0]["display_name"].startswith("外部连接：")
+    visible_text = f"{visible[0].display_name}\n{visible[0].description}"
+    assert "mcp" not in visible_text.lower()
+    assert "mcp_server.open_employees" in {a["action"] for a in audit_rows(admin)}
+
+
+def test_open_still_respects_skill_visibility_deny(admin, installed):
+    """开放只改启用开关；可见性拒绝规则仍把该 Skill 挡在员工候选之外。"""
+    from oa_agent.chat.service import visible_skills_for
+    from oa_agent.db.models import Skill, SkillVisibilityRule
+
+    _fake(installed)
+    assert admin.post(URL, json=stdio_body(name="ext-mcp", tool_prefix="ext_")).status_code == 200
+    assert admin.post(f"{URL}/ext-mcp/sync").status_code == 200
+    rt = installed.app.state.runtime
+    with rt.session() as db, db.begin():
+        skill = db.scalar(sa.select(Skill).where(Skill.tenant_id == rt.tenant_id, Skill.name == "mcp_ext_mcp"))
+        assert skill is not None
+        # 有规则后默认不再全员可见：allow all，再 deny alice
+        db.add(SkillVisibilityRule(
+            tenant_id=rt.tenant_id, skill_id=skill.id, effect="allow",
+            principal_type="all", principal_value="", created_by="tester",
+        ))
+        db.add(SkillVisibilityRule(
+            tenant_id=rt.tenant_id, skill_id=skill.id, effect="deny",
+            principal_type="oa", principal_value="alice", created_by="tester",
+        ))
+    assert admin.post(f"{URL}/ext-mcp/open-to-employees").status_code == 200
+    rt.engine.reload_catalog()
+    assert "mcp_ext_mcp" not in {s.name for s in visible_skills_for(rt, "alice")}
+    assert "mcp_ext_mcp" in {s.name for s in visible_skills_for(rt, "bob")}
+
+
+def test_close_to_employees_disables_tools_and_audits(admin, installed):
+    _fake(installed)
+    assert admin.post(URL, json=stdio_body(name="ext-mcp", tool_prefix="ext_")).status_code == 200
+    assert admin.post(f"{URL}/ext-mcp/sync").status_code == 200
+    assert admin.post(f"{URL}/ext-mcp/open-to-employees").status_code == 200
+    r = admin.post(f"{URL}/ext-mcp/close-to-employees")
+    assert r.status_code == 200, r.text
+    assert r.json()["employee_open"] is False
+    assert all(enabled is False for _, _, enabled, _ in _tools(installed))
+    rt = installed.app.state.runtime
+    rt.engine.reload_catalog()
+    assert "ext_echo" not in set(rt.engine.registry.names())
+    assert "mcp_server.close_employees" in {a["action"] for a in audit_rows(admin)}
+
+
+def test_open_and_close_require_permission_and_existing_server(admin, installed):
+    _fake(installed)
+    assert admin.post(f"{URL}/ghost/open-to-employees").status_code == 404
+    assert admin.post(f"{URL}/ghost/close-to-employees").status_code == 404
+    role = _role(admin, "tool_only3", ["ops.tool.manage"])
+    _user(admin, "toolonly3", [role["id"]])
+    other = login(TestClient(installed.app), "toolonly3", VIEWER_PASS)
+    assert admin.post(URL, json=stdio_body(name="ext-mcp")).status_code == 200
+    assert other.post(f"{URL}/ext-mcp/open-to-employees").status_code == 403
+    assert other.post(f"{URL}/ext-mcp/close-to-employees").status_code == 403

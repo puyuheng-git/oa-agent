@@ -18,12 +18,12 @@ from sqlalchemy.exc import IntegrityError
 
 from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
 from oa_agent.config.crypto import mask_display
-from oa_agent.db.models import McpServer, Tool
+from oa_agent.db.models import McpServer, Skill, SkillVersion, Tool
 from oa_agent.db.types import utcnow
 from oa_agent.errors import AppError
 from oa_agent.executor.executor import ToolError
 from oa_agent.executor.mcp_runtime import SYNC_ERROR, SYNC_OK, build_config, get_mcp_client
-from oa_agent.executor.mcp_sync import sync_server_tools
+from oa_agent.executor.mcp_sync import server_skill_source, sync_server_tools
 from oa_agent.observability.redact import redact
 
 router = APIRouter(prefix="/v1/admin/mcp-servers", tags=["admin-mcp-servers"])
@@ -67,6 +67,7 @@ def _secret_view(ctx: AdminCtx, name: str, kind: str) -> dict:
 def _view(ctx: AdminCtx, row: McpServer) -> dict:
     return {
         "name": row.name, "display_name": row.display_name, "enabled": row.enabled,
+        "employee_open": bool(row.employee_open),
         "transport": row.transport, "command": row.command, "args": list(row.args_json or []), "url": row.url,
         "tool_prefix": row.tool_prefix, "timeout_seconds": row.timeout_seconds,
         "headers_set": _secret_view(ctx, row.name, "headers"), "env_set": _secret_view(ctx, row.name, "env"),
@@ -293,7 +294,7 @@ def test_server(name: str, ctx: AdminCtx = Depends(admin_write(PERM))):
 
 @router.post("/{name}/sync")
 def sync_server(name: str, ctx: AdminCtx = Depends(admin_write(PERM))):
-    """tools/list → upsert kind=mcp Tool（新增默认停用，须管理员启用并绑 Skill 后才对员工可用）。"""
+    """tools/list → upsert kind=mcp Tool（新增默认停用，并挂到该连接的 Server Skill）。"""
     server_id, cfg = _probe(ctx, name)
     tools, error = _fetch_tools(ctx, cfg)
     with ctx.db.begin():
@@ -308,6 +309,56 @@ def sync_server(name: str, ctx: AdminCtx = Depends(admin_write(PERM))):
         ctx.audit("mcp_server.sync", "mcp_server", name,
                   after={"ok": True, "count": len(tools), **{k: len(v) for k, v in report.items()}})
     return {"ok": True, "count": len(tools), "error": None, **report}
+
+
+def _server_skill(ctx: AdminCtx, row: McpServer) -> Skill | None:
+    return ctx.db.scalar(sa.select(Skill).where(Skill.tenant_id == ctx.runtime.tenant_id,
+                                                Skill.source_file == server_skill_source(row.id)))
+
+
+def _live_tool_names(ctx: AdminCtx, skill: Skill | None) -> set[str]:
+    if skill is None or not skill.current_version_id:
+        return set()
+    version = ctx.db.get(SkillVersion, skill.current_version_id)
+    tools = (version.content_json or {}).get("tools") if version is not None else None
+    return {name for name in (tools or []) if isinstance(name, str)}
+
+
+def _set_employee_open(ctx: AdminCtx, name: str, opened: bool) -> dict:
+    """打开或收回员工可用开关：只改本连接下仍在 Server Skill 里的 MCP Tool，不改可见性规则。"""
+    with ctx.db.begin():
+        row = _get(ctx, name)
+        row.employee_open = opened
+        live = _live_tool_names(ctx, _server_skill(ctx, row))
+        tools = ctx.db.scalars(sa.select(Tool).where(
+            Tool.tenant_id == ctx.runtime.tenant_id, Tool.kind == "mcp", Tool.mcp_server_id == row.id,
+        )).all()
+        touched: list[str] = []
+        for tool in tools:
+            # 开放只启用仍挂在 Skill 上、且远端未标记消失的工具；收回则全部停用
+            if opened and ((live and tool.name not in live) or tool.last_sync_result == "removed"):
+                continue
+            tool.enabled = opened
+            tool.updated_by = ctx.user.username
+            touched.append(tool.name)
+        ctx.db.flush()
+        ctx.runtime.engine.catalog.revalidate_skills(ctx.db)
+        action = "mcp_server.open_employees" if opened else "mcp_server.close_employees"
+        ctx.audit(action, "mcp_server", name, after={"employee_open": opened, "tools": sorted(touched)})
+    ctx.runtime.engine.reload_catalog()
+    return _view(ctx, _get(ctx, name))
+
+
+@router.post("/{name}/open-to-employees")
+def open_to_employees(name: str, ctx: AdminCtx = Depends(admin_write(PERM))):
+    """确认对员工开放：employee_open=True，并启用该连接 Skill 上的 MCP Tool。"""
+    return _set_employee_open(ctx, name, True)
+
+
+@router.post("/{name}/close-to-employees")
+def close_to_employees(name: str, ctx: AdminCtx = Depends(admin_write(PERM))):
+    """收回员工开放：employee_open=False，并停用该连接下的 MCP Tool。"""
+    return _set_employee_open(ctx, name, False)
 
 
 @router.delete("/{name}")

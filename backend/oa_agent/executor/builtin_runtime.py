@@ -169,8 +169,12 @@ class BuiltinRuntime:
         self._handlers: dict[str, Callable[[ToolSpec, dict, Identity], dict]] = {
             "sys.time": self._time, "sys.calc": self._calc, "sys.export": self._export, "sys.memory": self._memory,
             "sys.http": self._http, "sys.web_search": self._web_search, "sys.fs_read": self._fs_read,
-            "sys.fs_write": self._fs_write, "sys.cron": self._cron, "sys.skill_exec": self._skill_exec,
+            "sys.fs_write": self._fs_write, "sys.cron": self._cron,
+            "sys.skill": self._skill,
+            "sys.skill_read": self._skill_read,
+            "sys.skill_exec": self._skill_exec,
             "sys.skill_create": self._skill_create,
+            "sys.skill_update": self._skill_update,
         }
 
     def call(self, spec: ToolSpec, args: dict, *, identity: Identity) -> dict:
@@ -440,38 +444,181 @@ class BuiltinRuntime:
         target.write_bytes(data)
         return {"path": norm, "written": True, "size_bytes": len(data)}
 
-    # ---- sys.skill_create
+    # ---- sys.skill_create / sys.skill_update（确认后才落盘）
+    SKILL_MD_MAX_CHARS = 100_000
+    SKILL_CONFIRM_TTL_SEC = 1800
+    SKILL_CONFIRM_WORKFLOW = "skill_pack_confirm@1"
+
     def _skill_create(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
+        return self._skill_pack_propose(action="create", args=args, identity=identity)
+
+    def _skill_update(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
+        return self._skill_pack_propose(action="update", args=args, identity=identity)
+
+    def _skill_pack_propose(self, *, action: str, args: dict, identity: Identity) -> dict:
+        """校验草稿并签发确认卡；确认前不写入个人 Skill 库。"""
         if self.data_dir is None or self.session_factory is None:
             raise _not_available()
+        run_id = _optional_text(getattr(identity, "run_id", None))
+        if not run_id:
+            raise _invalid("缺少运行上下文，无法发起 Skill 确认")
         skill_md = args.get("skill_md")
         if not isinstance(skill_md, str) or len(skill_md.strip()) < 10:
             raise _invalid("缺少参数 skill_md（完整 SKILL.md 文本）")
+        if len(skill_md) > self.SKILL_MD_MAX_CHARS:
+            raise _invalid(f"skill_md 不能超过 {self.SKILL_MD_MAX_CHARS} 字符")
+        from oa_agent.runtime import confirmation
         from oa_agent.skills import service as skill_packs
+        from oa_agent.skills.parse import SkillMdError, parse_skill_md
 
         try:
+            parsed = parse_skill_md(skill_md)
+        except SkillMdError as exc:
+            raise _invalid(exc.message) from exc
+        name = parsed["name"]
+        description = parsed.get("description") or ""
+        pack_id: int | None = None
+        try:
             with self.session_factory() as db, db.begin():
-                pack = skill_packs.create_user_pack(
+                if action == "create":
+                    existing = skill_packs.get_pack_by_name(db, tenant_id=self.tenant_id, name=name)
+                    if existing is not None:
+                        raise AppError(409, "ALREADY_EXISTS", f"Skill 名 {name} 已被占用")
+                    reason = f"确认创建个人 Skill「{name}」"
+                elif action == "update":
+                    want = str(args.get("name") or "").strip().lower()
+                    if not want:
+                        raise _invalid("缺少参数 name")
+                    if want != name:
+                        raise _invalid("参数 name 须与 SKILL.md frontmatter 的 name 一致")
+                    pack = skill_packs.get_pack_by_name(db, tenant_id=self.tenant_id, name=want)
+                    if pack is None:
+                        raise AppError(404, "NOT_FOUND", f"Skill「{want}」不存在")
+                    if pack.kind != "user" or pack.owner_oa != identity.oa:
+                        raise AppError(403, "FORBIDDEN", "只能更新本人创建的个人 Skill")
+                    pack_id = pack.id
+                    reason = f"确认更新个人 Skill「{name}」"
+                else:
+                    raise _invalid(f"未知动作：{action}")
+                payload = {
+                    "kind": "skill_pack",
+                    "action": action,
+                    "skill_md": skill_md,
+                    "name": name,
+                    "description": description,
+                    "pack_id": pack_id,
+                }
+                issued = confirmation.issue(
                     db,
-                    tenant_id=self.tenant_id,
+                    self.tenant_id,
+                    run_id=run_id,
                     oa=identity.oa,
-                    data_dir=self.data_dir,
-                    skill_md=skill_md,
+                    workflow_version=self.SKILL_CONFIRM_WORKFLOW,
+                    payload=payload,
+                    reason=reason,
+                    ttl_seconds=self.SKILL_CONFIRM_TTL_SEC,
                 )
-                pack_id = pack.id
-                name = pack.name
-                display_name = pack.display_name or pack.name
-            with self.session_factory() as db:
-                body = skill_packs.load_skill_body(db, self.data_dir, pack_id)
+        except AppError as exc:
+            raise ToolError(exc.code, exc.message, user_message=exc.message) from exc
+        preview = {
+            "kind": "skill_pack",
+            "action": action,
+            "name": name,
+            "description": description,
+            "skill_md": skill_md,
+            "pack_id": pack_id,
+        }
+        verb = "创建" if action == "create" else "更新"
+        return {
+            "pending_confirmation": True,
+            "confirm_kind": "skill_pack",
+            "task_id": issued.task_id,
+            "token": issued.token,
+            "expire_at": issued.expire_at.isoformat(),
+            "preview": preview,
+            "text": (
+                f"已起草个人 Skill「{name}」的{verb}内容，请员工在确认卡中确认后才会写入「我的 Skill」。"
+                "在确认前不要声称已保存成功。"
+            ),
+        }
+
+    # ---- sys.skill（DSH：按 name 重读 SKILL.md）
+    def _skill(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
+        if self.data_dir is None or self.session_factory is None:
+            raise _not_available()
+        name = str(args.get("name") or "").strip().lower()
+        if not name:
+            raise _invalid("缺少参数 name")
+        from oa_agent.skills.service import (
+            bump_invoke,
+            enabled_packs_for,
+            find_enabled_pack,
+            load_skill_body,
+            render_skill_content,
+            resource_hint_for_pack,
+        )
+
+        with self.session_factory() as db:
+            packs = enabled_packs_for(db, tenant_id=self.tenant_id, oa=identity.oa)
+            pack = find_enabled_pack(packs, name)
+            if pack is None:
+                raise ToolError("NOT_FOUND", f"Skill 未启用：{name}", user_message=f"Skill 不可用：{name}")
+            if pack.disable_model_invocation:
+                raise ToolError(
+                    "FORBIDDEN",
+                    f"Skill 禁止模型调用：{name}",
+                    user_message=f"该 Skill 仅可通过用户 /{name} 调用",
+                )
+            body = load_skill_body(db, self.data_dir, pack.id)
+            hint = resource_hint_for_pack(pack)
+            text = render_skill_content(name=pack.name, instructions=body, resource_hint=hint)
+            pack_id = pack.id
+        try:
+            with self.session_factory() as db, db.begin():
+                bump_invoke(db, pack_id)
+        except Exception:  # noqa: BLE001
+            log.exception("skill 调用计数失败 pack_id=%s", pack_id)
+        return {"name": name, "text": text}
+
+    # ---- sys.skill_read（包内 references/assets/根文档）
+    def _skill_read(self, spec: ToolSpec, args: dict, identity: Identity) -> dict:
+        if self.data_dir is None or self.session_factory is None:
+            raise _not_available()
+        skill_name = str(args.get("skill") or "").strip().lower()
+        rel = str(args.get("path") or "").strip()
+        if not skill_name or not rel:
+            raise _invalid("缺少参数 skill 或 path")
+        from oa_agent.db.models import SkillPack, SkillPackVersion
+        from oa_agent.errors import AppError
+        from oa_agent.skills.service import (
+            enabled_packs_for,
+            find_enabled_pack,
+            pack_bundle_dir,
+            read_skill_resource,
+        )
+
+        with self.session_factory() as db:
+            packs = enabled_packs_for(db, tenant_id=self.tenant_id, oa=identity.oa)
+            pack_state = find_enabled_pack(packs, skill_name)
+            if pack_state is None:
+                raise ToolError("NOT_FOUND", f"Skill 未启用：{skill_name}", user_message=f"Skill 不可用：{skill_name}")
+            pack = db.get(SkillPack, pack_state.id)
+            if pack is None or not pack.current_version_id:
+                raise ToolError("NOT_FOUND", "Skill 包不存在", user_message="Skill 不可用")
+            version = db.get(SkillPackVersion, pack.current_version_id)
+            if version is None or not version.storage_path:
+                raise ToolError("NOT_FOUND", "Skill 包无版本", user_message="Skill 不可用")
+            bundle = pack_bundle_dir(self.data_dir, version.storage_path)
+        try:
+            out = read_skill_resource(bundle, rel)
         except AppError as exc:
             raise ToolError(exc.code, exc.message, user_message=exc.message) from exc
         return {
-            "ok": True,
-            "id": pack_id,
-            "name": name,
-            "display_name": display_name,
-            "skill_md_chars": len(body),
-            "text": f"已创建个人 Skill「{display_name}」（{name}），可在工作空间「我的 Skill」中查看与启停。",
+            "skill": skill_name,
+            "path": out["path"],
+            "content": out["content"],
+            "truncated": out["truncated"],
+            "text": f'<skill_resource skill="{skill_name}" path="{out["path"]}">\n{out["content"]}\n</skill_resource>',
         }
 
     # ---- sys.skill_exec

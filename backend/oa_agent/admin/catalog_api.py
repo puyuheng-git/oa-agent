@@ -1,20 +1,22 @@
-"""/v1/admin/tools"v1/admin/skills：新"编辑、从文件导入、启停、版本与 diff（设"§9 ops.tool.manage / ops.skill.manage）"
+"""/v1/admin/tools、/v1/admin/skills：新建/编辑、启停、版本与 diff（§9 ops.tool.manage / ops.skill.manage）。
 
-变更提交后立即重载运行时注册表（停用即拒绝调用）；全部写操作带审计，审计与变更同事务"
-后台编辑与文件导入走同一套校验与版本规则：兼容变更立即生效，不兼容变更存为待激活版本"
+变更提交后立即重载运行时注册表（停用即拒绝调用）；全部写操作带审计，审计与变更同事务。
+兼容变更立即生效，不兼容变更存为待激活版本。
 """
 
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any, Literal
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile
 from pydantic import BaseModel, Field
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from oa_agent.admin.wizard_temp_upload import save_wizard_temp_file
 from oa_agent.auth.rbac import AdminCtx, admin_read, admin_write
 from oa_agent.db.models import McpServer, Skill, SkillVersion, SkillVisibilityRule, Tool, ToolVersion
 from oa_agent.errors import AppError
@@ -24,12 +26,16 @@ from oa_agent.integrations.open_oa import (
 from oa_agent.executor import apipost
 from oa_agent.executor.builtin_catalog import TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_guide
 from oa_agent.executor.catalog import (
-    canonical_hash, compare, normalize_open_oa_catalog_item, normalize_skill, normalize_tool_form,
-    recover_open_oa_invoke_schema, registration_blockers,
+    OrphanToolError, assert_tool_bound_for_enable, canonical_hash, compare,
+    enabled_orphans_after_skill_tools, iter_skill_tool_bindings,
+    normalize_open_oa_catalog_item, normalize_skill, normalize_tool_form,
+    recover_open_oa_invoke_schema, registration_blockers, skill_category_kind_errors,
 )
 # normalize_open_oa_catalog_item：向导 save 复用（由管理员填写的契约组装 Tool schema）
 from oa_agent.executor.contract_test import contract_check, is_activatable
 from oa_agent.executor.visibility import VisibilityService
+from oa_agent.executor.invoke_args import unwrap_bag_args
+from oa_agent.executor.skill_draft import draft_skill_from_tools
 from oa_agent.runtime.llm import ModelCallError, build_chat_model, resolve_model
 
 tools_router = APIRouter(prefix="/v1/admin/tools", tags=["admin-tools"])
@@ -50,11 +56,16 @@ class ActivateIn(ReasonIn):
     version_no: int = Field(ge=1)
 
 
-class ToolResultIn(BaseModel):
-    kind: str = "object"
-    fields: list[str] = Field(default_factory=list, max_length=100)
-    labels: dict[str, str] = Field(default_factory=dict)
-    list_columns: list[str] = Field(default_factory=list, max_length=20)
+with warnings.catch_warnings():
+    # 契约字段名即 schema，pydantic 会提示其遮蔽 BaseModel.schema（已弃用），此处有意为之
+    warnings.filterwarnings("ignore", message='Field name "schema"')
+
+    class ToolResultIn(BaseModel):
+        kind: str = "object"
+        fields: list[str] = Field(default_factory=list, max_length=100)
+        labels: dict[str, str] = Field(default_factory=dict)
+        list_columns: list[str] = Field(default_factory=list, max_length=20)
+        schema: dict[str, Any] | None = None  # 可选：返回结构说明，由 normalize 递归规范化
 
 
 class ToolIn(ReasonIn):
@@ -120,6 +131,8 @@ class SkillIn(ReasonIn):
     instructions: str = Field("", max_length=2000)
     examples: list[str] = Field(default_factory=list, max_length=10)
     tools: list[str] = Field(min_length=1, max_length=20)
+    # 空串不限制 Tool.kind；写入 content_json.category
+    category: str = Field(default="", max_length=32)
 
 
 class VisibilityRuleIn(BaseModel):
@@ -342,6 +355,26 @@ def list_tools(kind: Literal["office", "open_oa_invoke", "builtin", "mcp"] | Non
     return {"items": [_tool_view(ctx, t) for t in tools], "upstreams": ups, "default_upstream_key": default_key}
 
 
+@tools_router.get("/orphans")
+def list_orphan_tools(ctx: AdminCtx = Depends(admin_read(TOOL))):
+    """未出现在任何 Skill 当前 tools 里的非 builtin Tool。
+
+    必须注册在 /{name} 之前，否则 orphans 会被当成 Tool 名。
+    """
+    bindings = iter_skill_tool_bindings(ctx.db, ctx.runtime.tenant_id)
+    tools = ctx.db.scalars(
+        sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id).order_by(Tool.name)
+    ).all()
+    items = []
+    for tool in tools:
+        kind = tool.kind or "office"
+        # builtin 允许不绑 Skill；已有引用的业务 Tool 也不是孤儿
+        if kind == "builtin" or tool.name in bindings:
+            continue
+        items.append({"name": tool.name, "kind": kind, "enabled": bool(tool.enabled)})
+    return {"items": items}
+
+
 @tools_router.get("/{name}")
 def tool_detail(name: str, ctx: AdminCtx = Depends(admin_read(TOOL))):
     tool = _get_tool(ctx, name)
@@ -380,20 +413,6 @@ def tool_diff(name: str, from_no: int, to_no: int, ctx: AdminCtx = Depends(admin
     a, b = _tool_version(ctx, tool, from_no), _tool_version(ctx, tool, to_no)
     level, diff = compare(a.schema_json, b.schema_json)
     return {"from": from_no, "to": to_no, "compat_level": level, "changes": diff}
-
-
-@tools_router.post("/sync")
-def sync_tools(ctx: AdminCtx = Depends(admin_write(TOOL))):
-    engine = ctx.runtime.engine
-    with ctx.db.begin():
-        report = engine.catalog.sync_tools(ctx.db, ctx.user.username)
-        ctx.db.flush()
-        engine.catalog.revalidate_skills(ctx.db)
-        ctx.audit("tool.sync", "tool", "*", after={
-            "files": [{"file": f["file"], "ok": f["ok"]} for f in report["files"]],
-            "tools": report["tools"]})
-    engine.reload_catalog()
-    return report
 
 
 def _upstream_configured(ctx: AdminCtx, upstream: str) -> bool:
@@ -622,13 +641,16 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
     """向导：指定测试员工试调。"""
     client, secret = _open_oa_wizard_client(ctx)
     ctx.db.rollback()
+    call = body.call.strip() or "one_by_params"
+    # 整包 call 摊平 params|data，避免业务方法多套一层
+    args = unwrap_bag_args(call, dict(body.args or {}))
     try:
         data = client.probe_export(
             service=body.service.strip(),
             method=body.method.strip(),
             oa=body.oa.strip(),
-            args=dict(body.args or {}),
-            call=body.call.strip() or "one_by_params",
+            args=args,
+            call=call,
             op=body.op.strip() or "read",
             gateway_secret=secret,
             idempotency_key=body.idempotency_key.strip(),
@@ -638,6 +660,23 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
     return {"data": data}
 
 
+@tools_router.post("/export-wizard/upload-temp")
+async def export_wizard_upload_temp(file: UploadFile = File(...), ctx: AdminCtx = Depends(admin_write(TOOL))):
+    """向导：文件型参数测试用，上传到本机临时目录并返回 ref。"""
+    # 读取并校验大小（空文件/超 20MB 拒绝）
+    data = await file.read()
+    if not data:
+        raise AppError(400, "VALIDATION_ERROR", "空文件")
+    if len(data) > 20 * 1024 * 1024:
+        raise AppError(400, "VALIDATION_ERROR", "文件过大，上限 20MB")
+    out = save_wizard_temp_file(data, file.filename or "file")
+    # 审计：仅记元数据，不记路径外内容
+    with ctx.db.begin():
+        ctx.audit("tool.export_wizard_upload_temp", "tool", "export-wizard",
+                  after={"filename": out["filename"], "sha256": out["sha256"], "size": out["size"]})
+    return {"data": out}
+
+
 @tools_router.post("/export-wizard/save")
 def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
     """向导：用同一参数再 probe 一次，成功后写入 open_oa_invoke Tool。"""
@@ -645,13 +684,15 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
         raise AppError(422, "VALIDATION_ERROR", "入库前须配置 result.fields")
     client, secret = _open_oa_wizard_client(ctx)
     ctx.db.rollback()
+    call = body.call.strip() or "one_by_params"
+    args = unwrap_bag_args(call, dict(body.args or {}))
     try:
         client.probe_export(
             service=body.service.strip(),
             method=body.method.strip(),
             oa=body.oa.strip(),
-            args=dict(body.args or {}),
-            call=body.call.strip() or "one_by_params",
+            args=args,
+            call=call,
             op=body.op.strip() or "read",
             gateway_secret=secret,
             idempotency_key=body.idempotency_key.strip(),
@@ -663,6 +704,13 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
     for pname, rule in (body.model_params or {}).items():
         if not isinstance(rule, dict):
             continue
+        # 落库不再保留整包袋名，避免 Agent 再套一层
+        if call in ("one_by_params", "page_list") and pname in ("params", "data"):
+            if rule.get("type") == "object" and isinstance(rule.get("properties"), dict):
+                for ck, cv in rule["properties"].items():
+                    if isinstance(cv, dict):
+                        params_list.append({"name": str(ck), **cv})
+            continue
         row = {"name": pname, **rule}
         params_list.append(row)
     item = {
@@ -672,13 +720,14 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
         "summary": body.summary.strip() or body.name.strip(),
         "op": body.op.strip() or "read",
         "risk": body.risk.strip() or "low",
-        "call": body.call.strip() or "one_by_params",
+        "call": call,
         "params": params_list,
         "returns": {
             "kind": body.result.kind,
             "fields": list(body.result.fields or []),
             "labels": dict(body.result.labels or {}),
             "list_columns": list(body.result.list_columns or []),
+            "schema": body.result.schema,
         },
     }
     spec, errs = normalize_open_oa_catalog_item(item)
@@ -737,8 +786,19 @@ def delete_tool(name: str, body: ReasonIn, ctx: AdminCtx = Depends(admin_write(T
 def _toggle(ctx: AdminCtx, name: str, enabled: bool, reason: str) -> dict:
     with ctx.db.begin():
         tool = _get_tool(ctx, name)
+        # 启用非 builtin 前必须已有 Skill 引用；停用不设这道闸
+        if enabled:
+            try:
+                assert_tool_bound_for_enable(
+                    ctx.db, ctx.runtime.tenant_id, tool.name, tool.kind or "office",
+                )
+            except OrphanToolError as exc:
+                raise AppError(400, "TOOL_UNBOUND", str(exc)) from None
         before = tool.enabled
         tool.enabled, tool.updated_by = enabled, ctx.user.username
+        # 绑定发生在停用期间时，启用后重算 Skill 校验，否则功能仍不可用
+        if enabled:
+            ctx.runtime.engine.catalog.revalidate_skills(ctx.db)
         ctx.audit("tool.enable" if enabled else "tool.disable", "tool", name, before={"enabled": before},
                   after={"enabled": enabled}, reason=reason)
     _reload(ctx)
@@ -872,6 +932,7 @@ def _skill_view(ctx: AdminCtx, skill: Skill) -> dict:
         "validation_errors": skill.validation_errors or [],
         "current_version_no": current.version_no if current else None,
         "workflow": (current.content_json or {}).get("workflow") if current else None,
+        "category": (current.content_json or {}).get("category") or "" if current else "",
         "description": (current.content_json or {}).get("description") if current else None,
         "instructions": (current.content_json or {}).get("instructions") or "" if current else "",
         "examples": (current.content_json or {}).get("examples") or [] if current else [],
@@ -881,11 +942,72 @@ def _skill_view(ctx: AdminCtx, skill: Skill) -> dict:
     }
 
 
+class SkillDraftFromToolsIn(BaseModel):
+    """先选 Tool，再让小模型根据契约生成 Skill 表单草稿。"""
+
+    tools: list[str] = Field(min_length=1, max_length=20)
+
+
+def _draft_skill_model(ctx: AdminCtx):
+    """优先 text/small；没有小模型则回落默认模型。复用请求 session，避免嵌套连接。"""
+    rt = ctx.runtime
+    try:
+        # 读路径可能留下隐式事务；解析模型前先干净回滚
+        ctx.db.rollback()
+        cfg = resolve_model(ctx.db, rt.vault, rt.tenant_id, capability="text", model_tier="small")
+        if cfg is None:
+            cfg = resolve_model(ctx.db, rt.vault, rt.tenant_id)
+        ctx.db.rollback()
+    except Exception:  # noqa: BLE001 — vault/路由异常统一视为未配置，由上层给可操作提示
+        log.exception("resolve draft skill model failed")
+        return None
+    if cfg is None:
+        return None
+    try:
+        return build_chat_model(cfg)
+    except Exception:  # noqa: BLE001 — 客户端构造失败也按未配置/不可用处理
+        log.exception("build_chat_model for skill draft failed")
+        return None
+
+
 @skills_router.get("")
 def list_skills(ctx: AdminCtx = Depends(admin_read(SKILL))):
     skills = ctx.db.scalars(sa.select(Skill).where(Skill.tenant_id == ctx.runtime.tenant_id)
                             .order_by(Skill.name)).all()
     return {"items": [_skill_view(ctx, s) for s in skills]}
+
+
+@skills_router.post("/draft-from-tools")
+def draft_skill_from_tools_api(body: SkillDraftFromToolsIn, ctx: AdminCtx = Depends(admin_write(SKILL))):
+    """根据已选 Tool 当前契约，调用小模型生成 Skill 草稿（不落库）。"""
+    names = [n.strip() for n in body.tools if n and n.strip()]
+    if not names:
+        raise AppError(422, "VALIDATION_ERROR", "请至少选择一个 Tool")
+    schemas: list[dict] = []
+    for name in names:
+        tool = _get_tool(ctx, name)
+        current = ctx.db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
+        # schema_json 可能非 dict（坏数据）；兜底成空契约再补 name/summary
+        raw = current.schema_json if current else None
+        schema = dict(raw) if isinstance(raw, dict) else {}
+        schema.setdefault("name", tool.name)
+        if not schema.get("summary"):
+            schema["summary"] = tool.summary or tool.name
+        schemas.append(schema)
+    model = _draft_skill_model(ctx)
+    if model is None:
+        raise AppError(422, "LLM_NOT_CONFIGURED", "未配置可用的文本模型（建议配置 text/small），无法自动生成")
+    try:
+        draft = draft_skill_from_tools(model, schemas)
+    except ModelCallError as exc:
+        raise AppError(422, "LLM_FAILED", f"模型生成失败：{exc}") from None
+    except Exception as exc:  # noqa: BLE001 — 契约畸形等不得冒成 INTERNAL_ERROR
+        log.exception("draft_skill_from_tools failed")
+        raise AppError(422, "LLM_FAILED", f"模型生成失败：{type(exc).__name__}: {exc}") from None
+    with ctx.db.begin():
+        ctx.audit("skill.draft_from_tools", "skill", draft.get("name") or "*", after={
+            "tools": names, "draft_name": draft.get("name")})
+    return {"draft": draft}
 
 
 @skills_router.get("/{name}")
@@ -898,17 +1020,6 @@ def skill_detail(name: str, ctx: AdminCtx = Depends(admin_read(SKILL))):
                         "content_hash": v.content_hash[:16], "created_by": v.created_by, "created_at": v.created_at}
                        for v in versions]
     return out
-
-
-@skills_router.post("/sync")
-def sync_skills(ctx: AdminCtx = Depends(admin_write(SKILL))):
-    engine = ctx.runtime.engine
-    with ctx.db.begin():
-        report = engine.catalog.sync_skills(ctx.db, ctx.user.username)
-        ctx.audit("skill.sync", "skill", "*", after={
-            "files": [{"file": f["file"], "ok": f["ok"]} for f in report["files"]], "skills": report["skills"]})
-    engine.reload_catalog()
-    return report
 
 
 def _save_skill(ctx: AdminCtx, body: SkillIn, create: bool) -> dict:
@@ -925,6 +1036,24 @@ def _save_skill(ctx: AdminCtx, body: SkillIn, create: bool) -> dict:
         unknown = [t for t in content["tools"] if not engine.catalog.exists(ctx.db, Tool, t)]
         if unknown:
             raise AppError(422, "VALIDATION_ERROR", f"Tool 不存在：{', '.join(unknown)}")
+        # 非空种类按已入库 Tool.kind 收紧；空种类不查
+        if content.get("category"):
+            kind_rows = ctx.db.scalars(
+                sa.select(Tool).where(Tool.tenant_id == ctx.runtime.tenant_id, Tool.name.in_(list(content["tools"])))
+            ).all()
+            kind_by_name = {row.name: (row.kind or "office") for row in kind_rows}
+            pairs = [(name, kind_by_name[name]) for name in content["tools"] if name in kind_by_name]
+            kind_errors = skill_category_kind_errors(content["category"], pairs)
+            if kind_errors:
+                raise AppError(422, "VALIDATION_ERROR", "；".join(kind_errors))
+        # 拿掉某 Tool 后若再无 Skill 引用、且该 Tool 仍启用，先让管理员改绑或禁用
+        if not create:
+            orphaned = enabled_orphans_after_skill_tools(
+                ctx.db, ctx.runtime.tenant_id, content["name"], list(content["tools"]),
+            )
+            if orphaned:
+                names = "、".join(orphaned)
+                raise AppError(400, "TOOL_WOULD_BE_ORPHAN", f"请先改绑或先禁用 Tool：{names}")
         skill = engine.catalog.save_skill(ctx.db, content, ctx.user.username)
         ctx.audit("skill.create" if create else "skill.update", "skill", skill.name,
                   after={"result": skill.last_sync_result, "tools": content["tools"]}, reason=body.reason)

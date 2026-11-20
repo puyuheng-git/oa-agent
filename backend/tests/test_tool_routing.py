@@ -128,8 +128,15 @@ def test_deterministic_first_skips_llm_on_rule_hit():
     assert out["intent"] == "tool"
     assert out["tool"] == LIST
     assert out["intent_source"] == "rules"
+    # 命中窄门：模式保持确定性，fallback_from 为空，不进入 Skill / 海选阶段。
+    assert out["routing_mode"] == "deterministic_first"
+    assert out.get("routing_fallback_from") in (None, "")
     assert any(e["event_type"] == "routing_stage" and e["metadata"].get("stage") == "deterministic"
                for e in rec.events)
+    assert not any(
+        e["event_type"] == "routing_stage" and e["metadata"].get("stage") in ("skill_select", "topk")
+        for e in rec.events
+    )
 
 
 def test_plan_list_then_detail_invoked_on_recent_detail():
@@ -297,3 +304,143 @@ def test_router_then_fill_keyword_fallback_without_llm():
     out, _ = _route("router_then_fill", "查上周行程报销", llm_select=None)
     assert out["intent"] == "tool"
     assert out["tool"] == LIST
+
+
+def test_low_confidence_clarifies_without_business_tool():
+    """确定性未命中且 Skill 规则全 0 分时澄清，不调用业务 Tool。"""
+    tools = _two_tools(multi_skill=True)
+    called = {"n": 0}
+
+    def llm_select(*_a, **_k):
+        called["n"] += 1
+        return {"intent": "tool", "tool": LIST, "params": {}, "intent_source": "llm"}
+
+    out, rec = _route(
+        "deterministic_first",
+        "随便聊聊",
+        tools=tools,
+        llm_select=llm_select,
+        routing_skill_method="rules",
+        routing_clarify_on_low_confidence=True,
+    )
+    assert called["n"] == 0
+    assert out["intent"] == "chat"
+    assert out.get("tool") is None
+    assert out.get("chat_reply")
+    assert out["routing_mode"] == "skill_then_tool"
+    assert out.get("routing_fallback_from") == "deterministic_first"
+    assert any(e["event_type"] == "routing_clarify" for e in rec.events)
+    decision = next(e for e in rec.events if e["event_type"] == "routing_decision")
+    assert decision.get("tool_name") in (None, "")
+
+
+def test_routing_defaults_are_deterministic_first():
+    assert tr.ROUTING_DEFAULTS["tool_routing_mode"] == "deterministic_first"
+    assert tr.ROUTING_DEFAULTS["deterministic_fallback_mode"] == "skill_then_tool"
+    cfg = tr.resolve_routing_config({}, None)
+    assert cfg["tool_routing_mode"] == "deterministic_first"
+    bad = tr.resolve_routing_config({"tool_routing_mode": "not_a_mode"}, None)
+    assert bad["tool_routing_mode"] == "deterministic_first"
+
+
+def test_workflow_snapshot_still_wins_over_default():
+    cfg = tr.resolve_routing_config(
+        {"tool_routing_mode": "legacy_prompt"},
+        {"tool_routing_mode": "deterministic_first"},
+    )
+    assert cfg["tool_routing_mode"] == "legacy_prompt"
+
+
+def test_resolve_routing_config_records_source():
+    """mode 键在哪一层，来源就记哪一层；快照里的其它键不算 release。"""
+    release = tr.resolve_routing_config(
+        {"tool_routing_mode": "legacy_prompt", "prompt_topk": 3},
+        {"tool_routing_mode": "retrieve_then_tool"},
+    )
+    assert release["config_source"] == "release"
+    assert release["tool_routing_mode"] == "legacy_prompt"
+
+    global_only = tr.resolve_routing_config(
+        {"prompt_topk": 4},
+        {"tool_routing_mode": "retrieve_then_tool"},
+    )
+    assert global_only["config_source"] == "global"
+    assert global_only["tool_routing_mode"] == "retrieve_then_tool"
+
+    code_default = tr.resolve_routing_config({"prompt_topk": 4}, None)
+    assert code_default["config_source"] == "code_default"
+    assert code_default["tool_routing_mode"] == "deterministic_first"
+
+    empty = tr.resolve_routing_config({}, None)
+    assert empty["config_source"] == "code_default"
+
+
+def test_route_emits_config_resolved():
+    rec = FakeRecorder()
+    tr.route(
+        "查报销",
+        tools=_two_tools(),
+        today=date(2026, 10, 28),
+        config={},
+        runtime_defaults=None,
+        recorder=rec,
+    )
+    types = [e["event_type"] for e in rec.events]
+    assert "config_resolved" in types
+    ev = next(e for e in rec.events if e["event_type"] == "config_resolved")
+    assert ev["metadata"]["mode"] == "deterministic_first"
+    assert ev["metadata"]["source"] == "code_default"
+    assert ev["metadata"]["fallback_mode"] == "skill_then_tool"
+    assert types.index("config_resolved") < types.index("routing_start")
+
+
+def test_route_config_resolved_source_follows_layer():
+    release = FakeRecorder()
+    tr.route(
+        "查报销",
+        tools=_two_tools(),
+        today=date(2026, 10, 28),
+        config={"tool_routing_mode": "legacy_prompt"},
+        runtime_defaults={"tool_routing_mode": "retrieve_then_tool"},
+        recorder=release,
+    )
+    release_ev = next(e for e in release.events if e["event_type"] == "config_resolved")
+    assert release_ev["metadata"]["source"] == "release"
+    assert release_ev["metadata"]["mode"] == "legacy_prompt"
+
+    runtime = FakeRecorder()
+    tr.route(
+        "查报销",
+        tools=_two_tools(),
+        today=date(2026, 10, 28),
+        config={"prompt_topk": 4},
+        runtime_defaults={"tool_routing_mode": "retrieve_then_tool", "deterministic_fallback_mode": "legacy_prompt"},
+        recorder=runtime,
+    )
+    runtime_ev = next(e for e in runtime.events if e["event_type"] == "config_resolved")
+    assert runtime_ev["metadata"]["source"] == "global"
+    assert runtime_ev["metadata"]["mode"] == "retrieve_then_tool"
+    assert runtime_ev["metadata"]["fallback_mode"] == "legacy_prompt"
+
+
+def test_config_resolved_omitted_when_trace_off():
+    rec = FakeRecorder()
+    tr.route(
+        "查报销",
+        tools=_two_tools(),
+        today=date(2026, 10, 28),
+        config={"routing_trace_enabled": False},
+        runtime_defaults=None,
+        recorder=rec,
+    )
+    assert not any(e["event_type"] == "config_resolved" for e in rec.events)
+
+
+def test_deterministic_stage_marks_source():
+    _, rec = _route("deterministic_first", "查上周行程报销")
+    stages = [
+        e for e in rec.events
+        if e["event_type"] == "routing_stage" and e["metadata"].get("stage") == "deterministic"
+    ]
+    assert stages
+    assert stages[0]["metadata"]["source"] == "deterministic"

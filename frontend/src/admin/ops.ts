@@ -149,6 +149,8 @@ export interface SkillItem {
   validation_errors: string[]
   current_version_no: number | null
   workflow: string | null
+  /** 空串表示不限制可绑 Tool 类型 */
+  category?: string
   description: string | null
   instructions: string
   examples: string[]

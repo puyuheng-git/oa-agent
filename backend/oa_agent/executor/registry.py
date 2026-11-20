@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from oa_agent.settings import REPO_ROOT
-
-DEFAULT_SPECS = (REPO_ROOT / "openapi" / "travel_expense.yaml",)
+# 测试夹具路径（生产运行时从 Catalog/DB 加载，不依赖此文件）
+_FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "catalog" / "openapi" / "travel_expense.yaml"
+DEFAULT_SPECS = (_FIXTURE,)
 
 
 @dataclass(frozen=True)

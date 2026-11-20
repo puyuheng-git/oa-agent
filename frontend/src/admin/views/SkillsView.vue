@@ -43,13 +43,13 @@ const mainTab = ref<'catalog' | 'packs' | 'market'>('catalog')
 const items = ref<SkillItem[]>([])
 const loading = ref(false)
 const loadError = ref('')
-const syncing = ref(false)
 
 const editor = ref(false)
 const editing = ref<string | null>(null)
 const form = ref<SkillForm>(emptySkillForm())
 const editReason = ref('')
 const saving = ref(false)
+const drafting = ref(false)
 const toolOptions = ref<ToolItem[]>([])
 
 const packs = ref<PackItem[]>([])
@@ -83,21 +83,6 @@ async function loadPacks() {
   }
 }
 
-async function sync() {
-  syncing.value = true
-  try {
-    const r = await http.post<{ files: { file: string; ok: boolean; errors: string[] }[] }>('/v1/admin/skills/sync')
-    const failed = r.files.filter((f) => !f.ok)
-    if (failed.length) ElMessage.warning(`有 ${failed.length} 个文件解析失败：${failed.map((f) => f.errors.join('；')).join(' / ')}`)
-    else ElMessage.success('导入完成')
-    await load()
-  } catch (e) {
-    ElMessage.error(errorMessage(e))
-  } finally {
-    syncing.value = false
-  }
-}
-
 async function loadTools() {
   try {
     toolOptions.value = (await http.get<{ items: ToolItem[] }>('/v1/admin/tools')).items
@@ -115,6 +100,40 @@ async function create() {
   await loadTools()
 }
 
+/** 先选 Tool，再调用小模型根据 Tool 契约填表（可再改）。 */
+async function draftFromTools() {
+  if (!form.value.tools.length) {
+    ElMessage.warning('请先选择至少一个可用 Tool')
+    return
+  }
+  drafting.value = true
+  try {
+    const r = await http.post<{
+      draft: {
+        name: string
+        display_name: string
+        description: string
+        instructions: string
+        examples: string[]
+        tools: string[]
+      }
+    }>('/v1/admin/skills/draft-from-tools', { tools: form.value.tools })
+    const d = r.draft
+    // 新建时写入建议名；编辑已有 Skill 时不改 name（主键不可改）
+    if (!editing.value && d.name) form.value.name = d.name
+    form.value.display_name = d.display_name || form.value.display_name
+    form.value.description = d.description || ''
+    form.value.instructions = d.instructions || ''
+    form.value.examplesText = (d.examples || []).join('\n')
+    if (d.tools?.length) form.value.tools = d.tools
+    ElMessage.success('已根据 Tool 生成草稿，请检查后再保存')
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    drafting.value = false
+  }
+}
+
 async function edit(skill: SkillItem) {
   editing.value = skill.name
   form.value = {
@@ -123,6 +142,7 @@ async function edit(skill: SkillItem) {
     description: skill.description || '',
     instructions: skill.instructions || '',
     examplesText: (skill.examples || []).join('\n'),
+    category: skill.category || '',
     tools: skill.tools.map((t) => t.name),
   }
   editReason.value = ''
@@ -432,9 +452,6 @@ onMounted(() => {
         />
         <div style="margin-bottom: 12px">
           <el-button type="primary" @click="create">新建 Skill</el-button>
-          <el-tooltip content="批量导入仓库 skills/*.yaml（同名 Skill 会被文件内容覆盖为新版本）">
-            <el-button :loading="syncing" @click="sync">从文件导入</el-button>
-          </el-tooltip>
           <el-button @click="load">刷新</el-button>
         </div>
         <el-result v-if="loadError" icon="error" :title="loadError" />
@@ -639,6 +656,14 @@ onMounted(() => {
         <el-form-item label="示例问题">
           <el-input v-model="form.examplesText" type="textarea" :rows="3" placeholder="每行一条，最多 10 条；显示在员工欢迎页" />
         </el-form-item>
+        <el-form-item label="种类">
+          <el-select v-model="form.category" clearable placeholder="不限制可绑 Tool 类型" style="width: 100%">
+            <el-option label="OA 查询（office / open_oa_invoke）" value="oa_query" />
+            <el-option label="OA 调用（office / open_oa_invoke）" value="oa_invoke" />
+            <el-option label="外部 MCP（mcp）" value="external_mcp" />
+            <el-option label="平台（builtin）" value="platform" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="可用 Tool" required>
           <el-select v-model="form.tools" multiple filterable style="width: 100%" placeholder="选择该 Skill 可调用的 Tool">
             <el-option v-for="t in toolOptions" :key="t.name" :value="t.name" :label="`${t.name}（${t.summary}）`">
@@ -646,6 +671,12 @@ onMounted(() => {
               <span class="muted"> {{ t.summary }}<template v-if="!t.registered"> · 未注册</template></span>
             </el-option>
           </el-select>
+          <div style="margin-top: 8px">
+            <el-button :loading="drafting" :disabled="!form.tools.length" @click="draftFromTools">
+              根据 Tool 用小模型生成草稿
+            </el-button>
+            <span class="muted" style="margin-left: 8px">先选 Tool，再自动填名称/说明/指引/示例（可改）</span>
+          </div>
         </el-form-item>
         <el-form-item label="变更原因" required>
           <el-input v-model="editReason" maxlength="200" placeholder="写入审计，至少 2 个字" />

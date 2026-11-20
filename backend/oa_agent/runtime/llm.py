@@ -12,10 +12,15 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from oa_agent.config.vault import SecretVault
-from oa_agent.db.models import LlmModel, LlmProvider
+from oa_agent.db.models import LlmDefaults, LlmModel, LlmProvider, LlmRoute
 from oa_agent.observability.events import RunRecorder
 
 INTENT_PURPOSE = "intent"
+
+
+CAPABILITIES = ("text", "vision", "multimodal", "embedding")
+TIERS = ("large", "small")
+DEFAULT_MAX_FAILOVER = 3
 
 
 @dataclass(frozen=True)
@@ -26,31 +31,115 @@ class ModelConfig:
     timeout: int
     model_name: str
     params: dict
+    # 以下字段放在末尾并带默认值，保持旧的 6 参位置构造兼容
+    model_id: int = 0
+    capabilities: tuple[str, ...] = ("text",)
+    model_tier: str = "large"
+
+
+def _config_ok(m: LlmModel, p: LlmProvider, vault: SecretVault, db: Session) -> bool:
+    """模型启用、提供方启用且已配置 API Key（设计 §4.2）。"""
+    return bool(m.enabled and p.enabled and vault.reveal(db, p.secret_ref))
+
+
+def _to_cfg(m: LlmModel, p: LlmProvider, vault: SecretVault, db: Session) -> ModelConfig:
+    return ModelConfig(p.name, p.base_url, vault.reveal(db, p.secret_ref), p.timeout_seconds, m.model_name,
+                       dict(m.params_json or {}), m.id, tuple(m.capabilities or ["text"]), m.model_tier or "large")
+
+
+def _pool_ids(route: LlmRoute, after_id: int | None, by_id: dict, usable: Callable[[int], bool]) -> list[int]:
+    """取池内可用候选：能力/档位须与池一致，无效条目静默跳过；after_id 在池内时只取其后。"""
+    ids = list(route.model_ids or [])
+    if after_id is not None and after_id in ids:
+        ids = ids[ids.index(after_id) + 1:]
+    out = []
+    for mid in ids:
+        pair = by_id.get(mid)
+        if pair is None or mid == after_id or not usable(mid):
+            continue
+        m = pair[0]
+        if route.capability in (m.capabilities or ["text"]) and (m.model_tier or "large") == route.model_tier:
+            out.append(mid)
+    return out
+
+
+def _failover_route(routes: list[LlmRoute], model: LlmModel, capability: str | None) -> LlmRoute | None:
+    """显式 model_id 的顺延池（设计 §4.4）：传了 capability 用 (capability, 模型档位)，
+    否则在含该 ID 且档位一致的启用池里按 capability 固定顺序取第一条。"""
+    tier = model.model_tier or "large"
+    if capability:
+        return next((r for r in routes if r.capability == capability and r.model_tier == tier), None)
+    hits = [r for r in routes if r.model_tier == tier and model.id in (r.model_ids or [])]
+    hits.sort(key=lambda r: CAPABILITIES.index(r.capability) if r.capability in CAPABILITIES else len(CAPABILITIES))
+    return hits[0] if hits else None
+
+
+def resolve_candidates(db: Session, vault: SecretVault, tenant_id: str, model_id: int | None = None, *,
+                       capability: str | None = None, model_tier: str | None = None,
+                       purpose: str = INTENT_PURPOSE) -> list[ModelConfig]:
+    """按设计 §4.1 顺序给出配置可用的有序候选，长度 ≤ max_failover。
+    显式 ID 可用时排首位，并追加其同池后续；不可用则跳过它走后续步骤；全部没有返回空列表。"""
+    # 读取租户内模型、启用的路由池与默认配置
+    defaults = db.scalar(sa.select(LlmDefaults).where(LlmDefaults.tenant_id == tenant_id))
+    limit = (defaults.max_failover if defaults else None) or DEFAULT_MAX_FAILOVER
+    rows = db.execute(
+        sa.select(LlmModel, LlmProvider).join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
+        .where(LlmModel.tenant_id == tenant_id).order_by(LlmModel.id)
+    ).all()
+    by_id = {m.id: (m, p) for m, p in rows}
+    routes = list(db.scalars(sa.select(LlmRoute).where(LlmRoute.tenant_id == tenant_id, LlmRoute.enabled.is_(True))))
+    usable_cache: dict[int, bool] = {}
+
+    def usable(mid: int) -> bool:
+        if mid not in usable_cache:
+            usable_cache[mid] = mid in by_id and _config_ok(*by_id[mid], vault, db)
+        return usable_cache[mid]
+
+    ordered: list[int] = []
+    # 步骤 1：显式 ID（可用则首位）+ 同池后续
+    if model_id is not None and model_id in by_id:
+        if usable(model_id):
+            ordered.append(model_id)
+        pool = _failover_route(routes, by_id[model_id][0], capability)
+        if pool is not None:
+            ordered.extend(_pool_ids(pool, model_id, by_id, usable))
+    # 步骤 2：(capability, tier) 路由池；仅当显式 ID 没产出候选时进入
+    if not ordered and capability and model_tier:
+        route = next((r for r in routes if r.capability == capability and r.model_tier == model_tier), None)
+        if route is not None:
+            ordered.extend(_pool_ids(route, None, by_id, usable))
+    elif not ordered:
+        # 步骤 3：全局默认；步骤 4：用途标签 → 任一启用模型
+        gid = defaults.global_default_model_id if defaults else None
+        if gid and usable(gid):
+            ordered.append(gid)
+        else:
+            tagged = next((m.id for m, _ in rows if purpose in (m.purpose_tags or []) and usable(m.id)), None)
+            ordered.append(tagged if tagged is not None else next((m.id for m, _ in rows if usable(m.id)), 0))
+    # 去重、截断到 max_failover 并转为配置
+    seen: list[int] = []
+    for mid in ordered:
+        if mid and mid not in seen:
+            seen.append(mid)
+    return [_to_cfg(*by_id[mid], vault, db) for mid in seen[:limit]]
 
 
 def resolve_model(db: Session, vault: SecretVault, tenant_id: str, model_id: int | None = None,
-                  purpose: str = INTENT_PURPOSE) -> ModelConfig | None:
-    """发布配置指定了模型且该模型启用时用它；否则优先选带用途标签的启用模型，再否则任一启用模型；
-    都没有返回 None（走规则）。"""
-    rows = db.execute(
-        sa.select(LlmModel, LlmProvider)
-        .join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
-        .where(LlmModel.tenant_id == tenant_id, LlmModel.enabled.is_(True), LlmProvider.enabled.is_(True))
-        .order_by(LlmModel.id)
-    ).all()
-    if not rows:
-        return None
-    pinned = next(((m, p) for m, p in rows if model_id is not None and m.id == model_id), None)
-    model, provider = pinned or next(((m, p) for m, p in rows if purpose in (m.purpose_tags or [])), rows[0])
-    return ModelConfig(provider.name, provider.base_url, vault.reveal(db, provider.secret_ref),
-                       provider.timeout_seconds, model.model_name, dict(model.params_json or {}))
+                  purpose: str = INTENT_PURPOSE, *, capability: str | None = None,
+                  model_tier: str | None = None) -> ModelConfig | None:
+    """取首选候选；没有可用模型返回 None（走规则）。"""
+    cands = resolve_candidates(db, vault, tenant_id, model_id, capability=capability,
+                               model_tier=model_tier, purpose=purpose)
+    return cands[0] if cands else None
 
 
 def build_chat_model(cfg: ModelConfig):
     from langchain_openai import ChatOpenAI
 
+    # 超时以后台 Provider 配置为准；复杂 ReAct / 附件任务可能需要数分钟
+    timeout_sec = max(1, int(cfg.timeout or 60))
     kwargs = {"model": cfg.model_name, "base_url": cfg.base_url, "api_key": cfg.api_key or "not-set",
-              "timeout": min(cfg.timeout, 30), "max_retries": 0, "stream_usage": True}
+              "timeout": timeout_sec, "max_retries": 0, "stream_usage": True}
     if "temperature" in cfg.params:
         kwargs["temperature"] = cfg.params["temperature"]
     if "max_tokens" in cfg.params:
@@ -59,7 +148,7 @@ def build_chat_model(cfg: ModelConfig):
 
 
 class ModelCallError(Exception):
-    pass
+    reply_emitted = False  # 失败前 reply/answer 正文是否已流式推给用户（是则不得顺延，避免重复文本）
 
 
 class ReplyStream:
@@ -180,7 +269,12 @@ def invoke_json(chat_model, cfg: ModelConfig, messages: list, rec: RunRecorder, 
     # 故意 allow_text=False：模型先输出无标签英文推理再 JSON 时，不能整段当员工可见正文
     stream = ReplyStream(on_delta, allow_text=False) if on_delta else None
     call = _LoggedCall(cfg, messages, rec, node_name)
-    text, usage = call.run(chat_model, stream.feed if stream else None)
+    try:
+        text, usage = call.run(chat_model, stream.feed if stream else None)
+    except ModelCallError as exc:
+        # 调用中途失败：标记正文是否已流出，供 invoke_json_failover 决定能否换模型
+        exc.reply_emitted = bool(stream is not None and stream.reply_emitted)
+        raise
     cleaned = _strip_think_blocks(text)
     parsed = _parse_json(cleaned)
     if parsed is None and text_fallback is not None:
@@ -195,6 +289,39 @@ def invoke_json(chat_model, cfg: ModelConfig, messages: list, rec: RunRecorder, 
     if stream is not None and stream.reply_emitted and on_reply_emitted is not None:
         on_reply_emitted()
     return call.finish(text, usage, parsed)
+
+
+_INVALID_OUTPUT_MARKERS = ("模型输出不是合法 JSON", "模型没有输出内容")
+
+
+def is_provider_error(exc: BaseException) -> bool:
+    """是否传输/提供方错误（可顺延）：模型已返回但输出非法 JSON/空输出不算（设计 §4.3）。"""
+    if not isinstance(exc, ModelCallError):
+        return True
+    msg = str(exc)
+    return not any(marker in msg for marker in _INVALID_OUTPUT_MARKERS)
+
+
+def invoke_json_failover(pairs: list[tuple[object, ModelConfig]], messages: list, rec: RunRecorder,
+                         node_name: str, **kwargs) -> dict:
+    """按候选顺序调用 invoke_json：提供方错误换下一个候选；非法 JSON、正文已流出或候选耗尽直接抛出。
+    顺延成功时在该次 model_log 上记 failover_from（首选模型 ID）与 attempt（第几次尝试）。"""
+    if not pairs:
+        raise ModelCallError("没有可用的模型候选")
+    last_index = len(pairs) - 1
+    for i, (chat_model, cfg) in enumerate(pairs):
+        try:
+            parsed = invoke_json(chat_model, cfg, messages, rec, node_name, **kwargs)
+        except ModelCallError as exc:
+            # 非提供方错误（输出非法）、正文已流式输出（换模型会重复文本）或已无后续候选：不再顺延
+            if not is_provider_error(exc) or exc.reply_emitted or i == last_index:
+                raise
+            continue
+        if i > 0 and rec.model_logs:
+            rec.model_logs[-1]["failover_from"] = pairs[0][1].model_id
+            rec.model_logs[-1]["attempt"] = i + 1
+        return parsed
+    raise ModelCallError("没有可用的模型候选")  # 不可达：循环内必然 return 或 raise
 
 
 def invoke_text(chat_model, cfg: ModelConfig, messages: list, rec: RunRecorder, node_name: str) -> str:
@@ -258,8 +385,8 @@ def complete_json(chat_model, messages: list) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise ModelCallError(f"{type(exc).__name__}: {exc}") from exc
     parsed = _parse_json(_final_text(resp.content))
-    if parsed is None:
-        raise ModelCallError("模型输出不是合法 JSON")
+    if not isinstance(parsed, dict):
+        raise ModelCallError("模型输出不是合法 JSON 对象")
     return parsed
 
 

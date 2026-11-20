@@ -355,13 +355,13 @@ GROUPS: dict[str, GroupDef] = {
                          "内置工具 sys.http 的默认允许主机（如 api.example.com 或 *.example.com）；"
                          "单个 Tool 的沙箱策略里配置了 http_allow_hosts 时以 Tool 为准。"
                          "留空且 Tool 也未配置时，sys.http 一律拒绝（SANDBOX_REQUIRED）。高风险工具默认关闭。"),
-                FieldDef("tool_routing_mode", "工具路由模式（全局默认）", "enum", "legacy_prompt",
+                FieldDef("tool_routing_mode", "工具路由模式（全局默认）", "enum", "deterministic_first",
                          "决定助手「听到员工一句话后，怎么从众多查询能力里挑出该调哪个接口」。"
                          "这里是全局默认：新对话若所属工作流发布里没单独写路由模式，就用本项；"
                          "若流程配置已发布并写了路由模式，以那次发布为准（跑着的旧对话也不变）。"
                          "行程报销等「固定写流程」不走这里，仍按白名单写 Workflow。"
                          "各模式白话说明——"
-                         "提示词海选：把可见查询能力的说明书塞给模型一次选；Tool 不多时最简单，默认兼容。"
+                         "提示词海选：把可见查询能力的说明书塞给模型一次选；Tool 不多时最简单，兼容/待迁移。"
                          "先选 Skill 再选 Tool：先判断属于哪类业务（如行程报销），再只在该类里选接口，减少跨业务误选。"
                          "检索召回再精选：先按关键词从能力库里捞一批候选，再让模型精选填参；Tool 变多时更合适。"
                          "元工具渐进披露：首轮不塞业务说明书；模型（或服务端）先 search_capabilities 再 get_tool_schema，"
@@ -369,7 +369,7 @@ GROUPS: dict[str, GroupDef] = {
                          "确定性优先：能靠固定说法/规则（含「先列表再详情」串联）直接定下就不问模型；定不下再走下面的回退模式。"
                          "小路由大填参：先便宜地定「用哪一个 Tool」，再用主模型只带这一份参数说明去填参，省 Token。",
                          options=(
-                             ("legacy_prompt", "提示词海选（兼容）"),
+                             ("legacy_prompt", "提示词海选（兼容/待迁移）"),
                              ("skill_then_tool", "先选 Skill 再选 Tool"),
                              ("retrieve_then_tool", "检索召回再精选"),
                              ("meta_search", "元工具渐进披露"),
@@ -410,12 +410,33 @@ GROUPS: dict[str, GroupDef] = {
                          "仅「元工具渐进披露」：search_capabilities / get_tool_schema 最多往返几次，防止无限追问说明书。"
                          "用尽仍未选中业务 Tool 时会向员工澄清（若开启低置信澄清）。默认 3。",
                          min=1, max=10, unit="次"),
+                FieldDef("react_max_rounds", "ReAct 轮次上限", "int", 8,
+                         "Think→Act→Observe 循环最多轮数；触顶后安全收尾。默认 8。",
+                         min=1, max=32, unit="轮"),
+                FieldDef("max_tool_calls", "工具调用次数上限", "int", 20,
+                         "单次任务累计工具调用次数上限（含读写）。默认 20。",
+                         min=1, max=100, unit="次"),
+                FieldDef("max_tool_retries", "工具重试次数上限", "int", 2,
+                         "同一逻辑操作允许的重试次数上限。默认 2。",
+                         min=0, max=10, unit="次"),
+                FieldDef("max_decision_repairs", "决策修复次数", "int", 2,
+                         "非法 Decision 结构允许自动修复的次数。默认 2。",
+                         min=0, max=5, unit="次"),
+                FieldDef("max_observation_tokens", "Observation 注入字符预算", "int", 24000,
+                         "注入模型的 Tool observations 最大字符数。默认 24000。",
+                         min=2000, max=200000, unit="字"),
+                FieldDef("max_execution_time", "任务墙钟时间上限", "int", 300,
+                         "单次任务最长执行秒数；0 表示不限制。默认 300。",
+                         min=0, max=7200, unit="秒"),
+                FieldDef("max_total_tokens", "任务累计 Token 上限", "int", 200000,
+                         "模型调用预留+结算累计上限；0 表示不限制。默认 200000。",
+                         min=0, max=5000000, unit="token"),
                 FieldDef("deterministic_fallback_mode", "确定性未命中回退模式", "enum", "skill_then_tool",
                          "仅在「确定性优先」下使用：当固定规则认不出员工意图时，改走哪一种选 Tool 方式。"
                          "不能再选「确定性优先」本身，否则会自己套自己。"
                          "建议保持「先选 Skill 再选 Tool」或「提示词海选」；Tool 很多时可用「检索召回再精选」。",
                          options=(
-                             ("legacy_prompt", "提示词海选"),
+                             ("legacy_prompt", "提示词海选（兼容/待迁移）"),
                              ("skill_then_tool", "先选 Skill 再选 Tool"),
                              ("retrieve_then_tool", "检索召回再精选"),
                              ("router_then_fill", "小路由大填参"),

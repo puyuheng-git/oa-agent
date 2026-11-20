@@ -6,10 +6,22 @@ import { errorMessage, http } from '@/shared/http'
 import { formatTime } from '@/shared/format'
 import {
   NO_DATA,
+  TOOLS_PATH,
+  ackKeepLegacy,
+  auditReasonError,
+  contractMigrateDiff,
+  fetchConfigTruth,
+  fetchOrphanTools,
   formatMs,
   formatRate,
+  migrateContract,
   rangeParams,
   routingEventMetadataDisplay,
+  routingModeLabel,
+  type ConfigTruth,
+  type ContractDiffLine,
+  type LegacyPromptRelease,
+  type OrphanToolItem,
   type RoutingEvent,
   type RoutingRunItem,
   type RoutingStats,
@@ -59,6 +71,22 @@ const statsLoading = ref(false)
 const stats = ref<RoutingStats | null>(null)
 const statsRange = ref<'24h' | '7d' | '30d'>('24h')
 
+const truthLoading = ref(false)
+const truth = ref<ConfigTruth | null>(null)
+const includeAcked = ref(false)
+const orphanItems = ref<OrphanToolItem[] | null>(null)
+
+const migrateOpen = ref(false)
+const migrateSaving = ref(false)
+const migrateRow = ref<LegacyPromptRelease | null>(null)
+const migrateReason = ref('')
+const migrateDiff = ref<ContractDiffLine[]>([])
+
+const ackOpen = ref(false)
+const ackSaving = ref(false)
+const ackRow = ref<LegacyPromptRelease | null>(null)
+const ackReason = ref('')
+
 function fromQuery() {
   const q = route.query
   for (const k of FILTER_KEYS) filters[k] = typeof q[k] === 'string' ? (q[k] as string) : ''
@@ -100,6 +128,85 @@ async function openDetail(row: RoutingRunItem) {
   } finally {
     detailLoading.value = false
   }
+}
+
+async function loadTruth() {
+  truthLoading.value = true
+  try {
+    truth.value = await fetchConfigTruth(includeAcked.value)
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    truthLoading.value = false
+  }
+}
+
+async function loadOrphans() {
+  try {
+    const data = await fetchOrphanTools()
+    orphanItems.value = data.items
+  } catch {
+    orphanItems.value = null
+  }
+}
+
+function openMigrate(row: LegacyPromptRelease) {
+  migrateRow.value = row
+  migrateDiff.value = contractMigrateDiff(row.tool_routing_mode)
+  migrateReason.value = ''
+  migrateOpen.value = true
+}
+
+async function submitMigrate() {
+  const row = migrateRow.value
+  if (!row) return
+  const err = auditReasonError(migrateReason.value)
+  if (err) {
+    ElMessage.warning(err)
+    return
+  }
+  migrateSaving.value = true
+  try {
+    const saved = await migrateContract(row.release_id, migrateReason.value.trim())
+    ElMessage.success(`已写入草稿 v${saved.draft_version.version_no}，请自行发布`)
+    migrateOpen.value = false
+    await loadTruth()
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    migrateSaving.value = false
+  }
+}
+
+function openAck(row: LegacyPromptRelease) {
+  ackRow.value = row
+  ackReason.value = ''
+  ackOpen.value = true
+}
+
+async function submitAck() {
+  const row = ackRow.value
+  if (!row) return
+  const err = auditReasonError(ackReason.value)
+  if (err) {
+    ElMessage.warning(err)
+    return
+  }
+  ackSaving.value = true
+  try {
+    await ackKeepLegacy(row.release_id, ackReason.value.trim())
+    ElMessage.success('已标记保留海选')
+    ackOpen.value = false
+    await loadTruth()
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    ackSaving.value = false
+  }
+}
+
+function openTools() {
+  router.push(TOOLS_PATH)
 }
 
 async function loadStats() {
@@ -148,6 +255,10 @@ watch(
   },
 )
 
+watch(includeAcked, () => {
+  loadTruth()
+})
+
 watch(activeTab, (tab) => {
   if (tab === 'stats') loadStats()
   else loadList()
@@ -156,12 +267,71 @@ watch(activeTab, (tab) => {
 
 onMounted(() => {
   fromQuery()
+  loadTruth()
+  loadOrphans()
   if (activeTab.value === 'stats') loadStats()
   else loadList()
 })
 </script>
 
 <template>
+  <el-card shadow="never" class="truth-card" v-loading="truthLoading">
+    <template #header>
+      <div class="truth-head">
+        <span>配置真相</span>
+        <el-checkbox v-model="includeAcked">含已确认保留海选</el-checkbox>
+      </div>
+    </template>
+    <el-alert v-if="truth?.note" type="info" :closable="false" :title="truth.note" />
+    <el-descriptions :column="2" border size="small" style="margin-top: 12px">
+      <el-descriptions-item label="全局路由模式">{{ routingModeLabel(truth?.global_mode) }}</el-descriptions-item>
+      <el-descriptions-item label="全局未命中回退">{{ routingModeLabel(truth?.global_fallback) }}</el-descriptions-item>
+    </el-descriptions>
+
+    <h4>在用工作流</h4>
+    <el-table :data="truth?.active_workflows ?? []" :empty-text="NO_DATA" size="small">
+      <el-table-column prop="workflow_id" label="工作流" min-width="160" />
+      <el-table-column prop="release_id" label="当前发布" min-width="180" />
+      <el-table-column label="快照模式" min-width="200">
+        <template #default="{ row }">{{ routingModeLabel(row.tool_routing_mode) }}</template>
+      </el-table-column>
+      <el-table-column label="与全局一致" width="110">
+        <template #default="{ row }">{{ row.matches_global ? '是' : '否' }}</template>
+      </el-table-column>
+    </el-table>
+
+    <h4>待迁移（提示词海选）</h4>
+    <el-table :data="truth?.legacy_prompt_releases ?? []" :empty-text="NO_DATA" size="small">
+      <el-table-column prop="workflow_id" label="工作流" min-width="140" />
+      <el-table-column prop="release_id" label="发布" min-width="160" />
+      <el-table-column label="版本" width="80">
+        <template #default="{ row }">{{ row.version_no ?? NO_DATA }}</template>
+      </el-table-column>
+      <el-table-column label="快照模式" min-width="180">
+        <template #default="{ row }">{{ routingModeLabel(row.tool_routing_mode) }}</template>
+      </el-table-column>
+      <el-table-column label="操作" width="220">
+        <template #default="{ row }">
+          <el-button type="primary" link @click="openMigrate(row)">迁移到契约默认</el-button>
+          <el-button link @click="openAck(row)">保留海选</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+    <p class="muted">迁移只写入该工作流草稿，不改已发布快照，也不改进行中的运行。写完后请自行校验并发布。</p>
+    <h4>孤儿清单</h4>
+    <el-table :data="orphanItems ?? []" :empty-text="NO_DATA" size="small">
+      <el-table-column prop="name" label="名称" min-width="180" />
+      <el-table-column prop="kind" label="类型" width="140" />
+      <el-table-column label="启用" width="90">
+        <template #default="{ row }">{{ row.enabled ? '是' : '否' }}</template>
+      </el-table-column>
+    </el-table>
+    <p class="truth-foot">
+      <el-link @click="openTools">打开工具页</el-link>
+      <span class="muted">{{ orphanItems == null ? NO_DATA : `${orphanItems.length} 个` }}</span>
+    </p>
+  </el-card>
+
   <el-card shadow="never">
     <el-tabs v-model="activeTab">
       <el-tab-pane label="过程明细" name="process">
@@ -357,9 +527,67 @@ onMounted(() => {
       </div>
     </el-drawer>
   </el-card>
+
+  <el-dialog
+    v-model="migrateOpen"
+    title="迁移到契约默认"
+    width="640px"
+    :close-on-click-modal="false"
+    :teleported="true"
+    append-to="body"
+  >
+    <p>
+      工作流 {{ migrateRow?.workflow_id || NO_DATA }}，发布 {{ migrateRow?.release_id || NO_DATA }}。
+      确认后只改草稿，已发布内容保持原样。
+    </p>
+    <el-table :data="migrateDiff" size="small" :empty-text="NO_DATA">
+      <el-table-column prop="label" label="配置项" width="140" />
+      <el-table-column label="变更前" min-width="180">
+        <template #default="{ row }">{{ row.key === 'tool_routing_mode' ? routingModeLabel(row.before) : row.before }}</template>
+      </el-table-column>
+      <el-table-column label="草稿将写入" min-width="180">
+        <template #default="{ row }">{{ row.key === 'routing_clarify_on_low_confidence' ? '开启（true）' : routingModeLabel(row.after) }}</template>
+      </el-table-column>
+    </el-table>
+    <p class="muted">回退与低置信澄清的变更前值接口未返回，表中记为「{{ NO_DATA }}」。</p>
+    <el-form label-width="72px" style="margin-top: 12px" @submit.prevent="submitMigrate">
+      <el-form-item label="原因">
+        <el-input v-model="migrateReason" maxlength="200" show-word-limit placeholder="至少 2 个字，写入审计" />
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="migrateOpen = false">取消</el-button>
+      <el-button type="primary" :loading="migrateSaving" @click="submitMigrate">确认迁移</el-button>
+    </template>
+  </el-dialog>
+
+  <el-dialog
+    v-model="ackOpen"
+    title="保留海选"
+    width="480px"
+    :close-on-click-modal="false"
+    :teleported="true"
+    append-to="body"
+  >
+    <p>
+      确认发布 {{ ackRow?.release_id || NO_DATA }} 继续使用提示词海选。只记审计，不改快照；默认清单不再列出此项。
+    </p>
+    <el-form label-width="72px" @submit.prevent="submitAck">
+      <el-form-item label="原因">
+        <el-input v-model="ackReason" maxlength="200" show-word-limit placeholder="至少 2 个字，写入审计" />
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="ackOpen = false">取消</el-button>
+      <el-button type="primary" :loading="ackSaving" @click="submitAck">确认保留</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <style scoped>
+.truth-card { margin-bottom: 12px; }
+.truth-head { display: flex; align-items: center; justify-content: space-between; }
+.truth-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .clickable :deep(tbody tr) { cursor: pointer; }
 .muted { color: var(--el-text-color-secondary); font-size: 12px; margin-top: 4px; }
 .meta {

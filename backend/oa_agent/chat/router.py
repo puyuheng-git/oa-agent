@@ -73,6 +73,8 @@ class MemoryClearIn(BaseModel):
 
 class ConfirmationIn(BaseModel):
     token: str = Field(min_length=10, max_length=128)
+    # confirm=落盘/继续；reject=取消（Skill 确认与写 Workflow 共用）
+    decision: Literal["confirm", "reject"] = "confirm"
 
 
 class WorkflowStartIn(BaseModel):
@@ -730,9 +732,11 @@ def delete_memory(
 
 @router.post("/confirmations/{task_id}")
 def confirm_workflow(task_id: str, body: ConfirmationIn, request: Request, auth: ChatAuth = Depends(chat_auth)):
-    """员工确认写操作：校验令牌后恢复固定 Workflow（管理员不能代确认）。"""
+    """员工确认写操作：校验令牌后恢复固定 Workflow 或落盘个人 Skill（管理员不能代确认）。"""
     rt = get_runtime(request)
-    return confirm_write(rt, auth.session, task_id, body.token.strip(), request.state.request_id)
+    return confirm_write(
+        rt, auth.session, task_id, body.token.strip(), request.state.request_id, decision=body.decision,
+    )
 
 
 @router.get("/runs/{run_id}")

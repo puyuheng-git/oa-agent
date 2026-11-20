@@ -1,10 +1,9 @@
 """Tool / Skill 注册表（设计 §8、§13 P4）。
 
-- Tool 来源：管理后台表单（source_file = "admin"），或从 openapi/*.yaml 的 operation（x-agent 扩展）导入。
-  两者走同一套 规范化 → 校验 → 哈希 → 与当前版本比较：unchanged 不动；compatible 自动生效；
-  breaking 存为待激活版本，需管理员激活。首次启动表为空时从文件导入一次，之后以后台为准。
-- 文件解析/校验失败：该文件的 Tool 记录失败原因，保留最后有效版本（导入失败不覆盖）。
-- 运行时注册表只包含：管理员启用 + 规范启用 + 低风险免确认 + GET 只读 + 有当前版本 的 Tool。
+- Tool / Skill 以管理后台为准（source_file = "admin"）；也可由测试夹具通过 sync_* 批量写入。
+  规范化 → 校验 → 哈希 → 与当前版本比较：unchanged 不动；compatible 自动生效；
+  breaking 存为待激活版本，需管理员激活。
+- 运行时注册表只包含：管理员启用 + 规范启用 + 低风险免确认 + 有当前版本 的 Tool。
 - Skill 声明说明、填参指引、示例问题与可用 Tool；依赖不可用时 Skill 校验失败，对话不会使用它。
 """
 
@@ -38,6 +37,8 @@ log = logging.getLogger(__name__)
 OPENAPI_DIR = REPO_ROOT / "openapi"
 SKILLS_DIR = REPO_ROOT / "skills"
 PARAM_TYPES = {"string", "integer", "number", "boolean", "object", "array", "file"}
+SCHEMA_MAX_DEPTH = 8
+RESULT_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 IDENTITY_FIELDS = {"oa"}
 RESULT_KINDS = {"list", "object"}
 RISK_LEVELS = {"low", "medium", "high"}
@@ -115,6 +116,10 @@ class SpecError(Exception):
         self.errors = errors
 
 
+class OrphanToolError(Exception):
+    """非 builtin Tool 尚未绑定 Skill，不能启用。"""
+
+
 def canonical_hash(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
                                      default=str).encode()).hexdigest()
@@ -122,27 +127,69 @@ def canonical_hash(value: Any) -> str:
 
 # ---------------- Tool：解析与规范化 ----------------
 
-def _normalize_param(name: str, rule: Any, errors: list[str], op: str) -> dict:
+def _normalize_schema_node(path: str, rule: Any, errors: list[str], depth: int = 0) -> dict:
+    """递归规范化 SchemaNode（object.properties / array.items / file.accept），深度上限 SCHEMA_MAX_DEPTH。
+
+    path 为错误文案前缀（model_params 与 result.schema 共用）。
+    """
     if not isinstance(rule, dict):
-        errors.append(f"{op}.model_params.{name} 必须是对象")
+        errors.append(f"{path} 必须是对象")
+        return {}
+    # 超过深度上限：记错并不再下钻
+    if depth > SCHEMA_MAX_DEPTH:
+        errors.append(f"{path} 嵌套深度超过 {SCHEMA_MAX_DEPTH}")
         return {}
     out = {k: rule[k] for k in ("type", "format", "enum", "minimum", "maximum", "default", "required", "description",
-                                "label", "enum_labels")
+                                "label", "enum_labels", "accept", "multiple")
            if k in rule and rule[k] not in (None, "", [], {})}
     if out.get("type", "string") not in PARAM_TYPES:
-        errors.append(
-            f"{op}.model_params.{name}.type 只支持 string / integer / number / boolean / object / array / file"
-        )
+        errors.append(f"{path}.type 只支持 string / integer / number / boolean / object / array / file")
     out.setdefault("type", "string")
     out["required"] = bool(out.get("required", False))
     if "enum" in out and not isinstance(out["enum"], list):
-        errors.append(f"{op}.model_params.{name}.enum 必须是数组")
+        errors.append(f"{path}.enum 必须是数组")
     if "enum_labels" in out:
         if not isinstance(out["enum_labels"], dict):
-            errors.append(f"{op}.model_params.{name}.enum_labels 必须是 取值→名称 的对象")
+            errors.append(f"{path}.enum_labels 必须是 取值→名称 的对象")
         else:
             out["enum_labels"] = {str(k): str(v) for k, v in out["enum_labels"].items()}
+    if "accept" in out:
+        if not isinstance(out["accept"], list):
+            errors.append(f"{path}.accept 必须是数组")
+            out.pop("accept", None)
+        else:
+            out["accept"] = [str(x) for x in out["accept"] if str(x).strip()]
+    # file + multiple → array of file
+    if out.get("type") == "file" and out.pop("multiple", False):
+        items = {"type": "file"}
+        if "accept" in out:
+            items["accept"] = out.pop("accept")
+        out = {k: v for k, v in out.items() if k in ("label", "description", "required")}
+        out["type"] = "array"
+        out["items"] = items
+        out["required"] = bool(rule.get("required", False))
+    if out.get("type") == "object":
+        props_raw = rule.get("properties") or {}
+        if props_raw and not isinstance(props_raw, dict):
+            errors.append(f"{path}.properties 必须是对象")
+        elif isinstance(props_raw, dict) and props_raw:
+            out["properties"] = {
+                str(k): _normalize_schema_node(f"{path}.{k}", v, errors, depth + 1)
+                for k, v in props_raw.items()
+            }
+    if out.get("type") == "array":
+        items_raw = rule.get("items")
+        if items_raw is None and "items" not in out:
+            out["items"] = {"type": "string"}
+        elif items_raw is not None:
+            out["items"] = _normalize_schema_node(f"{path}[]", items_raw, errors, depth + 1)
+    out.pop("multiple", None)
     return out
+
+
+def _normalize_param(name: str, rule: Any, errors: list[str], op: str, depth: int = 0) -> dict:
+    """规范化单个 model_params 条目（递归见 _normalize_schema_node）。"""
+    return _normalize_schema_node(f"{op}.model_params.{name}", rule, errors, depth)
 
 
 def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, list[str]]:
@@ -172,7 +219,14 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
     kind = result.get("kind", "object")
     if kind not in RESULT_KINDS:
         errors.append(f"{name}.result.kind 只支持 list / object")
-    fields = list(result.get("fields") or [])
+    fields_raw = list(result.get("fields") or [])
+    # 字段名只允许单段或一层点号（如 user.name）；非法字段记错并丢弃
+    fields = []
+    for f in fields_raw:
+        if isinstance(f, str) and RESULT_FIELD_RE.fullmatch(f):
+            fields.append(f)
+        else:
+            errors.append(f"{name}.result.fields 字段名无效（仅支持 a 或 a.b 一层）：{f}")
     if not fields:
         errors.append(f"{name}.result.fields 不能为空（只返回白名单字段）")
     labels = result.get("labels") or {}
@@ -230,6 +284,9 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
         "result": {"kind": kind, "fields": fields, "labels": labels,
                    "list_columns": [c for c in columns if c in fields]},
     }
+    # result.schema：可选的返回结构说明，递归规范化
+    if result.get("schema"):
+        spec["result"]["schema"] = _normalize_schema_node(f"{name}.result.schema", result["schema"], errors)
     if bindings_explicit:
         # 仅显式声明写入 schema（哈希）；inject 合成留给 to_tool_spec
         spec["identity_bindings"] = bindings
@@ -275,14 +332,11 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
         if not pname or not FIELD_RE.match(pname):
             errors.append(f"{name}.params 含无效字段名")
             continue
-        rule: dict[str, Any] = {
-            "type": raw.get("type") or "string",
-            "label": raw.get("label") or pname,
-            "required": bool(raw.get("required")),
-        }
-        for key in ("format", "enum", "minimum", "maximum", "default", "description", "enum_labels"):
-            if raw.get(key) not in (None, "", [], {}):
-                rule[key] = raw[key]
+        # 保留完整 SchemaNode（properties / items / accept / multiple 等），后续由 _normalize_schema_node 递归规范化
+        rule: dict[str, Any] = {k: v for k, v in raw.items() if k != "name"}
+        rule["type"] = raw.get("type") or "string"
+        rule["label"] = raw.get("label") or pname
+        rule["required"] = bool(raw.get("required"))
         model_params[pname] = rule
     returns = item.get("returns") if isinstance(item.get("returns"), dict) else {}
     risk = str(item.get("risk") or "low")
@@ -302,6 +356,7 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
             "fields": list(returns.get("fields") or []),
             "labels": dict(returns.get("labels") or {}),
             "list_columns": list(returns.get("list_columns") or []),
+            "schema": returns.get("schema"),
         },
     }
     if risk not in RISK_LEVELS:
@@ -359,7 +414,8 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
         "identity_params": form.get("identity_params") or {},
         "model_params": form.get("model_params") or {},
         "result": {"kind": result.get("kind") or "object", "fields": result.get("fields") or [],
-                   "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or []},
+                   "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or [],
+                   "schema": result.get("schema")},
     }
     if is_invoke:
         xa["invoke_service"] = inv_s
@@ -497,13 +553,43 @@ def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
         add("result.fields", "removed", removed, None, True)
     if added:
         add("result.fields", "added", None, added)
-    for key in ("labels", "list_columns"):
+    # schema 仅为返回结构元数据，变更可见但不算 breaking
+    for key in ("labels", "list_columns", "schema"):
         if old_res.get(key) != new_res.get(key):
             add(f"result.{key}", "changed", old_res.get(key), new_res.get(key))
     return (BREAKING if breaking else COMPATIBLE), diff
 
 
 # ---------------- Skill ----------------
+
+# 种类只约束可绑 Tool.kind，不参与 route()。空串不约束，兼容没有 category 的旧数据。
+SKILL_CATEGORY_KINDS = {
+    "oa_query": frozenset({"office", "open_oa_invoke"}),
+    "oa_invoke": frozenset({"office", "open_oa_invoke"}),
+    "external_mcp": frozenset({"mcp"}),
+    "platform": frozenset({"builtin"}),
+}
+
+
+def skill_category_kind_errors(
+    category: str, tool_kinds: list[tuple[str, str]], where: str = "Skill",
+) -> list[str]:
+    """非空种类时，每个 (tool 名, kind) 必须落在 SKILL_CATEGORY_KINDS。"""
+    cat = str(category or "").strip()
+    if not cat:
+        return []
+    allowed = SKILL_CATEGORY_KINDS.get(cat)
+    if allowed is None:
+        names = "、".join(SKILL_CATEGORY_KINDS)
+        return [f"{where}.category 只能是 {names} 或留空"]
+    errors = []
+    allowed_text = "、".join(sorted(allowed))
+    for name, kind in tool_kinds:
+        actual = kind or "office"
+        if actual not in allowed:
+            errors.append(f"{where} 种类 {cat} 不能绑定 {actual} 类型的 Tool：{name}（允许：{allowed_text}）")
+    return errors
+
 
 def normalize_skill(doc: dict, where: str = "Skill") -> tuple[dict, list[str]]:
     errors = []
@@ -528,6 +614,17 @@ def normalize_skill(doc: dict, where: str = "Skill") -> tuple[dict, list[str]]:
     instructions = str(doc.get("instructions") or "")
     if len(description) > MAX_TEXT or len(instructions) > MAX_TEXT:
         errors.append(f"{where} 的说明和填参指引各不超过 {MAX_TEXT} 字")
+    # 种类写入 content_json；非法值拒绝，空值保持不约束
+    raw_category = doc.get("category", "")
+    if raw_category is None:
+        raw_category = ""
+    if not isinstance(raw_category, str):
+        errors.append(f"{where}.category 只能是 {'、'.join(SKILL_CATEGORY_KINDS)} 或留空")
+        category = ""
+    else:
+        category = raw_category.strip()
+        if category and category not in SKILL_CATEGORY_KINDS:
+            errors.append(f"{where}.category 只能是 {'、'.join(SKILL_CATEGORY_KINDS)} 或留空")
     content = {
         "name": name.strip(),
         "display_name": str(doc.get("display_name") or name).strip()[:128],
@@ -535,6 +632,7 @@ def normalize_skill(doc: dict, where: str = "Skill") -> tuple[dict, list[str]]:
         "instructions": instructions.strip(),
         "examples": examples[:MAX_EXAMPLES],
         "workflow": str(doc.get("workflow") or ""),
+        "category": category,
         "tools": list(dict.fromkeys(t.strip() for t in tools)),
         "spec_enabled": doc.get("enabled", True) is True,
     }
@@ -712,6 +810,70 @@ class SkillState:
         return self.enabled and self.valid
 
 
+def iter_skill_tool_bindings(db: Session, tenant_id: str) -> dict[str, set[str]]:
+    """当前 Skill 版本 content_json.tools：tool_name -> 引用它的 Skill 名。"""
+    rows = db.execute(
+        sa.select(Skill.name, SkillVersion.content_json)
+        .join(SkillVersion, SkillVersion.id == Skill.current_version_id)
+        .where(Skill.tenant_id == tenant_id, Skill.current_version_id.is_not(None))
+    ).all()
+    bindings: dict[str, set[str]] = {}
+    for skill_name, content in rows:
+        # 只认当前版本；历史版本里的 tools 不再算绑定
+        tools = (content or {}).get("tools") or []
+        for raw in tools:
+            tool_name = str(raw).strip()
+            if not tool_name:
+                continue
+            bindings.setdefault(tool_name, set()).add(skill_name)
+    return bindings
+
+
+def tool_skill_refs(db: Session, tenant_id: str) -> dict[str, set[str]]:
+    """tool_name -> skill names。与 iter_skill_tool_bindings 相同。"""
+    return iter_skill_tool_bindings(db, tenant_id)
+
+
+def is_orphan_tool(db: Session, tenant_id: str, tool_name: str, kind: str) -> bool:
+    """builtin 允许不绑 Skill；其余 Tool 没有任何当前引用则为孤儿。"""
+    if (kind or "office") == "builtin":
+        return False
+    return tool_name not in iter_skill_tool_bindings(db, tenant_id)
+
+
+def assert_tool_bound_for_enable(db: Session, tenant_id: str, tool_name: str, kind: str) -> None:
+    """启用前校验。builtin 直接通过；未绑定的非 builtin 抛 OrphanToolError。"""
+    if is_orphan_tool(db, tenant_id, tool_name, kind):
+        raise OrphanToolError(f"启用前须先绑定 Skill：{tool_name}")
+
+
+def enabled_orphans_after_skill_tools(
+    db: Session, tenant_id: str, skill_name: str, new_tools: list[str],
+) -> list[str]:
+    """把该 Skill 的 tools 换成 new_tools 后，会失去全部引用且仍启用的非 builtin。"""
+    bindings = iter_skill_tool_bindings(db, tenant_id)
+    new_set = {str(name).strip() for name in new_tools if str(name).strip()}
+    # 只看本 Skill 当前持有、这次会拿掉的 Tool
+    current = {tool for tool, skills in bindings.items() if skill_name in skills}
+    removed = sorted(current - new_set)
+    if not removed:
+        return []
+    rows = db.scalars(sa.select(Tool).where(Tool.tenant_id == tenant_id, Tool.name.in_(removed))).all()
+    by_name = {row.name: row for row in rows}
+    orphaned: list[str] = []
+    for name in removed:
+        # 还有别的 Skill 引用则不是孤儿
+        if bindings.get(name, set()) - {skill_name}:
+            continue
+        tool = by_name.get(name)
+        if tool is None or not tool.enabled:
+            continue
+        if (tool.kind or "office") == "builtin":
+            continue
+        orphaned.append(name)
+    return orphaned
+
+
 class Catalog:
     def __init__(self, session_factory: Callable[[], Session], tenant_id: str,
                  openapi_dir: Path = OPENAPI_DIR, skills_dir: Path = SKILLS_DIR):
@@ -752,8 +914,12 @@ class Catalog:
         digest = canonical_hash(schema)
         tool = db.scalar(sa.select(Tool).where(Tool.tenant_id == self.tenant, Tool.name == spec["name"]))
         if tool is None:
-            tool = Tool(tenant_id=self.tenant, name=spec["name"], source_file=source, enabled=True,
-                        updated_by=operator)
+            kind = "office"
+            if spec.get("invoke_service") and spec.get("invoke_method"):
+                kind = "open_oa_invoke"
+            # 新建非 builtin 先停用，须绑定 Skill 后再走启用闸门
+            tool = Tool(tenant_id=self.tenant, name=spec["name"], source_file=source, enabled=False,
+                        kind=kind, updated_by=operator)
             db.add(tool)
             db.flush()
         current = db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
@@ -864,7 +1030,7 @@ class Catalog:
         return db.scalar(sa.select(model.id).where(model.tenant_id == self.tenant, model.name == name)) is not None
 
     def save_tool(self, db: Session, spec: dict, operator: str) -> dict:
-        """后台保存：与文件导入同一套版本规则（兼容变更立即生效，不兼容变更待激活）。"""
+        """后台保存：兼容变更立即生效，不兼容变更待激活。"""
         return self._sync_tool(db, ADMIN_SOURCE, ADMIN_SOURCE, spec, operator, utcnow())
 
     def save_skill(self, db: Session, content: dict, operator: str) -> Skill:
@@ -963,11 +1129,6 @@ class Catalog:
         return states
 
     def bootstrap(self) -> None:
-        """首次启动（表为空）时从仓库文件同步一次，保证开箱即用。"""
+        """启动时确保内置 Tool 存在；业务 Tool/Skill 由管理后台维护。"""
         with self._sf() as db, db.begin():
-            if db.scalar(sa.select(sa.func.count()).select_from(Tool).where(Tool.tenant_id == self.tenant)) == 0:
-                report = self.sync_tools(db, "system")
-                log.info("首次同步 Tool：%s", [t["name"] for t in report["tools"]])
-            if db.scalar(sa.select(sa.func.count()).select_from(Skill).where(Skill.tenant_id == self.tenant)) == 0:
-                self.sync_skills(db, "system")
             ensure_builtin_tools(db, self.tenant)
