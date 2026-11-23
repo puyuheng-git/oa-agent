@@ -136,7 +136,7 @@ def apply_oa_compat(values: dict, rows: dict[str, Setting] | None = None) -> dic
         upstreams = []
         if legacy_base:
             url = str(legacy_base).rstrip("/")
-            upstreams.append({"key": DEFAULT_UPSTREAM, "label": "office-api", "base_url": url})
+            upstreams.append({"key": DEFAULT_UPSTREAM, "label": "open-oa", "base_url": url})
         if isinstance(legacy_extra, list):
             for item in legacy_extra:
                 if isinstance(item, dict) and item.get("key"):

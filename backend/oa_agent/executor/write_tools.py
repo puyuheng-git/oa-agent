@@ -128,7 +128,7 @@ class WriteToolExecutor:
         try:
             client = self.clients.get(spec.upstream)
             if client is None:
-                raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 office-api 地址：{spec.upstream}")
+                raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置业务上游地址：{spec.upstream}")
             # write clients 均来自 OA upstreams 信任域，可回落 office 员工票
             auth = authorization_for(identity, spec.upstream, allow_office_fallback=True)
             resp = client.post(spec.path, clean, auth, timeout=spec.timeout_seconds,

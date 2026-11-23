@@ -224,8 +224,8 @@ def _skill_body(name: str, tools: list[str]) -> dict:
     return {**LEAVE_SKILL, "name": name, "display_name": name, "tools": tools, "reason": "入库闸门测试"}
 
 
-def test_enable_orphan_office_tool_rejected(admin):
-    """未绑定 Skill 的非 builtin Tool，停用后再启用应 400，且文案点明 Skill。"""
+def test_enable_orphan_office_tool_allowed(admin):
+    """未绑定 Skill 的非 builtin Tool 也可启用；对话仍只经 Skill 暴露，列表标 skill_bound=false。"""
     from tests.test_catalog_admin import _ensure_office_upstream
 
     _ensure_office_upstream(admin)
@@ -238,10 +238,14 @@ def test_enable_orphan_office_tool_rejected(admin):
     assert disabled.status_code == 200, disabled.text
     assert disabled.json()["enabled"] is False
 
-    r = admin.post(f"/v1/admin/tools/{name}/enable", json={"reason": "尝试启用"})
-    assert r.status_code == 400
-    assert "Skill" in _err_message(r)
-    assert admin.get(f"/v1/admin/tools/{name}").json()["enabled"] is False
+    r = admin.post(f"/v1/admin/tools/{name}/enable", json={"reason": "未绑 Skill 也启用"})
+    assert r.status_code == 200, r.text
+    assert r.json()["enabled"] is True
+    assert r.json().get("skill_bound") is False
+    listed = admin.get("/v1/admin/tools").json()["items"]
+    row = next(i for i in listed if i["name"] == name)
+    assert row["enabled"] is True
+    assert row["skill_bound"] is False
 
 
 def test_list_orphans_includes_unbound(admin):

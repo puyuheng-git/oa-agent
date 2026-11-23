@@ -24,7 +24,11 @@ import { normalizeNode, type SchemaNode } from '../schemaTree'
 import { buildArgsFromValues, mergeValuesOnSchemaChange } from '../schemaValue'
 import { flattenBagSchema, unwrapBagArgs } from '../wizardCallArgs'
 import { mergeProbeResultFields } from '../probeResultFields'
-import { emptyToolForm, toolFormFromSchema, toolPayload, type ToolForm } from '../catalogForm'
+import {
+  applyParamRows, emptyToolForm, paramRowsFromForm, toolFormFromSchema, toolPayload,
+  type ParamRow, type ToolForm,
+} from '../catalogForm'
+import type { SchemaType } from '../schemaTree'
 
 interface Upstream { key: string; label: string; base_url: string | null }
 
@@ -192,16 +196,39 @@ const editing = ref(false)
 const saving = ref(false)
 const form = ref<ToolForm>(emptyToolForm())
 const reason = ref('')
-// 顶层参数中填写了、但参数表里不存在的名称（toolPayload 会静默丢弃，这里提示）
-const unknownTopLevel = computed(() => {
-  const names = form.value.topLevelFields.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean)
-  const known = new Set(Object.keys(form.value.modelParams).map((k) => k.trim()))
-  return names.filter((n) => !known.has(n))
-})
+/** 扁平参数表（与 form.modelParams / topLevelFields 双向同步） */
+const paramRows = ref<ParamRow[]>([])
+const PARAM_TYPES: SchemaType[] = ['string', 'integer', 'number', 'boolean']
+/** el-collapse 激活面板名；含 adv 时展开高级树 */
+const advancedCollapse = ref<string[]>([])
+
+function syncParamRowsFromForm() {
+  paramRows.value = paramRowsFromForm(form.value)
+}
+
+function syncFormFromParamRows() {
+  applyParamRows(form.value, paramRows.value)
+}
+
+function onAdvancedCollapseChange(names: string | string[]) {
+  const list = Array.isArray(names) ? names : [names]
+  // 展开前先把表格写入 form，避免树读到旧数据；收起后再把树同步回表格
+  if (list.includes('adv')) syncFormFromParamRows()
+  else syncParamRowsFromForm()
+  advancedCollapse.value = list
+}
+
+function addParamRow() {
+  paramRows.value.push({
+    name: '', type: 'string', required: false, label: '', description: '', topLevel: false,
+  })
+}
 
 function create() {
   editing.value = false
   form.value = emptyToolForm(defaultUpstreamKey.value)
+  syncParamRowsFromForm()
+  advancedCollapse.value = []
   reason.value = ''
   draftWarnings.value = []
   skillDraft.value = null
@@ -263,6 +290,8 @@ async function runImport() {
 function useDraft(d: ApipostDraft) {
   editing.value = false
   form.value = toolFormFromSchema(d.form)
+  syncParamRowsFromForm()
+  advancedCollapse.value = []
   reason.value = `从 Apipost 导入：${d.source?.name || d.form.name}`.slice(0, 200)
   draftWarnings.value = d.warnings
   skillDraft.value = d.skill || null
@@ -329,8 +358,6 @@ const wizard = ref({
 // 请求参数 Schema（落库的 model_params）与试调值（仅本页，不落库）
 const wizardParams = ref<Record<string, SchemaNode>>({})
 const wizardValues = ref<Record<string, unknown>>({})
-// 可选：返回结构 Schema（落库为 result.schema）
-const wizardResultSchema = ref<SchemaNode | null>(null)
 
 // Schema 变更后迁移已填试调值（同名同类型保留，新增键补 default）
 watch(wizardParams, (next, prev) => {
@@ -357,7 +384,6 @@ function openExportWizard() {
   wizard.value.methodFilter = ''
   wizardParams.value = {}
   wizardValues.value = {}
-  wizardResultSchema.value = null
   wizard.value.resultRows = [{ field: 'id', label: '编号' }]
 }
 
@@ -460,7 +486,6 @@ async function wizardPickMethod(row: WizardMethod) {
     // 先清空试调值，再换 Schema：watch 会按 default 补齐
     wizardValues.value = {}
     wizardParams.value = params
-    wizardResultSchema.value = null
   } catch (e) {
     wizardError.value = errorMessage(e)
   } finally {
@@ -620,7 +645,6 @@ async function wizardSave() {
         fields,
         labels,
         list_columns: wizard.value.resultKind === 'list' ? fields.slice(0, 6) : [],
-        schema: wizardResultSchema.value ? normalizeNode(wizardResultSchema.value) : null,
       },
     })
     ElMessage.success('已入库，请到列表中启用')
@@ -673,6 +697,10 @@ async function edit(name: string) {
     }
     editing.value = true
     form.value = toolFormFromSchema(d.current_schema)
+    syncParamRowsFromForm()
+    advancedCollapse.value = Object.values(form.value.modelParams).some(
+      (n) => n.type === 'object' || n.type === 'array' || n.type === 'file',
+    ) ? ['adv'] : []
     // 配置里若仍是 office，把展示值对齐到已配置的上游 key，避免「未配置」误导
     if (!upstreams.value.some((u) => u.key === form.value.upstream)) {
       if (form.value.upstream === 'open_oa' && upstreams.value.some((u) => u.key === 'office')) {
@@ -760,6 +788,7 @@ async function save() {
     ElMessage.warning('请填写变更原因（至少 2 个字，写入审计）')
     return
   }
+  syncFormFromParamRows()
   saving.value = true
   try {
     const body = { ...toolPayload(form.value), reason: reason.value.trim() }
@@ -818,6 +847,7 @@ onMounted(load)
         <template #default="{ row }">
           <el-link type="primary" @click="open(row.name)">{{ row.name }}</el-link>
           <el-tag v-if="row.kind" size="small" effect="plain" style="margin-left: 6px">{{ KIND_LABEL[row.kind as ToolKind] || row.kind }}</el-tag>
+          <el-tag v-if="row.kind !== 'builtin' && row.skill_bound === false" size="small" type="warning" style="margin-left: 6px">未绑定 Skill</el-tag>
           <div class="muted">{{ row.summary }}</div>
           <div v-if="row.path" class="muted">
             <el-tag v-if="upstreamLabel(row.upstream)" size="small" type="info">{{ upstreamLabel(row.upstream) }}</el-tag>
@@ -941,45 +971,91 @@ onMounted(load)
           <el-input-number v-model="form.timeout_seconds" :min="1" :max="60" />
         </el-form-item>
 
-        <h4 class="sec">身份与传参</h4>
+        <h4 class="sec">身份注入</h4>
         <el-form-item label="注入员工身份">
           <el-switch v-model="form.injectOa" />
-          <span class="hint">开启后服务端把当前员工 <code>oa</code> 写入 JSON 参数；模型/客户端给的 oa 一律丢弃。参数表中不能出现 oa。</span>
+          <span class="hint">开启后由服务端写入当前员工账号，模型无法伪造。业务上游须按 token 校验本人数据。</span>
         </el-form-item>
-        <el-form-item label="JSON 参数字段">
-          <el-input v-model="form.query_params_field" style="width: 240px" placeholder="如 queryParams" />
-          <span class="hint">非「顶层」的参数打包成 JSON 放进这个查询参数；留空则所有参数直接作为查询参数（此时不能注入身份）。</span>
-        </el-form-item>
-        <el-form-item label="身份查询参数">
-          <el-input v-model="form.identityParams" style="width: 240px" placeholder="如 user_id，多个用逗号分隔" />
-          <span class="hint">这些查询参数由服务端填入当前员工 oa，模型无法指定、也不能出现在参数表中。须由业务上游按 token 校验该值，否则不安全。</span>
+        <template v-if="form.injectOa">
+          <el-form-item label="写入参数名" required>
+            <el-input v-model="form.identityParamName" style="width: 200px" placeholder="如 oa 或 user_id" />
+            <span class="hint">请求里的键名；值始终是当前员工账号。</span>
+          </el-form-item>
+          <el-form-item label="身份放在哪">
+            <el-radio-group v-model="form.identityPlacement">
+              <el-radio value="independent">独立参数（平铺 query）</el-radio>
+              <el-radio value="bag">打包字段内（关联数组 / JSON 对象）</el-radio>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item v-if="form.identityPlacement === 'bag'" label="打包字段名" required>
+            <el-input v-model="form.query_params_field" style="width: 200px" placeholder="如 queryParams、params" />
+            <span class="hint">例：?queryParams={"user_id":"张三","status":1}</span>
+          </el-form-item>
+          <el-form-item v-else label="参数打包字段">
+            <el-input v-model="form.query_params_field" style="width: 200px" placeholder="可选，如 queryParams" />
+            <span class="hint">身份仍平铺；若填写，未勾「顶层」的模型参数打进该 JSON。留空则全部平铺。</span>
+          </el-form-item>
+        </template>
+        <el-form-item v-else label="参数打包字段">
+          <el-input v-model="form.query_params_field" style="width: 200px" placeholder="可选，如 queryParams" />
+          <span class="hint">未勾「顶层」的模型参数打进该 JSON；留空则全部作为普通查询参数。</span>
         </el-form-item>
 
         <h4 class="sec">模型可填的参数</h4>
-        <SchemaTreeEditor v-model="form.modelParams" mode="params" />
-        <el-form-item label="顶层参数" style="margin-top: 8px">
-          <el-input v-model="form.topLevelFields" style="width: 320px" placeholder="如 limit, page，多个用逗号分隔" />
-          <span class="hint">这些参数直接作为查询参数传递；其余参数打包进「JSON 参数字段」。</span>
-          <div v-if="unknownTopLevel.length" class="hint" style="color: var(--el-color-warning)">
-            以下名称不在上方参数表中，保存时会被忽略：{{ unknownTopLevel.join(', ') }}
-          </div>
-        </el-form-item>
-        <div class="hint">删除参数、新增必填参数、收紧可选值等属于不兼容变更，保存后需在详情中激活。</div>
+        <el-table :data="paramRows" size="small" border>
+          <el-table-column label="参数名" min-width="120">
+            <template #default="{ row }"><el-input v-model="row.name" size="small" placeholder="如 status" /></template>
+          </el-table-column>
+          <el-table-column label="类型" width="120">
+            <template #default="{ row }">
+              <el-select v-model="row.type" size="small" style="width: 100%">
+                <el-option v-for="t in PARAM_TYPES" :key="t" :value="t" :label="t" />
+              </el-select>
+            </template>
+          </el-table-column>
+          <el-table-column label="必填" width="70">
+            <template #default="{ row }"><el-checkbox v-model="row.required" /></template>
+          </el-table-column>
+          <el-table-column label="显示名" min-width="100">
+            <template #default="{ row }"><el-input v-model="row.label" size="small" /></template>
+          </el-table-column>
+          <el-table-column label="说明" min-width="140">
+            <template #default="{ row }"><el-input v-model="row.description" size="small" /></template>
+          </el-table-column>
+          <el-table-column label="顶层" width="70">
+            <template #default="{ row }">
+              <el-checkbox v-model="row.topLevel" :disabled="!form.query_params_field.trim() && form.identityPlacement !== 'bag'" />
+            </template>
+          </el-table-column>
+          <el-table-column label="" width="64">
+            <template #default="{ $index }">
+              <el-button link type="danger" size="small" @click="paramRows.splice($index, 1)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-button size="small" style="margin: 6px 0 4px" @click="addParamRow">添加参数</el-button>
+        <div class="hint">勾选「顶层」的参数直接作为查询参数；其余进入打包字段 JSON。无打包字段时全部平铺。删除/新增必填等不兼容变更保存后需在详情中激活。</div>
+        <el-collapse :model-value="advancedCollapse" style="margin-top: 8px" @change="onAdvancedCollapseChange">
+          <el-collapse-item title="高级：嵌套参数（对象/数组/文件）" name="adv">
+            <SchemaTreeEditor v-model="form.modelParams" mode="params" />
+            <div class="hint">改完高级树后，保存前会与上方表格合并；同名节点保留树中的嵌套结构。</div>
+          </el-collapse-item>
+        </el-collapse>
 
         <h4 class="sec">返回结果</h4>
         <el-form-item label="结果类型">
           <el-radio-group v-model="form.result_kind">
-            <el-radio value="list">列表（表格展示）</el-radio>
-            <el-radio value="object">单条记录（详情展示）</el-radio>
+            <el-radio value="list">列表</el-radio>
+            <el-radio value="object">单条记录</el-radio>
           </el-radio-group>
         </el-form-item>
-        <SchemaTreeEditor v-model="form.resultSchema" mode="result-root" />
-        <el-table :data="form.fields" size="small" border style="margin-top: 8px">
-          <el-table-column label="字段（office-api 返回的键）" min-width="200">
-            <template #default="{ row }"><el-input v-model="row.key" size="small" placeholder="如 id、user.name（支持一层点路径）" /></template>
+        <div class="hint" style="margin-bottom: 6px">白名单：只有下列字段会回给模型/员工。字段名为上游返回的键，支持一层点路径（如 user.name）。</div>
+        <el-table :data="form.fields" size="small" border>
+          <el-table-column label="字段名（上游返回的键）" min-width="200">
+            <template #default="{ row }"><el-input v-model="row.key" size="small" placeholder="如 id、user.name" /></template>
           </el-table-column>
           <el-table-column label="显示名称" min-width="160">
-            <template #default="{ row }"><el-input v-model="row.label" size="small" placeholder="留空：详情中不显示" /></template>
+            <template #default="{ row }"><el-input v-model="row.label" size="small" placeholder="留空则详情中不显示" /></template>
           </el-table-column>
           <el-table-column v-if="form.result_kind === 'list'" label="列表中显示" width="100">
             <template #default="{ row }"><el-checkbox v-model="row.inList" /></template>
@@ -991,7 +1067,7 @@ onMounted(load)
           </el-table-column>
         </el-table>
         <el-button size="small" style="margin: 6px 0 4px" @click="addField">添加字段</el-button>
-        <div class="hint">只有列在这里的字段会返回给员工（白名单），其余字段丢弃。未勾选「列表中显示」时默认显示前 6 个字段。</div>
+        <div class="hint">未勾选「列表中显示」时默认显示前 6 个字段。</div>
 
         <h4 class="sec">变更原因</h4>
         <el-form-item label="原因" required>
@@ -1200,13 +1276,6 @@ onMounted(load)
                 </el-table-column>
               </el-table>
               <el-button style="margin-top: 6px" @click="wizardAddResultRow">添加返回字段</el-button>
-            </div>
-          </el-form-item>
-
-          <el-form-item label="返回结构">
-            <div style="width: 100%">
-              <div class="hint" style="margin-bottom: 6px">可选：描述接口返回的数据结构，落库为 result.schema，供模型理解返回内容。</div>
-              <SchemaTreeEditor v-model="wizardResultSchema" mode="result-root" />
             </div>
           </el-form-item>
 

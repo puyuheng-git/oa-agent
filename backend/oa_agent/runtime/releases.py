@@ -54,7 +54,7 @@ FIELDS = (
     {"key": "on_upstream_error", "group": BASIC, "label": "上游故障处理", "kind": "enum",
      "options": [{"value": "fail", "label": "直接失败（提示员工稍后再试）"},
                  {"value": "handoff", "label": "转人工介入（管理员决定重试或终止）"}],
-     "help": "office-api 超时、不可达或返回 5xx 时的处理。转人工后运行挂起，在「人工介入」页处理；"
+     "help": "业务上游超时、不可达或返回 5xx 时的处理。转人工后运行挂起，在「人工介入」页处理；"
              "业务校验失败（4xx）不会转人工，直接把业务系统的提示告诉员工"},
     {"key": "help_text", "group": BASIC, "label": "帮助回复", "kind": "text", "max": 2000,
      "help": "员工问「你能做什么」或问题无法处理时的回复。留空则按可用 Skill 的名称、说明和示例问题自动生成（推荐）；"

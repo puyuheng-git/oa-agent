@@ -16,7 +16,7 @@ withDefaults(defineProps<{ focus?: 'skill' | 'tool' | 'mcp' }>(), { focus: 'skil
         <b>Skill</b>：员工能力包。决定员工能用什么、示例问题与可用 Tool，授权在 Skill 上配置。
       </li>
       <li :class="{ active: focus === 'tool' }">
-        <b>Tool</b>：原子能力，有三种来源——OA 接口（office）、平台内置（builtin）、外部 MCP（mcp）。
+        <b>Tool</b>：原子能力（业务上游 HTTP / open-oa 调用 / 内置 / MCP）。可先启用；对话只加载 Skill，须在 Skill 中绑定后员工才能用到。
       </li>
       <li :class="{ active: focus === 'mcp' }">
         <b>MCP</b>：外部连接，只负责接入；谁能用、能用哪些，授权在 Skill，而不在 MCP 连接上。
