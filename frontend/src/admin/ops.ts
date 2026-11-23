@@ -68,6 +68,8 @@ export interface ToolItem {
   sandbox_policy?: Record<string, unknown> | null
   registered: boolean
   unregistered_reasons: string[]
+  /** 是否已被至少一个 Skill 引用；未绑定也可启用，但对话不会加载该 Tool */
+  skill_bound?: boolean
   current_version_no: number | null
   pending_version_no: number | null
   pending_compat: string | null

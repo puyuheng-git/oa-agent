@@ -842,9 +842,8 @@ def is_orphan_tool(db: Session, tenant_id: str, tool_name: str, kind: str) -> bo
 
 
 def assert_tool_bound_for_enable(db: Session, tenant_id: str, tool_name: str, kind: str) -> None:
-    """启用前校验。builtin 直接通过；未绑定的非 builtin 抛 OrphanToolError。"""
-    if is_orphan_tool(db, tenant_id, tool_name, kind):
-        raise OrphanToolError(f"启用前须先绑定 Skill：{tool_name}")
+    """历史闸门：曾要求启用前必须绑 Skill。现已允许未绑定启用（对话仍只经 Skill 暴露），保留空实现兼容旧调用。"""
+    return None
 
 
 def enabled_orphans_after_skill_tools(

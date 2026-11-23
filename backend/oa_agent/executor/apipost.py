@@ -179,7 +179,7 @@ def to_draft(api: dict, max_columns: int = MAX_COLUMNS) -> dict:
         if key.lower() in IDENTITY_KEYS or IDENTITY_HINT.search(desc):
             identity[key] = "oa"
             warnings.append(f"参数 {key}（{desc or '无说明'}）识别为员工身份：改由服务端注入当前员工 oa，模型不可填。"
-                            "请确认 office-api 会校验它与员工 token 一致")
+                            "请确认业务上游会校验它与员工 token 一致")
             continue
         if key == "queryParams":
             query_field = key
@@ -245,7 +245,7 @@ def to_draft(api: dict, max_columns: int = MAX_COLUMNS) -> dict:
         "result": {"kind": kind or "object", "fields": fields, "labels": labels, "list_columns": columns},
     }
     if not identity and not query_field:
-        warnings.append("没有识别到身份参数：office-api 只能凭员工 token 判断本人，请确认接口确实如此")
+        warnings.append("没有识别到身份参数：业务上游只能凭员工 token 判断本人，请确认接口确实如此")
     return {"form": form, "warnings": warnings,
             "source": {"target_id": api.get("target_id"), "name": name, "method": method, "url": api.get("url")}}
 

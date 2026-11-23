@@ -21,7 +21,7 @@ def parse_oa_office(
         hint = business_hint(body, hint_max) if isinstance(body, dict) or body is not None else ""
         raise ConnectorError(
             "OFFICE_TOKEN_EXPIRED",
-            f"office-api 拒绝访问（HTTP {status_code}）{(' ' + hint) if hint else ''}".rstrip(),
+            f"业务上游拒绝访问（HTTP {status_code}）{(' ' + hint) if hint else ''}".rstrip(),
             status_code,
             user_message=hint,
         )
@@ -29,7 +29,7 @@ def parse_oa_office(
         hint = business_hint(body, hint_max) if status_code < 500 else ""
         raise ConnectorError(
             "UPSTREAM_HTTP_ERROR",
-            f"office-api HTTP {status_code} {hint}".strip(),
+            f"业务上游 HTTP {status_code} {hint}".strip(),
             status_code,
             user_message=hint,
         )
@@ -44,13 +44,13 @@ def parse_oa_office(
         if looks_like_login_hint(hint):
             raise ConnectorError(
                 "OFFICE_TOKEN_EXPIRED",
-                f"office-api 登录失效 code={code} {hint}".strip(),
+                f"业务上游登录失效 code={code} {hint}".strip(),
                 status_code,
                 user_message=hint,
             )
         raise ConnectorError(
             "UPSTREAM_BIZ_ERROR",
-            f"office-api 业务错误 code={code} {hint}".strip(),
+            f"业务上游业务错误 code={code} {hint}".strip(),
             status_code,
             user_message=hint,
         )

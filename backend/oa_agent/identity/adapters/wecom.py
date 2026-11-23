@@ -34,7 +34,7 @@ class WeComIdP:
         client = payload.get("client")
         if client is not None and callable(getattr(client, "mint_by_wework", None)):
             return client  # type: ignore[return-value]
-        raise OfficeApiError("OFFICE_API_NOT_CONFIGURED", "未配置 office-api 客户端")
+        raise OfficeApiError("OFFICE_API_NOT_CONFIGURED", "未配置 open-oa 客户端")
 
     def verify(self, payload: dict, *, ctx: IdPContext) -> PrincipalClaims:
         wework_user_id = str(payload.get("wework_user_id") or "").strip()

@@ -190,8 +190,8 @@ export function resolveToolGuide(detail: ToolDetail | null): ToolGuide | null {
   return {
     kind: 'office',
     summary: detail.summary || String(schema.summary || ''),
-    runtime: 'OfficeApiClient（员工 token）',
-    how: '调用时由 ToolExecutor 用员工会话里的 OA token，向所选上游 office-api 发 HTTP；路径只存相对 path。业务授权在 office-api，本系统不访问 OA 业务库。',
+    runtime: '业务上游 HTTP（员工 token）',
+    how: '调用时由 ToolExecutor 用员工会话里的 OA token，向所选业务上游发 HTTP；路径只存相对 path。业务授权在上游 / Service，本系统不访问 OA 业务库。',
     constraints: [
       '身份字段由服务端注入，模型不可伪造 oa / token',
       '只允许契约内 method + path + 参数白名单',

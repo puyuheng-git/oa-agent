@@ -26,8 +26,8 @@ from oa_agent.integrations.open_oa import (
 from oa_agent.executor import apipost
 from oa_agent.executor.builtin_catalog import TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_guide
 from oa_agent.executor.catalog import (
-    OrphanToolError, assert_tool_bound_for_enable, canonical_hash, compare,
-    enabled_orphans_after_skill_tools, iter_skill_tool_bindings,
+    canonical_hash, compare, enabled_orphans_after_skill_tools, is_orphan_tool,
+    iter_skill_tool_bindings,
     normalize_open_oa_catalog_item, normalize_skill, normalize_tool_form,
     recover_open_oa_invoke_schema, registration_blockers, skill_category_kind_errors,
 )
@@ -79,6 +79,7 @@ class ToolIn(ReasonIn):
     path: str = Field(max_length=255)
     timeout_seconds: float = 10
     inject_identity_fields: list[str] = Field(default_factory=list)
+    identity_bindings: list[dict[str, str]] | None = None
     top_level_fields: list[str] = Field(default_factory=list)
     query_params_field: str | None = Field(None, max_length=64)
     identity_params: dict[str, str] = Field(default_factory=dict)
@@ -188,8 +189,8 @@ def _office_guide(tool: Tool, schema: dict | None) -> dict:
         "kind": "office",
         "summary": tool.summary or schema.get("summary") or "",
         "how": (
-            "调用时由 ToolExecutor 用员工会话里的 OA token，向所选上游 office-api 发 HTTP；"
-            "路径只存相对 path，完整 URL 由上游 base_url 拼出。业务授权与校验在 office-api / Service，"
+            "调用时由 ToolExecutor 用员工会话里的 OA token，向所选业务上游发 HTTP；"
+            "路径只存相对 path，完整 URL 由上游 base_url 拼出。业务授权与校验在上游 / Service，"
             "本系统不访问 OA 业务库，模型输出不参与权限判定。"
         ),
         "constraints": [
@@ -202,7 +203,7 @@ def _office_guide(tool: Tool, schema: dict | None) -> dict:
         "model_params": dict(schema.get("model_params") or {}),
         "identity_params": dict(schema.get("identity_params") or {}),
         "result": dict(schema.get("result") or {}),
-        "runtime": "OfficeApiClient（员工 token）",
+        "runtime": "业务上游 HTTP（员工 token）",
         "edit_hint": "可在本页编辑 method/path/参数与结果字段，并走版本激活。",
     }
 
@@ -300,13 +301,19 @@ def _tool_guide(ctx: AdminCtx, tool: Tool, schema: dict | None) -> dict | None:
     return _office_guide(tool, schema)
 
 
-def _tool_view(ctx: AdminCtx, tool: Tool) -> dict:
+def _tool_view(ctx: AdminCtx, tool: Tool, *, skill_bound: bool | None = None) -> dict:
     current = ctx.db.get(ToolVersion, tool.current_version_id) if tool.current_version_id else None
     schema = current.schema_json if current else {}
     blockers = registration_blockers(tool, current is not None, schema.get("method"))
     pending = ctx.db.get(ToolVersion, tool.pending_version_id) if tool.pending_version_id else None
+    kind = tool.kind or "office"
+    # builtin 不要求绑 Skill；其余未传入 skill_bound 时按引用表现算
+    if skill_bound is None:
+        skill_bound = kind == "builtin" or not is_orphan_tool(
+            ctx.db, ctx.runtime.tenant_id, tool.name, kind,
+        )
     return {
-        "name": tool.name, "kind": tool.kind or "office",
+        "name": tool.name, "kind": kind,
         "summary": tool.summary, "method": schema.get("method"), "path": schema.get("path"),
         "upstream": schema.get("upstream", DEFAULT_UPSTREAM) if current else None,
         "source_file": tool.source_file, "enabled": tool.enabled,
@@ -318,6 +325,7 @@ def _tool_view(ctx: AdminCtx, tool: Tool) -> dict:
         "sandbox_policy": dict(tool.sandbox_policy_json or {}) or None,
         "registered": ctx.runtime.engine.registry.get(tool.name) is not None,
         "unregistered_reasons": blockers,
+        "skill_bound": bool(skill_bound),
         "current_version_no": _version_no(ctx, tool.current_version_id),
         "pending_version_no": pending.version_no if pending else None,
         "pending_compat": pending.compat_level if pending else None,
@@ -335,7 +343,7 @@ def _upstreams(ctx: AdminCtx) -> list[dict]:
     base = values.get("office_api_base_url") or values.get("mint_base_url")
     out = []
     if base:
-        out.append({"key": DEFAULT_UPSTREAM, "label": "office-api", "base_url": base})
+        out.append({"key": DEFAULT_UPSTREAM, "label": "open-oa", "base_url": base})
     out.extend(values.get("extra_upstreams") or [])
     return out
 
@@ -347,12 +355,18 @@ def list_tools(kind: Literal["office", "open_oa_invoke", "builtin", "mcp"] | Non
     if kind:
         stmt = stmt.where(Tool.kind == kind)
     tools = ctx.db.scalars(stmt.order_by(Tool.name)).all()
+    bindings = iter_skill_tool_bindings(ctx.db, ctx.runtime.tenant_id)
     oa = ctx.runtime.settings_svc.view(ctx.db, "oa")["values"]
     default_key = (oa.get("default_upstream_key") or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
     ups = _upstreams(ctx)
     if ups and default_key not in {u["key"] for u in ups}:
         default_key = ups[0]["key"]
-    return {"items": [_tool_view(ctx, t) for t in tools], "upstreams": ups, "default_upstream_key": default_key}
+    items = []
+    for t in tools:
+        kind_val = t.kind or "office"
+        bound = kind_val == "builtin" or t.name in bindings
+        items.append(_tool_view(ctx, t, skill_bound=bound))
+    return {"items": items, "upstreams": ups, "default_upstream_key": default_key}
 
 
 @tools_router.get("/orphans")
@@ -786,17 +800,9 @@ def delete_tool(name: str, body: ReasonIn, ctx: AdminCtx = Depends(admin_write(T
 def _toggle(ctx: AdminCtx, name: str, enabled: bool, reason: str) -> dict:
     with ctx.db.begin():
         tool = _get_tool(ctx, name)
-        # 启用非 builtin 前必须已有 Skill 引用；停用不设这道闸
-        if enabled:
-            try:
-                assert_tool_bound_for_enable(
-                    ctx.db, ctx.runtime.tenant_id, tool.name, tool.kind or "office",
-                )
-            except OrphanToolError as exc:
-                raise AppError(400, "TOOL_UNBOUND", str(exc)) from None
+        # 允许未绑 Skill 时启用；对话只加载 Skill，未绑定 Tool 不会出现在对话候选里
         before = tool.enabled
         tool.enabled, tool.updated_by = enabled, ctx.user.username
-        # 绑定发生在停用期间时，启用后重算 Skill 校验，否则功能仍不可用
         if enabled:
             ctx.runtime.engine.catalog.revalidate_skills(ctx.db)
         ctx.audit("tool.enable" if enabled else "tool.disable", "tool", name, before={"enabled": before},

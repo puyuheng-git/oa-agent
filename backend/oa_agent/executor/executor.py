@@ -303,7 +303,7 @@ def _extract_list(data: object) -> tuple[list, int]:
                     return rows, int(total)
                 except (TypeError, ValueError):
                     return rows, len(rows)
-    raise ToolError("UPSTREAM_BAD_RESPONSE", "office-api 列表响应结构无法识别")
+    raise ToolError("UPSTREAM_BAD_RESPONSE", "业务上游列表响应结构无法识别")
 
 
 class ToolExecutor:

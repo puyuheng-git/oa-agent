@@ -218,7 +218,7 @@ GROUPS: dict[str, GroupDef] = {
                 _text("office_api_not_configured", "助手未配置", "助手尚未完成配置，请联系管理员。",
                       "未配置 open-oa 地址时给员工的提示"),
                 _text("upstream_not_configured", "查询地址未配置", "该查询功能尚未完成配置，请联系管理员。",
-                      "Tool 指向的 office-api 地址不存在时给员工的提示"),
+                      "Tool 指向的业务上游地址不存在时给员工的提示"),
                 _text("invalid_argument", "查询条件有误", "查询条件有误：{message}",
                       "Tool 参数校验失败时给员工的提示，{message} 会替换为具体原因"),
                 _text("tool_not_available", "功能未开放（Tool）", "该功能未对你开放。",
@@ -231,7 +231,7 @@ GROUPS: dict[str, GroupDef] = {
                 _text("intervention_expired", "介入过期", "业务系统暂时不可用，请稍后重新提问。",
                       "人工介入任务超时未处理时给员工的提示"),
                 _text("upstream_unavailable", "业务系统不可用", "业务系统暂时不可用，请稍后再试。",
-                      "office-api 超时、5xx 等故障时给员工的提示（不展示接口原文）"),
+                      "业务上游超时、5xx 等故障时给员工的提示（不展示接口原文）"),
                 _text("handoff", "已转人工", "业务系统暂时不可用，已转人工处理。处理完成后结果会显示在这里，你也可以稍后重新提问。",
                       "上游故障且发布配置为「转人工介入」时给员工的提示"),
                 _text("generic_failure", "通用失败", "处理失败，请稍后再试。", "其他未分类错误时给员工的提示"),
@@ -350,7 +350,7 @@ GROUPS: dict[str, GroupDef] = {
                          min=1, max=366, unit="天"),
                 FieldDef("write_workflows_enabled", "启用固定写 Workflow", "bool", False,
                          "开启后允许运行行程报销等固定写闭环（查→草稿→员工确认→提交）。"
-                         "office-api 写接口未就绪或探针失败时应保持关闭；默认关闭。"),
+                         "业务上游写接口未就绪或探针失败时应保持关闭；默认关闭。"),
                 FieldDef("http_allow_hosts", "内置 HTTP 全局白名单", "list", [],
                          "内置工具 sys.http 的默认允许主机（如 api.example.com 或 *.example.com）；"
                          "单个 Tool 的沙箱策略里配置了 http_allow_hosts 时以 Tool 为准。"
