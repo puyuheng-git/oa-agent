@@ -149,6 +149,12 @@ def verify_assertion(assertion: str, secret: str | None, kv: KV, now: int | None
 
 
 def _mint(client: OfficeApiClient, oa: str, gateway_secret: str | None) -> tuple[str, int]:
+    result = _mint_result(client, oa, gateway_secret)
+    return result.authorization, int(time.time()) + result.ttl_seconds
+
+
+def _mint_result(client: OfficeApiClient, oa: str, gateway_secret: str | None):
+    """调用 office mint；失败抛 AppError。"""
     try:
         result = client.mint(oa, gateway_secret)
     except OfficeApiError as exc:
@@ -156,7 +162,37 @@ def _mint(client: OfficeApiClient, oa: str, gateway_secret: str | None) -> tuple
         raise AppError(status, exc.code, exc.message) from exc
     if result.ttl_seconds <= 60:
         raise AppError(502, "MINT_FAILED", "签发的员工令牌有效期过短")
-    return result.authorization, int(time.time()) + result.ttl_seconds
+    return result
+
+
+def create_session_from_oa(
+    kv: KV,
+    oa: str,
+    client: OfficeApiClient,
+    gateway_secret: str | None,
+    policy: LaunchPolicy = DEFAULT_POLICY,
+    *,
+    channel: str = "oa_web",
+) -> tuple[str, ChatSession]:
+    """按 oa mint 后直接签发 chat ticket（开发登录等旁路；不经 launch_code）。"""
+    clean = (oa or "").strip()
+    if not clean:
+        raise AppError(422, "VALIDATION_ERROR", "缺少 oa")
+    result = _mint_result(client, clean, gateway_secret)
+    expires_at = int(time.time()) + result.ttl_seconds
+    session = ChatSession(
+        oa=result.oa,
+        uid=result.uid,
+        display_name=str(result.display_name or result.oa),
+        thread_id=new_thread_id(),
+        office_token=result.authorization,
+        token_expires_at=expires_at,
+        created_at=int(time.time()),
+        channel=channel,
+    )
+    ticket = secrets.token_urlsafe(32)
+    kv.set(_ticket_key(ticket), _session_payload(session), _ttl_for(session, policy))
+    return ticket, session
 
 
 def create_launch(kv: KV, identity: dict, client: OfficeApiClient, gateway_secret: str | None,

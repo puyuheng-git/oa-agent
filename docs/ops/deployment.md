@@ -167,6 +167,7 @@ npm run dev
 - `http://127.0.0.1:8765/healthz` 返回 `{"status":"ok",...}`
 - `http://127.0.0.1:5173/healthz` 经代理返回同一结果
 - 带一次性 `launch` 打开 `http://127.0.0.1:5173/?launch={launch_code}` 后，问答页 `POST /v1/chat/session` 经代理打到本机 Agent。之后的消息和 SSE 仍走 `5173` → `8765`
+- 本机也可在管理后台「员工对话」开启开发登录后，用 `http://127.0.0.1:5173/?dev=1` 填 OA + 口令换票（见 `openspec/changes/chat-dev-login`）
 
 管理后台：`http://127.0.0.1:8765/admin/`。
 

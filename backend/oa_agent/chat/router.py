@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import queue
@@ -50,6 +52,11 @@ class LaunchIn(BaseModel):
 class SessionIn(BaseModel):
     launch_code: str = Field(min_length=10, max_length=128)
     thread_id: str | None = Field(default=None, min_length=8, max_length=40)
+
+
+class DevSessionIn(BaseModel):
+    oa: str = Field(min_length=1, max_length=64)
+    passphrase: str = Field(min_length=1, max_length=128)
 
 
 class MessageIn(BaseModel):
@@ -117,34 +124,126 @@ def launch(body: LaunchIn, request: Request):
     return {"launch_code": code, "expires_in": policy.launch_ttl}
 
 
+def _dev_login_cfg(rt) -> tuple[bool, str]:
+    """返回 (是否启用开关, 已配置口令)；口令仅供服务端校验。"""
+    chat = load_settings(rt, "chat")
+    enabled = bool(chat.get("dev_login_enabled"))
+    passphrase = str(chat.get("dev_login_passphrase") or "")
+    return enabled, passphrase
+
+
+def _dev_login_usable(rt) -> bool:
+    enabled, passphrase = _dev_login_cfg(rt)
+    return enabled and bool(passphrase.strip())
+
+
+def _passphrase_matches(provided: str, expected: str) -> bool:
+    if not expected:
+        return False
+    left = hashlib.sha256(provided.encode("utf-8")).digest()
+    right = hashlib.sha256(expected.encode("utf-8")).digest()
+    return hmac.compare_digest(left, right)
+
+
+def _bind_entry_thread(rt, ticket: str, session: ChatSession, policy, thread_id: str | None = None) -> ChatSession:
+    """开票后绑定 entry thread（续聊指定或 pick 空白/最近）。"""
+    if thread_id:
+        with rt.session() as db, db.begin():
+            if get_owned(db, thread_id=thread_id, oa=session.oa) is None:
+                raise AppError(404, "THREAD_NOT_FOUND", "会话不存在")
+        session.thread_id = thread_id
+    else:
+        channel = session.channel or "oa_web"
+        with rt.session() as db, db.begin():
+            # 复用空白/最近会话，避免每次进入都新建一条空会话
+            row = pick_entry_thread(db, oa=session.oa, channel=channel, tenant_id=rt.tenant_id)
+            session.thread_id = row.thread_id
+    chat_launch.store_session(rt.kv.current, ticket, session, policy)
+    return session
+
+
+def _session_open_body(rt, ticket: str, session: ChatSession, policy) -> dict:
+    expires_in = min(policy.ticket_ttl, session.token_expires_at - int(time.time()))
+    return {
+        "ticket": ticket,
+        "expires_in": expires_in,
+        "display_name": session.display_name,
+        "thread_id": session.thread_id,
+        "oa": session.oa,
+        **_session_extras(rt, oa=session.oa, office_token=session.office_token),
+    }
+
+
+def _audit_dev_login(rt, request: Request, *, oa: str, result: str, reason: str = "") -> None:
+    meta = request_meta(request)
+    try:
+        with rt.session() as db, db.begin():
+            rt.audit.record(
+                db,
+                actor_type="employee",
+                actor_id=oa or "-",
+                action="chat.dev_login",
+                resource_type="chat_session",
+                resource_id=oa or "",
+                result=result,
+                reason=reason,
+                meta=meta,
+            )
+    except Exception:  # noqa: BLE001 —— 开发登录审计失败不阻断
+        pass
+
+
+@router.get("/dev/status")
+def dev_login_status(request: Request):
+    """开发登录是否可用（不泄露口令）。"""
+    return {"enabled": _dev_login_usable(get_runtime(request))}
+
+
+@router.post("/dev/session")
+def create_dev_session(body: DevSessionIn, request: Request):
+    """开发登录：校验后台开关与共享口令后 mint 并签发 ticket（channel=dev_login）。"""
+    rt = get_runtime(request)
+    oa = body.oa.strip()
+    enabled, expected = _dev_login_cfg(rt)
+    if not enabled or not str(expected or "").strip():
+        _audit_dev_login(rt, request, oa=oa, result="failure", reason="DEV_LOGIN_DISABLED")
+        raise AppError(403, "DEV_LOGIN_DISABLED", "开发登录未启用")
+    if not _passphrase_matches(body.passphrase, expected):
+        _audit_dev_login(rt, request, oa=oa, result="failure", reason="DEV_LOGIN_INVALID")
+        raise AppError(401, "DEV_LOGIN_INVALID", "开发口令错误")
+    policy = launch_policy(rt)
+    oa_cfg = load_settings(rt, "oa")
+    try:
+        ticket, session = chat_launch.create_session_from_oa(
+            rt.kv.current,
+            oa,
+            office_client(rt),
+            oa_cfg.get("gateway_secret"),
+            policy,
+            channel="dev_login",
+        )
+    except AppError as exc:
+        _audit_dev_login(rt, request, oa=oa, result="failure", reason=exc.code)
+        raise
+    session = _bind_entry_thread(rt, ticket, session, policy)
+    _audit_dev_login(rt, request, oa=session.oa, result="success")
+    return _session_open_body(rt, ticket, session, policy)
+
+
 @router.post("/session")
 def create_session(body: SessionIn, request: Request):
     rt = get_runtime(request)
     policy = launch_policy(rt)
     ticket, session = chat_launch.redeem_launch(rt.kv.current, body.launch_code, policy)
-    if body.thread_id:
-        with rt.session() as db, db.begin():
-            if get_owned(db, thread_id=body.thread_id, oa=session.oa) is None:
-                raise AppError(404, "THREAD_NOT_FOUND", "会话不存在")
-        session.thread_id = body.thread_id
-        chat_launch.store_session(rt.kv.current, ticket, session, policy)
-    else:
-        channel = session.channel or "oa_web"
-        with rt.session() as db, db.begin():
-            # 复用空白/最近会话，避免每次从 OA 进入都新建一条空会话
-            row = pick_entry_thread(db, oa=session.oa, channel=channel, tenant_id=rt.tenant_id)
-            session.thread_id = row.thread_id
-        chat_launch.store_session(rt.kv.current, ticket, session, policy)
-    expires_in = min(policy.ticket_ttl, session.token_expires_at - int(time.time()))
-    return {"ticket": ticket, "expires_in": expires_in, "display_name": session.display_name,
-            "thread_id": session.thread_id,
-            **_session_extras(rt, oa=session.oa, office_token=session.office_token)}
+    session = _bind_entry_thread(rt, ticket, session, policy, body.thread_id)
+    return _session_open_body(rt, ticket, session, policy)
 
 
 @router.get("/session")
 def get_session(request: Request, auth: ChatAuth = Depends(chat_auth)):
     rt = get_runtime(request)
     return {"display_name": auth.session.display_name, "thread_id": auth.session.thread_id,
+            "oa": auth.session.oa,
             **_session_extras(rt, oa=auth.session.oa, office_token=auth.session.office_token)}
 
 
