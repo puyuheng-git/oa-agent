@@ -420,6 +420,10 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
     if is_invoke:
         xa["invoke_service"] = inv_s
         xa["invoke_method"] = inv_m
+        call = str(form.get("invoke_call") or form.get("call") or "one_by_params").strip()
+        if call not in ("one_by_params", "page_list", "named_args"):
+            call = "one_by_params"
+        xa["invoke_call"] = call
         path = INVOKE_PATH
     op = {
         "operationId": name,

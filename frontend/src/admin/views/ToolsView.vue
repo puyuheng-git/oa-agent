@@ -18,6 +18,7 @@ function paramEntries(params: Record<string, { type?: string; label?: string; de
   }))
 }
 import AbilityHelpBanner from '../components/AbilityHelpBanner.vue'
+import CallSignatureEditor from '../components/CallSignatureEditor.vue'
 import SchemaTreeEditor from '../components/SchemaTreeEditor.vue'
 import SchemaValueEditor from '../components/SchemaValueEditor.vue'
 import { normalizeNode, type SchemaNode } from '../schemaTree'
@@ -29,6 +30,10 @@ import {
   type ParamRow, type ToolForm,
 } from '../catalogForm'
 import type { SchemaType } from '../schemaTree'
+import {
+  applySlotsToToolForm, inferInvokeCall, slotsFromDescribe, slotsFromPresetId, slotsFromToolForm,
+  type CallSlot,
+} from '../callSignature'
 
 interface Upstream { key: string; label: string; base_url: string | null }
 
@@ -201,6 +206,14 @@ const paramRows = ref<ParamRow[]>([])
 const PARAM_TYPES: SchemaType[] = ['string', 'integer', 'number', 'boolean']
 /** el-collapse 激活面板名；含 adv 时展开高级树 */
 const advancedCollapse = ref<string[]>([])
+/** 调用形参槽位（新建/编辑） */
+const callSlots = ref<CallSlot[]>(slotsFromPresetId('bag_only'))
+/** 向导形参槽位 */
+const wizardSlots = ref<CallSlot[]>(slotsFromPresetId('bag_only'))
+
+const formPreviewMethod = computed(() =>
+  (form.value.invoke_method || form.value.name || 'method').trim() || 'method',
+)
 
 function syncParamRowsFromForm() {
   paramRows.value = paramRowsFromForm(form.value)
@@ -208,6 +221,21 @@ function syncParamRowsFromForm() {
 
 function syncFormFromParamRows() {
   applyParamRows(form.value, paramRows.value)
+}
+
+function syncCallSlotsFromForm() {
+  callSlots.value = slotsFromToolForm(form.value)
+}
+
+function onCallSlotsUpdate(slots: CallSlot[]) {
+  callSlots.value = slots
+  applySlotsToToolForm(form.value, slots)
+  form.value.invoke_call = inferInvokeCall(slots)
+}
+
+function onWizardSlotsUpdate(slots: CallSlot[]) {
+  wizardSlots.value = slots
+  wizard.value.call = inferInvokeCall(slots)
 }
 
 function onAdvancedCollapseChange(names: string | string[]) {
@@ -228,6 +256,7 @@ function create() {
   editing.value = false
   form.value = emptyToolForm(defaultUpstreamKey.value)
   syncParamRowsFromForm()
+  syncCallSlotsFromForm()
   advancedCollapse.value = []
   reason.value = ''
   draftWarnings.value = []
@@ -291,6 +320,7 @@ function useDraft(d: ApipostDraft) {
   editing.value = false
   form.value = toolFormFromSchema(d.form)
   syncParamRowsFromForm()
+  syncCallSlotsFromForm()
   advancedCollapse.value = []
   reason.value = `从 Apipost 导入：${d.source?.name || d.form.name}`.slice(0, 200)
   draftWarnings.value = d.warnings
@@ -313,11 +343,6 @@ interface WizardResultRow {
   field: string
   label: string
 }
-const CALL_OPTIONS = [
-  { value: 'one_by_params', label: '整包参数（一个数组传入）' },
-  { value: 'page_list', label: '分页列表（参数 + 页码 + 条数）' },
-  { value: 'named_args', label: '按参数名逐个传入' },
-]
 const OP_OPTIONS = [
   { value: 'read', label: '读取' },
   { value: 'write', label: '写入' },
@@ -465,7 +490,8 @@ async function wizardPickMethod(row: WizardMethod) {
       service: wizard.value.service.trim(),
       method: row.name,
     })
-    wizard.value.call = d.call_suggest || 'named_args'
+    wizardSlots.value = slotsFromDescribe(d.params, d.call_suggest)
+    wizard.value.call = inferInvokeCall(wizardSlots.value) || d.call_suggest || 'named_args'
     wizard.value.summary = d.summary || row.summary || row.name
     wizard.value.name = row.name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().slice(0, 64)
     // 每个形参转为 SchemaNode；one_by_params/page_list 再把 params|data 袋摊到顶层
@@ -698,6 +724,7 @@ async function edit(name: string) {
     editing.value = true
     form.value = toolFormFromSchema(d.current_schema)
     syncParamRowsFromForm()
+    syncCallSlotsFromForm()
     advancedCollapse.value = Object.values(form.value.modelParams).some(
       (n) => n.type === 'object' || n.type === 'array' || n.type === 'file',
     ) ? ['adv'] : []
@@ -789,6 +816,8 @@ async function save() {
     return
   }
   syncFormFromParamRows()
+  applySlotsToToolForm(form.value, callSlots.value)
+  form.value.invoke_call = inferInvokeCall(callSlots.value)
   saving.value = true
   try {
     const body = { ...toolPayload(form.value), reason: reason.value.trim() }
@@ -971,35 +1000,29 @@ onMounted(load)
           <el-input-number v-model="form.timeout_seconds" :min="1" :max="60" />
         </el-form-item>
 
-        <h4 class="sec">身份注入</h4>
-        <el-form-item label="注入员工身份">
-          <el-switch v-model="form.injectOa" />
-          <span class="hint">开启后由服务端写入当前员工账号，模型无法伪造。业务上游须按 token 校验本人数据。</span>
+        <h4 class="sec">调用形参</h4>
+        <el-form-item v-if="form.invoke_service || form.invoke_method" label="Export 方法">
+          <el-input v-model="form.invoke_method" style="width: 280px" placeholder="如 getTravelExpensePageList" />
+          <span class="hint">预览用的方法名；open-oa 入库时与服务路径一起生效。</span>
         </el-form-item>
-        <template v-if="form.injectOa">
-          <el-form-item label="写入参数名" required>
-            <el-input v-model="form.identityParamName" style="width: 200px" placeholder="如 oa 或 user_id" />
-            <span class="hint">请求里的键名；值始终是当前员工账号。</span>
-          </el-form-item>
-          <el-form-item label="身份放在哪">
-            <el-radio-group v-model="form.identityPlacement">
-              <el-radio value="independent">独立参数（平铺 query）</el-radio>
-              <el-radio value="bag">打包字段内（关联数组 / JSON 对象）</el-radio>
-            </el-radio-group>
-          </el-form-item>
-          <el-form-item v-if="form.identityPlacement === 'bag'" label="打包字段名" required>
-            <el-input v-model="form.query_params_field" style="width: 200px" placeholder="如 queryParams、params" />
-            <span class="hint">例：?queryParams={"user_id":"张三","status":1}</span>
-          </el-form-item>
-          <el-form-item v-else label="参数打包字段">
-            <el-input v-model="form.query_params_field" style="width: 200px" placeholder="可选，如 queryParams" />
-            <span class="hint">身份仍平铺；若填写，未勾「顶层」的模型参数打进该 JSON。留空则全部平铺。</span>
-          </el-form-item>
-        </template>
-        <el-form-item v-else label="参数打包字段">
-          <el-input v-model="form.query_params_field" style="width: 200px" placeholder="可选，如 queryParams" />
-          <span class="hint">未勾「顶层」的模型参数打进该 JSON；留空则全部作为普通查询参数。</span>
+        <el-form-item v-else label="预览方法名">
+          <el-input v-model="form.invoke_method" style="width: 280px" :placeholder="form.name || '默认用 Tool 名'" />
+          <span class="hint">仅影响下方调用预览文案；HTTP GET Tool 可不填。</span>
         </el-form-item>
+        <el-form-item label="形参与预览">
+          <CallSignatureEditor
+            :method-name="formPreviewMethod"
+            :slots="callSlots"
+            @update:slots="onCallSlotsUpdate"
+          />
+        </el-form-item>
+        <div class="hint" style="margin: -4px 0 12px 130px">
+          当前传参：注入身份={{ form.injectOa ? '是' : '否' }}
+          · 身份键={{ form.identityParamName || '—' }}
+          · 位置={{ form.identityPlacement === 'bag' ? '打包字段内' : '独立参数' }}
+          · 打包字段={{ form.query_params_field || '（无）' }}
+          · call={{ form.invoke_call }}
+        </div>
 
         <h4 class="sec">模型可填的参数</h4>
         <el-table :data="paramRows" size="small" border>
@@ -1220,11 +1243,13 @@ onMounted(load)
           <el-form-item label="用途说明">
             <el-input v-model="wizard.summary" maxlength="255" placeholder="给管理员和模型看的中文说明" />
           </el-form-item>
-          <el-form-item label="调用方式">
-            <el-select v-model="wizard.call" style="width: 100%">
-              <el-option v-for="o in CALL_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
-            </el-select>
-            <div class="hint">决定参数如何传给 PHP 方法；分页接口一般选「分页列表」</div>
+          <el-form-item label="调用形参">
+            <CallSignatureEditor
+              :method-name="wizard.method"
+              :slots="wizardSlots"
+              @update:slots="onWizardSlotsUpdate"
+            />
+            <div class="hint">对应 invoke call={{ wizard.call }}；分页选「参数袋 + page/limit」。</div>
           </el-form-item>
           <el-form-item label="操作类型">
             <el-radio-group v-model="wizard.op">
