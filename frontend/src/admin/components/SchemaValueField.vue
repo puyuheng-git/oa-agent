@@ -49,16 +49,72 @@ function setProp(key: string, v: unknown) {
   emit('update:modelValue', next)
 }
 
-// ---------- 粘贴 JSON（object / array；未声明子参数的自由对象只能走 JSON） ----------
+// ---------- 粘贴 JSON（object / array）；自由对象默认键值表，可切 JSON ----------
 
 const isContainer = computed(() => props.node.type === 'object' || props.node.type === 'array')
 const freeObject = computed(() => props.node.type === 'object' && !hasProps.value)
 const jsonMode = ref(false)
-const showJson = computed(() => freeObject.value || jsonMode.value)
+const showJson = computed(() => jsonMode.value)
 const jsonText = ref('')
 const jsonError = ref('')
 // 最近一次由本组件发出的值指纹，用于忽略父级回灌、只响应外部改值
 let lastJson = ''
+
+/** 自由对象键值行（一层；嵌套值用 JSON 字符串编辑） */
+interface KvRow { key: string; value: string }
+const kvRows = ref<KvRow[]>([])
+
+function valueToKvText(v: unknown): string {
+  if (v === undefined || v === null) return ''
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  return JSON.stringify(v)
+}
+
+function parseKvText(text: string): unknown {
+  const t = text.trim()
+  if (!t) return ''
+  if (t === 'true') return true
+  if (t === 'false') return false
+  if (/^-?\d+$/.test(t)) return Number(t)
+  if (/^-?\d+\.\d+$/.test(t)) return Number(t)
+  if ((t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'))) {
+    try {
+      return JSON.parse(t)
+    } catch {
+      return text
+    }
+  }
+  return text
+}
+
+function syncKvFromValue(v: unknown) {
+  if (!isPlainObject(v)) {
+    kvRows.value = []
+    return
+  }
+  kvRows.value = Object.entries(v).map(([key, val]) => ({ key, value: valueToKvText(val) }))
+}
+
+function emitKvRows() {
+  const next: Record<string, unknown> = {}
+  for (const row of kvRows.value) {
+    const k = row.key.trim()
+    if (!k) continue
+    next[k] = parseKvText(row.value)
+  }
+  lastJson = JSON.stringify(next)
+  emit('update:modelValue', Object.keys(next).length ? next : {})
+}
+
+function addKvRow() {
+  kvRows.value.push({ key: '', value: '' })
+}
+
+function removeKvRow(i: number) {
+  kvRows.value.splice(i, 1)
+  emitKvRows()
+}
 
 function valueToText(v: unknown): string {
   return v === undefined || v === null ? '' : JSON.stringify(v, null, 2)
@@ -66,6 +122,7 @@ function valueToText(v: unknown): string {
 
 jsonText.value = valueToText(props.modelValue)
 lastJson = JSON.stringify(props.modelValue ?? null)
+syncKvFromValue(props.modelValue)
 
 watch(
   () => props.modelValue,
@@ -74,6 +131,7 @@ watch(
     lastJson = JSON.stringify(v ?? null)
     jsonText.value = valueToText(v)
     jsonError.value = ''
+    if (freeObject.value && !jsonMode.value) syncKvFromValue(v)
   },
   { deep: true },
 )
@@ -83,6 +141,8 @@ function toggleJson() {
   if (jsonMode.value) {
     jsonText.value = valueToText(props.modelValue)
     jsonError.value = ''
+  } else if (freeObject.value) {
+    syncKvFromValue(props.modelValue)
   }
 }
 
@@ -164,7 +224,7 @@ async function doUpload(opt: UploadRequestOptions) {
 <template>
   <el-form-item :label="hideLabel ? '' : labelText" :label-width="hideLabel ? '0px' : undefined" :required="!!node.required">
     <div class="svf-control">
-      <!-- 粘贴 JSON：object / array 可切换；自由对象（无子参数）始终使用 -->
+      <!-- 粘贴 JSON：结构化 object / array；自由对象可切换 -->
       <template v-if="isContainer && showJson">
         <el-input
           type="textarea"
@@ -175,8 +235,31 @@ async function doUpload(opt: UploadRequestOptions) {
           @update:model-value="onJsonInput"
         />
         <div v-if="jsonError" class="svf-err">{{ jsonError }}</div>
-        <el-button v-if="!freeObject" size="small" link type="primary" @click="toggleJson">返回表单填写</el-button>
+        <el-button size="small" link type="primary" @click="toggleJson">返回表单填写</el-button>
       </template>
+
+      <!-- 自由对象：键值表（可嵌套一层，值可填 JSON） -->
+      <div v-else-if="freeObject" class="svf-box">
+        <div v-for="(row, i) in kvRows" :key="i" class="svf-kv">
+          <el-input
+            v-model="row.key"
+            size="small"
+            placeholder="键名"
+            style="width: 140px"
+            @change="emitKvRows"
+          />
+          <el-input
+            v-model="row.value"
+            size="small"
+            placeholder="值（对象/数组可填 JSON）"
+            style="flex: 1"
+            @change="emitKvRows"
+          />
+          <el-button size="small" type="danger" plain @click="removeKvRow(i)">删除</el-button>
+        </div>
+        <el-button size="small" plain @click="addKvRow">添加键值</el-button>
+        <el-button size="small" link type="primary" class="svf-json-btn" @click="toggleJson">粘贴 JSON</el-button>
+      </div>
 
       <!-- 对象：递归渲染子属性 -->
       <div v-else-if="node.type === 'object'" class="svf-box">
@@ -324,6 +407,12 @@ async function doUpload(opt: UploadRequestOptions) {
   font-size: 12px;
 }
 .svf-json-btn {
+  margin-bottom: 8px;
+}
+.svf-kv {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-bottom: 8px;
 }
 .svf-desc {

@@ -111,6 +111,32 @@ class ExportWizardProbeIn(ExportWizardDescribeIn):
     idempotency_key: str = Field(default="", max_length=128)
 
 
+class HttpProbeIn(BaseModel):
+    """普通 HTTP Tool 测调：按表单契约 mint 测试员工身份并向所选上游发请求。"""
+
+    oa: str = Field(min_length=1, max_length=64)
+    args: dict[str, Any] = Field(default_factory=dict)
+    upstream: str = Field(default=DEFAULT_UPSTREAM, max_length=32)
+    path: str = Field(min_length=1, max_length=255)
+    method: str = Field(default="GET", max_length=8)
+    timeout_seconds: float = Field(default=10, ge=1, le=60)
+    inject_identity_fields: list[str] = Field(default_factory=list)
+    identity_bindings: list[dict[str, str]] | None = None
+    top_level_fields: list[str] = Field(default_factory=list)
+    query_params_field: str | None = Field(None, max_length=64)
+    identity_params: dict[str, str] = Field(default_factory=dict)
+    model_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class EnrichSchemaIn(BaseModel):
+    """测调成功后用默认 LLM 生成完整 Tool schema 候选。"""
+
+    probe_args: dict[str, Any] = Field(default_factory=dict)
+    probe_data: Any = None
+    draft: dict[str, Any] = Field(default_factory=dict)
+    include_skill: bool = True
+
+
 class ExportWizardSaveIn(ReasonIn):
     """测通后入库；服务端会用同一参数再 probe 一次。"""
 
@@ -590,12 +616,19 @@ def _open_oa_wizard_client(ctx: AdminCtx) -> tuple[OpenOaClient, str]:
 
 
 def _wizard_upstream_error(exc: OpenOaError) -> AppError:
-    return AppError(
-        502,
-        "IMPORT_FAILED",
-        f"调用 open-oa 失败：{exc.message}。"
-        "请核对 mint_base_url 与 AGENT_GATEWAY_SECRET 是否与 open-oa 一致。",
-    )
+    """向导/测调上游失败：优先展示上游真实错误；仅配置类问题才提示核对 mint/密钥。"""
+    detail = (exc.user_message or exc.message or "").strip() or "未知错误"
+    config_codes = {
+        "OFFICE_API_NOT_CONFIGURED",
+        "MINT_FAILED",
+        "OPEN_OA_NOT_CONFIGURED",
+    }
+    # 登录/密钥类失败才附配置核对提示；业务/SQL/非 JSON 正文本身已是实际原因
+    if exc.code in config_codes or "AGENT_GATEWAY_SECRET" in detail or "未配置" in detail:
+        msg = f"调用 open-oa 失败：{detail}。请核对 mint_base_url 与 AGENT_GATEWAY_SECRET 是否与 open-oa 一致。"
+    else:
+        msg = f"调用业务接口失败：{detail}"
+    return AppError(502, "IMPORT_FAILED", msg)
 
 
 def _added_invoke_methods(ctx: AdminCtx, service: str) -> dict[str, str]:
@@ -675,6 +708,102 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
     except OpenOaError as exc:
         raise _wizard_upstream_error(exc) from exc
     return {"data": data}
+
+
+def _http_probe_spec(body: HttpProbeIn):
+    """从表单契约片段构造临时 ToolSpec，供 build_request 与运行时一致。"""
+    from oa_agent.executor.catalog import synthesize_identity_bindings, to_tool_spec
+
+    path = body.path.strip()
+    if not path.startswith("/") or path.startswith("//") or " " in path or "://" in path:
+        raise AppError(422, "VALIDATION_ERROR", "接口路径必须是以 / 开头的相对路径")
+    method = (body.method or "GET").upper()
+    if method != "GET":
+        raise AppError(422, "VALIDATION_ERROR", "HTTP 测调一期仅支持 GET")
+    inject = [str(x) for x in (body.inject_identity_fields or []) if str(x).strip()]
+    bindings = body.identity_bindings
+    if bindings is None and inject:
+        bindings = synthesize_identity_bindings(inject)
+    schema = {
+        "name": "http_probe_tmp",
+        "summary": "http probe",
+        "description": "",
+        "method": method,
+        "path": path,
+        "upstream": (body.upstream or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM,
+        "risk_level": "low",
+        "requires_confirmation": False,
+        "timeout_seconds": float(body.timeout_seconds or 10),
+        "inject_identity_fields": inject,
+        "top_level_fields": [str(x) for x in (body.top_level_fields or []) if str(x).strip()],
+        "query_params_field": (body.query_params_field or None),
+        "identity_params": {str(k): str(v) for k, v in (body.identity_params or {}).items()},
+        "identity_bindings": list(bindings or []),
+        "model_params": dict(body.model_params or {}),
+        "result": {"kind": "object", "fields": [], "labels": {}, "list_columns": []},
+    }
+    return to_tool_spec(schema, "probe", 0, "http-probe", kind="office")
+
+
+@tools_router.post("/http-probe")
+def http_probe(body: HttpProbeIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
+    """普通 HTTP Tool 测调：mint 测试员工 token，按契约注入身份后请求所选上游。"""
+    from oa_agent.chat import service as chat_service
+    from oa_agent.executor.executor import Identity, ToolError, build_request, validate_args
+
+    oa = body.oa.strip()
+    if not oa:
+        raise AppError(422, "VALIDATION_ERROR", "请填写测试员工 OA 账号")
+    spec = _http_probe_spec(body)
+    clients = chat_service.tool_clients(ctx.runtime)
+    upstream = spec.upstream or DEFAULT_UPSTREAM
+    client = clients.get(upstream) or clients.get(DEFAULT_UPSTREAM) or clients.get(LEGACY_UPSTREAM)
+    if client is None:
+        raise AppError(503, "UPSTREAM_NOT_CONFIGURED", f"未配置业务上游：{upstream}")
+    oa_cfg = chat_service.load_settings(ctx.runtime, "oa")
+    secret = oa_cfg.get("gateway_secret")
+    mint_client = chat_service.office_client(ctx.runtime)
+    ctx.db.rollback()
+    try:
+        minted = mint_client.mint(oa, secret)
+    except OpenOaError as exc:
+        raise AppError(502, "MINT_FAILED", f"签发测试员工令牌失败：{exc.message}") from exc
+    identity = Identity(oa=minted.oa or oa, authorization=minted.authorization)
+    try:
+        clean, _ = validate_args(spec, dict(body.args or {}))
+        params = build_request(spec, clean, identity)
+        resp = client.get(spec.path, params, identity.authorization, timeout=spec.timeout_seconds)
+    except ToolError as exc:
+        raise AppError(422, exc.code, exc.message) from exc
+    except OpenOaError as exc:
+        detail = (exc.user_message or exc.message or "").strip() or "未知错误"
+        raise AppError(502, "IMPORT_FAILED", f"调用业务接口失败：{detail}") from exc
+    return {"data": resp.data}
+
+
+@tools_router.post("/enrich-schema")
+def enrich_schema(body: EnrichSchemaIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
+    """测调成功后：用默认 LLM 生成完整 Tool schema 候选（不入库）。"""
+    from oa_agent.executor.schema_enrich import enrich_from_probe
+
+    model = _draft_model(ctx)
+    if model is None:
+        raise AppError(503, "LLM_NOT_CONFIGURED", "未配置默认对话模型，无法生成 Schema")
+    ctx.db.rollback()
+    try:
+        suggestion, skill, warnings = enrich_from_probe(
+            model, dict(body.draft or {}), dict(body.probe_args or {}), body.probe_data,
+        )
+    except ModelCallError as exc:
+        raise AppError(502, "LLM_FAILED", f"模型补全失败：{exc}") from exc
+    if not body.include_skill:
+        skill = None
+    with ctx.db.begin():
+        ctx.audit(
+            "tool.enrich_schema", "tool", str((body.draft or {}).get("name") or "draft"),
+            after={"has_skill": bool(skill), "field_count": len((suggestion or {}).get("fields") or [])},
+        )
+    return {"suggestion": suggestion, "skill": skill, "warnings": warnings}
 
 
 @tools_router.post("/export-wizard/upload-temp")

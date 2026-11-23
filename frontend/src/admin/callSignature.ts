@@ -166,24 +166,21 @@ export function slotsFromToolForm(form: Pick<
   'injectOa' | 'identityParamName' | 'identityPlacement' | 'query_params_field' | 'topLevelFields' | 'modelParams' | 'invoke_call'
 >): CallSlot[] {
   const call = (form.invoke_call || '').trim()
-  // open-oa 常无 query_params_field，按 invoke_call 回落预设
-  if (!form.query_params_field?.trim() && call === 'page_list') {
-    return slotsFromPresetId('bag_page_limit')
-  }
-  if (!form.query_params_field?.trim() && call === 'one_by_params' && !form.injectOa) {
-    return slotsFromPresetId('bag_only')
-  }
-  if (!form.query_params_field?.trim() && call === 'named_args' && form.injectOa) {
-    return slotsFromPresetId('identity_bag')
+  const bag = (form.query_params_field || '').trim()
+  // 无打包字段时按 invoke_call 回落：page_list / 无注入的 one_by_params。独立注入清空打包字段 → 仅 identity，勿回落 identity_bag（否则又写回 params）
+  if (!bag && form.identityPlacement !== 'bag') {
+    if (call === 'page_list') return slotsFromPresetId('bag_page_limit')
+    if (call === 'one_by_params' && !form.injectOa) return slotsFromPresetId('bag_only')
   }
 
   const slots: CallSlot[] = []
   const idName = (form.identityParamName || 'oa').trim() || 'oa'
-  const bag = (form.query_params_field || '').trim()
   const top = (form.topLevelFields || '').split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean)
 
-  // 身份在袋内 → 预览 method($params)，inject 仍由 form.injectOa 表达
-  if (form.injectOa && form.identityPlacement === 'independent') {
+  // 身份写入袋内：预览仅袋（method($params)），inject 仍由 form.injectOa 表达，勿生成 identity 槽
+  if (form.injectOa && form.identityPlacement === 'bag') {
+    if (bag) slots.push({ role: 'bag', name: bag })
+  } else if (form.injectOa && form.identityPlacement === 'independent') {
     slots.push({ role: 'identity', name: idName })
     if (bag) slots.push({ role: 'bag', name: bag })
   } else if (bag) {
@@ -202,37 +199,43 @@ export function slotsFromToolForm(form: Pick<
 
 /**
  * 槽位写回 ToolForm 的身份/打包字段。
- * - 有 identity 且其后有 bag、且 infer 为 named_args 且身份独立 → independent + bag 字段名
- * - 仅 bag → 不注入或仅 token；query_params_field=袋名
- * - identity 在 bag 场景（one_by_params 且 inject）：placement=bag
+ * - 有 identity 槽 → 开启注入；独立形参
+ * - 仅袋且表单已是「袋内注入」→ 保留 injectOa（身份区驱动，槽位只预览）
+ * - 仅袋且非袋内注入 → 关闭注入
+ * - query_params_field 允许空（不再强行写成 params）
  */
 export function applySlotsToToolForm(form: ToolForm, slots: CallSlot[]): void {
   const identity = slots.find((s) => s.role === 'identity')
   const bags = slots.filter((s) => s.role === 'bag')
   const scalars = slots.filter((s) => s.role === 'scalar')
   const call = inferInvokeCall(slots)
+  const bagName = bags[0]?.name.trim() || ''
+  const keepBagInject = !identity && bags.length > 0 && form.injectOa && form.identityPlacement === 'bag'
 
-  form.injectOa = !!identity
-  form.identityParamName = identity ? (identity.name.trim() || 'oa') : 'oa'
   form.topLevelFields = scalars.map((s) => s.name.trim()).filter(Boolean).join(', ')
 
-  if (call === 'one_by_params' || call === 'page_list') {
-    // 单袋：身份若存在，默认写入袋内
-    form.identityPlacement = (identity ? 'bag' : 'independent') as IdentityPlacement
-    form.query_params_field = bags[0]?.name.trim() || (call === 'one_by_params' ? 'params' : 'params')
-    if (!identity) form.identityPlacement = 'independent'
-    if (identity && call === 'one_by_params') form.identityPlacement = 'bag'
-  } else if (identity && bags.length) {
-    // named_args：身份独立形参 + 另有袋
-    form.identityPlacement = 'independent'
-    form.query_params_field = bags[0].name.trim()
-  } else if (identity && !bags.length) {
-    form.identityPlacement = 'independent'
-    form.query_params_field = ''
-  } else if (bags.length) {
-    form.identityPlacement = 'independent'
-    form.query_params_field = bags[0].name.trim()
-  } else {
-    form.query_params_field = ''
+  if (identity) {
+    form.injectOa = true
+    form.identityParamName = identity.name.trim() || 'oa'
+    if (call === 'one_by_params' || call === 'page_list') {
+      // 槽位带 identity + 整包 call 少见；有袋则视为袋内，无袋则独立
+      form.identityPlacement = (bagName ? 'bag' : 'independent') as IdentityPlacement
+      form.query_params_field = bagName
+    } else {
+      form.identityPlacement = 'independent'
+      form.query_params_field = bagName
+    }
+    return
   }
+
+  if (keepBagInject) {
+    form.injectOa = true
+    form.identityPlacement = 'bag'
+    if (bagName) form.query_params_field = bagName
+    return
+  }
+
+  form.injectOa = false
+  form.identityPlacement = 'independent'
+  form.query_params_field = bagName
 }

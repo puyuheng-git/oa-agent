@@ -1,14 +1,12 @@
 <script setup lang="ts">
 /**
- * 调用形参：预设 + 槽位表 + method($oa, $params) 预览。
- * 向导与新建/编辑 Tool 共用。
+ * 调用形参：动态槽位（增删排序）+ method($…) 预览。
+ * 不写死签名菜单；可选示例仅作参考。
  */
-import { computed, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   CALL_PRESETS,
-  findPresetId,
   previewCall,
-  slotsFromPresetId,
   type CallSlot,
   type CallSlotRole,
 } from '../callSignature'
@@ -28,14 +26,7 @@ const ROLE_OPTIONS: { value: CallSlotRole; label: string }[] = [
   { value: 'scalar', label: '标量' },
 ]
 
-const presetId = computed({
-  get: () => findPresetId(props.slots) || '',
-  set: (id: string) => {
-    if (!id) return
-    emit('update:slots', slotsFromPresetId(id))
-  },
-})
-
+const showExamples = ref(false)
 const preview = computed(() => previewCall(props.methodName, props.slots))
 
 function updateRow(index: number, patch: Partial<CallSlot>) {
@@ -43,8 +34,9 @@ function updateRow(index: number, patch: Partial<CallSlot>) {
   emit('update:slots', next)
 }
 
-function addSlot() {
-  emit('update:slots', [...props.slots, { role: 'bag', name: 'params' }])
+function addSlot(role: CallSlotRole = 'scalar', name = '') {
+  const defaults: Record<CallSlotRole, string> = { identity: 'oa', bag: 'params', scalar: 'page' }
+  emit('update:slots', [...props.slots, { role, name: name || defaults[role] }])
 }
 
 function removeSlot(index: number) {
@@ -61,11 +53,16 @@ function moveSlot(index: number, delta: number) {
   emit('update:slots', next)
 }
 
-// 无槽位时给一个默认袋，避免预览 method()
+function applyExample(slots: CallSlot[]) {
+  emit('update:slots', slots.map((s) => ({ ...s })))
+  showExamples.value = false
+}
+
+// 无槽位时给一个空袋，避免预览 method()
 watch(
   () => props.slots.length,
   (n) => {
-    if (n === 0) emit('update:slots', slotsFromPresetId('bag_only'))
+    if (n === 0) emit('update:slots', [{ role: 'bag', name: 'params' }])
   },
   { immediate: true },
 )
@@ -77,17 +74,6 @@ watch(
       <div class="preview-label">调用预览</div>
       <code class="preview-code">{{ preview }}</code>
     </div>
-
-    <el-form-item label="形参预设">
-      <el-select v-model="presetId" clearable placeholder="选择常见签名或下方自定义" style="width: 100%">
-        <el-option
-          v-for="p in CALL_PRESETS"
-          :key="p.id"
-          :value="p.id"
-          :label="`${p.label} → ${previewCall(p.sampleMethod, p.slots)}`"
-        />
-      </el-select>
-    </el-form-item>
 
     <el-table :data="slots" size="small" border>
       <el-table-column label="角色" width="120">
@@ -124,9 +110,28 @@ watch(
         </template>
       </el-table-column>
     </el-table>
-    <el-button size="small" style="margin-top: 6px" @click="addSlot">添加形参</el-button>
+    <div class="actions">
+      <el-button size="small" @click="addSlot('identity')">加身份</el-button>
+      <el-button size="small" @click="addSlot('bag')">加参数袋</el-button>
+      <el-button size="small" @click="addSlot('scalar')">加标量</el-button>
+      <el-button size="small" link type="primary" @click="showExamples = !showExamples">
+        {{ showExamples ? '收起示例' : '参考示例' }}
+      </el-button>
+    </div>
+    <div v-if="showExamples" class="examples">
+      <div class="hint">仅作参考，点选后仍可继续增删改：</div>
+      <el-button
+        v-for="p in CALL_PRESETS"
+        :key="p.id"
+        size="small"
+        style="margin: 4px 6px 0 0"
+        @click="applyExample(p.slots)"
+      >
+        {{ previewCall(p.sampleMethod, p.slots) }}
+      </el-button>
+    </div>
     <div class="hint">
-      身份 = 服务端写入当前员工账号；参数袋 = 关联数组（如 $params）；标量 = page/limit 等独立参数。
+      身份 = 服务端写入当前员工账号；参数袋 = 关联数组（如 $params）；标量 = page/limit 等独立参数。自由组合即可覆盖多种 PHP 方法签名。
     </div>
   </div>
 </template>
@@ -150,6 +155,20 @@ watch(
   font-weight: 600;
   color: var(--el-color-primary);
   word-break: break-all;
+}
+.actions {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.examples {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--el-fill-color-blank);
+  border: 1px dashed var(--el-border-color);
 }
 .hint {
   margin-top: 6px;

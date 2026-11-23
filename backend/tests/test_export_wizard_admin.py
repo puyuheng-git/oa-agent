@@ -55,6 +55,36 @@ def test_wizard_discover(admin, monkeypatch):
     assert isinstance(hit["already_added"], bool)
 
 
+def test_wizard_probe_surfaces_biz_error_without_mint_hint(admin, monkeypatch):
+    from oa_agent.admin import catalog_api
+    from oa_agent.integrations.open_oa import OpenOaError
+
+    class C:
+        def probe_export(self, **kw):
+            raise OpenOaError(
+                "UPSTREAM_BIZ_ERROR",
+                "SQLSTATE[23000]: Column 'id' in where clause is ambiguous",
+                user_message="SQLSTATE[23000]: Column 'id' in where clause is ambiguous",
+            )
+
+    monkeypatch.setattr(catalog_api, "_open_oa_wizard_client", lambda ctx: (C(), "secret"))
+    r = admin.post(
+        "/v1/admin/tools/export-wizard/probe",
+        json={
+            "service": "out_attendance/go_out_application",
+            "method": "getApplicationPageList",
+            "oa": "37083",
+            "args": {"page": 1, "limit": 10},
+            "call": "page_list",
+            "op": "read",
+        },
+    )
+    assert r.status_code == 502, r.text
+    detail = r.json().get("detail") or r.json().get("message") or r.text
+    assert "ambiguous" in str(detail)
+    assert "mint_base_url" not in str(detail)
+
+
 def test_wizard_save_requires_successful_probe(admin, monkeypatch):
     _patch_client(monkeypatch, probe_ok=False)
     r = admin.post(
