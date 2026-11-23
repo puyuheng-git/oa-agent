@@ -1,0 +1,15 @@
+schema: spec-driven
+
+context: |
+  Stack: Python FastAPI Agent (oa-langGraph) + Vite/TS chat shell (oa-agent-chat, sibling repo).
+  Employee chat auth: OA assertion → POST /v1/chat/launch → launch_code → POST /v1/chat/session → Bearer ticket; office token via mint.
+  Settings live in config/schema.py groups; secrets are write-only.
+  Dual-repo changes: document Impact for both oa-langGraph and oa-agent-chat; implement Agent first when APIs gate the UI.
+
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Include Non-goals either in What Changes or call out in Impact risks
+  tasks:
+    - Break tasks into chunks completable in one session
+    - Include tests and docs checklist items

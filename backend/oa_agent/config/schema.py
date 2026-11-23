@@ -203,6 +203,21 @@ GROUPS: dict[str, GroupDef] = {
                 FieldDef("result_poll_seconds", "转人工结果轮询间隔", "int", 5,
                          "员工页面在等待人工处理结果时，多久查询一次结果。越短越及时，但请求更多。",
                          min=2, max=60, unit="秒"),
+                FieldDef(
+                    "dev_login_enabled",
+                    "启用开发登录（危险）",
+                    "bool",
+                    False,
+                    "【危险】开启后，对话页可用 ?dev=1 填 OA 号 + 开发口令，绕过 OA 宿主登录并 mint 员工 token。"
+                    "仅用于开发/测试；生产务必保持关闭。口令泄露等于可冒充任意员工。",
+                ),
+                FieldDef(
+                    "dev_login_passphrase",
+                    "开发登录口令",
+                    "secret",
+                    help="开发登录共享口令。只写不读：保存后只显示末 4 位；留空表示不修改。"
+                    "未设置口令时即使打开开关也无法使用开发登录。",
+                ),
             ),
             description="员工从 OA 打开助手页、发送消息的相关限制与时长。助手的回答方式（角色、多轮对话、压缩、串联、"
                         "流式）在「工作流配置」中按版本发布。",
