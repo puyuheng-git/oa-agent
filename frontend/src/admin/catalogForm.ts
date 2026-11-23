@@ -50,6 +50,12 @@ export interface ToolForm {
   /** 顶层查询参数名，逗号分隔（与 ParamRow.topLevel 同步） */
   topLevelFields: string
   fields: FieldRow[]
+  /** open-oa：ANew 服务路径；有值时与 invoke_method 一起视为 invoke Tool */
+  invoke_service: string
+  /** open-oa 调用：Export 方法名（预览用；空则用 Tool 名） */
+  invoke_method: string
+  /** open-oa 调用：one_by_params | page_list | named_args */
+  invoke_call: string
 }
 
 export interface SkillForm {
@@ -70,6 +76,7 @@ export function emptyToolForm(defaultUpstream = 'open_oa'): ToolForm {
     timeout_seconds: 10, injectOa: true, identityParamName: 'oa', identityPlacement: 'bag',
     query_params_field: 'queryParams', identityParams: '', result_kind: 'list',
     modelParams: {}, topLevelFields: '', fields: [],
+    invoke_service: '', invoke_method: '', invoke_call: 'one_by_params',
   }
 }
 
@@ -173,7 +180,7 @@ export function toolPayload(form: ToolForm): Record<string, unknown> {
   for (const k of splitNames(form.identityParams)) {
     if (k !== paramName) identity_params[k] = 'oa'
   }
-  return {
+  const payload: Record<string, unknown> = {
     name: form.name.trim(),
     summary: form.summary.trim(),
     description: form.description.trim(),
@@ -189,6 +196,16 @@ export function toolPayload(form: ToolForm): Record<string, unknown> {
     model_params,
     result,
   }
+  // open-oa：同时有 service+method 时按 invoke 落库
+  const invSvc = form.invoke_service.trim()
+  const invMethod = form.invoke_method.trim()
+  if (invSvc && invMethod) {
+    payload.invoke_service = invSvc
+    payload.invoke_method = invMethod
+    payload.invoke_call = (form.invoke_call || 'one_by_params').trim() || 'one_by_params'
+    payload.method = 'POST'
+  }
+  return payload
 }
 
 export function toolFormFromSchema(schema: Record<string, any>): ToolForm {
@@ -228,6 +245,9 @@ export function toolFormFromSchema(schema: Record<string, any>): ToolForm {
       label: labels[key] || '',
       inList: columns.includes(key),
     })),
+    invoke_service: String(schema.invoke_service || '').trim(),
+    invoke_method: String(schema.invoke_method || '').trim(),
+    invoke_call: String(schema.invoke_call || schema.call || 'one_by_params').trim() || 'one_by_params',
   }
 }
 

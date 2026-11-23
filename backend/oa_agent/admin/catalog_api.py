@@ -85,6 +85,9 @@ class ToolIn(ReasonIn):
     identity_params: dict[str, str] = Field(default_factory=dict)
     model_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
     result: ToolResultIn
+    invoke_service: str = Field("", max_length=128)
+    invoke_method: str = Field("", max_length=128)
+    invoke_call: str = Field("one_by_params", max_length=32)
 
 
 class ApipostIn(BaseModel):
