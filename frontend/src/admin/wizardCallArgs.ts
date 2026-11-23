@@ -28,9 +28,19 @@ export function unwrapBagArgs(call: string, args: Record<string, unknown>): Reco
   return out
 }
 
+function inferTypeFromValue(v: unknown): SchemaNode['type'] {
+  if (typeof v === 'number') return Number.isInteger(v) ? 'integer' : 'number'
+  if (typeof v === 'boolean') return 'boolean'
+  if (Array.isArray(v)) return 'array'
+  if (v && typeof v === 'object') return 'object'
+  return 'string'
+}
+
 /**
- * describe 预填或入库前：把 bag 的 properties 提升为顶层 model_params，并删除 bag 键。
- * 无 properties 时：用 values[bag] 的键推断为 string 字段（便于落库给 Agent 填）。
+ * describe 预填或入库前：
+ * - object 袋有 properties → 提升为顶层并删除袋键
+ * - 无结构 array 袋 → 转为可编辑自由 object（不再静默删光）
+ * - 自由 object 无 properties：有试调值则推断字段后删袋；否则保留自由 object 袋供键值编辑
  */
 export function flattenBagSchema(
   call: string,
@@ -42,22 +52,48 @@ export function flattenBagSchema(
   for (const bag of BAG_PARAM_NAMES) {
     const node = out[bag]
     if (!node || (node.type !== 'object' && node.type !== 'array')) continue
-    if (node.type === 'object') {
-      const props = node.properties || {}
-      for (const [k, v] of Object.entries(props)) {
-        if (k === bag) continue
-        if (!(k in out)) out[k] = v
+
+    // 无结构 array 袋（PHP assoc / 自由对象）：改成可编辑自由 object，勿删
+    if (node.type === 'array') {
+      const itemProps = node.items?.properties
+      if (itemProps && Object.keys(itemProps).length) {
+        // 真列表：保留 array，不提升、不删除
+        continue
       }
-      // 自由对象：从当前试调值推断顶层字段
-      if (!Object.keys(props).length && values && values[bag] && typeof values[bag] === 'object' && !Array.isArray(values[bag])) {
-        for (const [k, v] of Object.entries(values[bag] as Record<string, unknown>)) {
-          if (k in out || k === bag) continue
-          const t = typeof v === 'number' ? (Number.isInteger(v) ? 'integer' : 'number') : typeof v === 'boolean' ? 'boolean' : 'string'
-          out[k] = normalizeNode({ type: t, label: k })
-        }
-      }
+      out[bag] = normalizeNode({
+        type: 'object',
+        label: node.label || bag,
+        description: node.description || '',
+        required: !!node.required,
+      })
+      continue
     }
-    delete out[bag]
+
+    const props = node.properties || {}
+    for (const [k, v] of Object.entries(props)) {
+      if (k === bag) continue
+      if (!(k in out)) out[k] = v
+    }
+    // 自由对象：从当前试调值推断顶层字段
+    if (!Object.keys(props).length && values && values[bag] && typeof values[bag] === 'object' && !Array.isArray(values[bag])) {
+      for (const [k, v] of Object.entries(values[bag] as Record<string, unknown>)) {
+        if (k in out || k === bag) continue
+        out[k] = normalizeNode({ type: inferTypeFromValue(v), label: k })
+      }
+      delete out[bag]
+      continue
+    }
+    if (Object.keys(props).length) {
+      delete out[bag]
+      continue
+    }
+    // 无 properties、无试调值：保留自由 object 袋，供测调键值编辑
+    out[bag] = normalizeNode({
+      type: 'object',
+      label: node.label || bag,
+      description: node.description || '',
+      required: !!node.required,
+    })
   }
   return out
 }

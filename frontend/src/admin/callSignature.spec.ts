@@ -81,4 +81,35 @@ describe('callSignature', () => {
     expect(form.topLevelFields.split(/,\s*/).sort()).toEqual(['limit', 'page'])
     expect(inferInvokeCall(slotsFromToolForm(form))).toBe('page_list')
   })
+
+  it('bag placement keeps injectOa when slots only have bag', () => {
+    const form = emptyToolForm()
+    form.injectOa = true
+    form.identityPlacement = 'bag'
+    form.identityParamName = 'oa'
+    form.query_params_field = 'params'
+    form.invoke_call = 'one_by_params'
+    const slots = slotsFromToolForm(form)
+    expect(slots).toEqual([{ role: 'bag', name: 'params' }])
+    expect(inferInvokeCall(slots)).toBe('one_by_params')
+    applySlotsToToolForm(form, slots)
+    expect(form.injectOa).toBe(true)
+    expect(form.identityPlacement).toBe('bag')
+    expect(form.query_params_field).toBe('params')
+  })
+
+  it('allows empty packing field when identity is independent', () => {
+    const form = emptyToolForm()
+    form.injectOa = true
+    form.identityPlacement = 'independent'
+    form.identityParamName = 'oa'
+    form.query_params_field = ''
+    form.invoke_call = 'named_args'
+    const slots = slotsFromToolForm(form)
+    expect(slots).toEqual([{ role: 'identity', name: 'oa' }])
+    applySlotsToToolForm(form, slots)
+    expect(form.injectOa).toBe(true)
+    expect(form.identityPlacement).toBe('independent')
+    expect(form.query_params_field).toBe('')
+  })
 })

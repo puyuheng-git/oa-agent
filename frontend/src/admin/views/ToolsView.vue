@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { errorMessage, http } from '@/shared/http'
 import { formatTime } from '@/shared/format'
@@ -18,18 +18,13 @@ function paramEntries(params: Record<string, { type?: string; label?: string; de
   }))
 }
 import AbilityHelpBanner from '../components/AbilityHelpBanner.vue'
-import CallSignatureEditor from '../components/CallSignatureEditor.vue'
-import SchemaTreeEditor from '../components/SchemaTreeEditor.vue'
-import SchemaValueEditor from '../components/SchemaValueEditor.vue'
+import ToolContractForm from '../components/ToolContractForm.vue'
 import { normalizeNode, type SchemaNode } from '../schemaTree'
-import { buildArgsFromValues, mergeValuesOnSchemaChange } from '../schemaValue'
-import { flattenBagSchema, unwrapBagArgs } from '../wizardCallArgs'
-import { mergeProbeResultFields } from '../probeResultFields'
+import { flattenBagSchema } from '../wizardCallArgs'
+import { mergeEnrichSuggestion, type EnrichSkillDraft, type EnrichSuggestion } from '../schemaEnrichMerge'
 import {
-  applyParamRows, emptyToolForm, paramRowsFromForm, toolFormFromSchema, toolPayload,
-  type ParamRow, type ToolForm,
+  emptyToolForm, toolFormFromSchema, toolPayload, type ToolForm,
 } from '../catalogForm'
-import type { SchemaType } from '../schemaTree'
 import {
   applySlotsToToolForm, inferInvokeCall, slotsFromDescribe, slotsFromPresetId, slotsFromToolForm,
   type CallSlot,
@@ -201,63 +196,46 @@ const editing = ref(false)
 const saving = ref(false)
 const form = ref<ToolForm>(emptyToolForm())
 const reason = ref('')
-/** 扁平参数表（与 form.modelParams / topLevelFields 双向同步） */
-const paramRows = ref<ParamRow[]>([])
-const PARAM_TYPES: SchemaType[] = ['string', 'integer', 'number', 'boolean']
-/** el-collapse 激活面板名；含 adv 时展开高级树 */
-const advancedCollapse = ref<string[]>([])
 /** 调用形参槽位（新建/编辑） */
 const callSlots = ref<CallSlot[]>(slotsFromPresetId('bag_only'))
-/** 向导形参槽位 */
-const wizardSlots = ref<CallSlot[]>(slotsFromPresetId('bag_only'))
+const editorContractRef = ref<InstanceType<typeof ToolContractForm> | null>(null)
 
 const formPreviewMethod = computed(() =>
   (form.value.invoke_method || form.value.name || 'method').trim() || 'method',
 )
-
-function syncParamRowsFromForm() {
-  paramRows.value = paramRowsFromForm(form.value)
-}
-
-function syncFormFromParamRows() {
-  applyParamRows(form.value, paramRows.value)
-}
+/** 新建/编辑始终可测调（Export 或 HTTP） */
+const editorShowProbe = computed(() => true)
+const editorProbeBusy = ref(false)
+const editorProbeOk = ref(false)
+const editorProbeError = ref('')
+const editorProbePreview = ref('')
+const editorProbeArgsPreview = ref('')
+const editorEnrichBusy = ref(false)
+const editorLastProbe = ref<{ args: Record<string, unknown>; data: unknown } | null>(null)
+const wizardEnrichBusy = ref(false)
+const wizardLastProbe = ref<{ args: Record<string, unknown>; data: unknown } | null>(null)
+const wizardProbeArgsPreview = ref('')
+const wizardSkillDraft = ref<EnrichSkillDraft | null>(null)
+const wizardWithSkill = ref(true)
 
 function syncCallSlotsFromForm() {
   callSlots.value = slotsFromToolForm(form.value)
 }
 
 function onCallSlotsUpdate(slots: CallSlot[]) {
+  // 子组件已按场景写回 form（形参编辑会 apply；身份区同步不会清 inject）
   callSlots.value = slots
-  applySlotsToToolForm(form.value, slots)
-  form.value.invoke_call = inferInvokeCall(slots)
-}
-
-function onWizardSlotsUpdate(slots: CallSlot[]) {
-  wizardSlots.value = slots
-  wizard.value.call = inferInvokeCall(slots)
-}
-
-function onAdvancedCollapseChange(names: string | string[]) {
-  const list = Array.isArray(names) ? names : [names]
-  // 展开前先把表格写入 form，避免树读到旧数据；收起后再把树同步回表格
-  if (list.includes('adv')) syncFormFromParamRows()
-  else syncParamRowsFromForm()
-  advancedCollapse.value = list
-}
-
-function addParamRow() {
-  paramRows.value.push({
-    name: '', type: 'string', required: false, label: '', description: '', topLevel: false,
-  })
 }
 
 function create() {
   editing.value = false
   form.value = emptyToolForm(defaultUpstreamKey.value)
-  syncParamRowsFromForm()
   syncCallSlotsFromForm()
-  advancedCollapse.value = []
+  editorProbeOk.value = false
+  editorProbeError.value = ''
+  editorProbePreview.value = ''
+  editorProbeArgsPreview.value = ''
+  editorLastProbe.value = null
   reason.value = ''
   draftWarnings.value = []
   skillDraft.value = null
@@ -319,9 +297,12 @@ async function runImport() {
 function useDraft(d: ApipostDraft) {
   editing.value = false
   form.value = toolFormFromSchema(d.form)
-  syncParamRowsFromForm()
   syncCallSlotsFromForm()
-  advancedCollapse.value = []
+  editorProbeOk.value = false
+  editorProbeError.value = ''
+  editorProbePreview.value = ''
+  editorProbeArgsPreview.value = ''
+  editorLastProbe.value = null
   reason.value = `从 Apipost 导入：${d.source?.name || d.form.name}`.slice(0, 200)
   draftWarnings.value = d.warnings
   skillDraft.value = d.skill || null
@@ -339,10 +320,6 @@ interface WizardMethod {
   already_added?: boolean
   tool_name?: string | null
 }
-interface WizardResultRow {
-  field: string
-  label: string
-}
 const OP_OPTIONS = [
   { value: 'read', label: '读取' },
   { value: 'write', label: '写入' },
@@ -351,10 +328,6 @@ const RISK_OPTIONS = [
   { value: 'low', label: '低' },
   { value: 'medium', label: '中' },
   { value: 'high', label: '高' },
-]
-const RESULT_KIND_OPTIONS = [
-  { value: 'list', label: '列表' },
-  { value: 'object', label: '单条对象' },
 ]
 // 返回字段名：单段或一层点号（与后端 RESULT_FIELD_RE 对齐），如 id、user.name
 const RESULT_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/
@@ -370,24 +343,14 @@ const wizard = ref({
   method: '',
   methods: [] as WizardMethod[],
   methodFilter: '',
-  call: 'one_by_params',
   op: 'read',
   risk: 'low',
-  name: '',
-  summary: '',
-  oa: '',
   reason: '',
-  resultKind: 'list',
-  resultRows: [{ field: 'id', label: '编号' }] as WizardResultRow[],
 })
-// 请求参数 Schema（落库的 model_params）与试调值（仅本页，不落库）
-const wizardParams = ref<Record<string, SchemaNode>>({})
-const wizardValues = ref<Record<string, unknown>>({})
-
-// Schema 变更后迁移已填试调值（同名同类型保留，新增键补 default）
-watch(wizardParams, (next, prev) => {
-  wizardValues.value = mergeValuesOnSchemaChange(prev ?? {}, next ?? {}, wizardValues.value)
-})
+/** 向导配置步与新建共用 ToolForm / ToolContractForm 模型 */
+const wizardForm = ref<ToolForm>(emptyToolForm())
+const wizardSlots = ref<CallSlot[]>(slotsFromPresetId('bag_only'))
+const wizardContractRef = ref<InstanceType<typeof ToolContractForm> | null>(null)
 
 const wizardFilteredMethods = computed(() => {
   const q = wizard.value.methodFilter.trim().toLowerCase()
@@ -403,13 +366,16 @@ function openExportWizard() {
   wizardError.value = ''
   wizardProbeOk.value = false
   wizardProbePreview.value = ''
+  wizardProbeArgsPreview.value = ''
+  wizardLastProbe.value = null
+  wizardSkillDraft.value = null
+  wizardWithSkill.value = true
   wizardStep.value = 'pick'
   wizard.value.methods = []
   wizard.value.method = ''
   wizard.value.methodFilter = ''
-  wizardParams.value = {}
-  wizardValues.value = {}
-  wizard.value.resultRows = [{ field: 'id', label: '编号' }]
+  wizardForm.value = emptyToolForm(defaultUpstreamKey.value)
+  wizardSlots.value = slotsFromPresetId('bag_only')
 }
 
 async function wizardDiscover() {
@@ -450,6 +416,10 @@ function wizardNodeFromDescribe(p: {
     description: p.description || '',
   }
   const def = p.default
+  // PHP 关联数组常被反射成 array：无 items 结构时按自由 object 处理
+  if (raw.type === 'array' && !(p as { items?: unknown }).items) {
+    raw.type = 'object'
+  }
   if (raw.type === 'object' && def && typeof def === 'object' && !Array.isArray(def)) {
     // 未声明 properties 的对象无法填值：按默认值的键推断子属性（类型按值推断，默认回落为文本）
     const props: Record<string, unknown> = {}
@@ -471,6 +441,9 @@ async function wizardPickMethod(row: WizardMethod) {
   wizardError.value = ''
   wizardProbeOk.value = false
   wizardProbePreview.value = ''
+  wizardProbeArgsPreview.value = ''
+  wizardLastProbe.value = null
+  wizardSkillDraft.value = null
   try {
     const d = await http.post<{
       call_suggest?: string
@@ -490,28 +463,35 @@ async function wizardPickMethod(row: WizardMethod) {
       service: wizard.value.service.trim(),
       method: row.name,
     })
-    wizardSlots.value = slotsFromDescribe(d.params, d.call_suggest)
-    wizard.value.call = inferInvokeCall(wizardSlots.value) || d.call_suggest || 'named_args'
-    wizard.value.summary = d.summary || row.summary || row.name
-    wizard.value.name = row.name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().slice(0, 64)
-    // 每个形参转为 SchemaNode；one_by_params/page_list 再把 params|data 袋摊到顶层
+    const nextForm = emptyToolForm(defaultUpstreamKey.value)
+    nextForm.invoke_service = wizard.value.service.trim()
+    nextForm.invoke_method = row.name
+    nextForm.name = row.name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().slice(0, 64)
+    nextForm.summary = d.summary || row.summary || row.name
+    nextForm.path = '/'
+    const slots = slotsFromDescribe(d.params, d.call_suggest)
+    const call = inferInvokeCall(slots) || d.call_suggest || 'named_args'
+    nextForm.invoke_call = call
+    applySlotsToToolForm(nextForm, slots)
     let params: Record<string, SchemaNode> = {}
     for (const p of d.params || []) {
       if (p?.name) params[p.name] = wizardNodeFromDescribe(p)
     }
-    if (wizard.value.call === 'page_list') {
+    if (call === 'page_list') {
       if (!params.page) {
         params.page = normalizeNode({ type: 'integer', label: '页码', description: '从 1 开始', default: 1 })
       }
       if (!params.limit) {
         params.limit = normalizeNode({ type: 'integer', label: '每页条数', description: '建议不超过 20', default: 5 })
       }
-      wizard.value.resultKind = 'list'
+      nextForm.result_kind = 'list'
     }
-    params = flattenBagSchema(wizard.value.call, params)
-    // 先清空试调值，再换 Schema：watch 会按 default 补齐
-    wizardValues.value = {}
-    wizardParams.value = params
+    nextForm.modelParams = flattenBagSchema(call, params)
+    nextForm.fields = [{ key: 'id', label: '编号', inList: true }]
+    wizardForm.value = nextForm
+    wizardSlots.value = slots
+    await nextTick()
+    wizardContractRef.value?.reloadFromForm()
   } catch (e) {
     wizardError.value = errorMessage(e)
   } finally {
@@ -519,102 +499,181 @@ async function wizardPickMethod(row: WizardMethod) {
   }
 }
 
-function wizardAddResultRow() {
-  wizard.value.resultRows.push({ field: '', label: '' })
+function onWizardSlotsUpdate(slots: CallSlot[]) {
+  wizardSlots.value = slots
 }
 
-function wizardRemoveResultRow(idx: number) {
-  wizard.value.resultRows.splice(idx, 1)
-}
-
-/** 试调值 → 调用 args；整包 call 时摊平 params|data，避免 PHP 多套一层。 */
-function wizardBuildArgs(): Record<string, unknown> {
-  const raw = buildArgsFromValues(wizardParams.value, wizardValues.value)
-  return unwrapBagArgs(wizard.value.call, raw)
-}
-
-/** 落库的 model_params：整包 call 再摊平袋字段，与运行时 args 形态一致。 */
-function wizardBuildModelParams(): Record<string, SchemaNode> {
-  return flattenBagSchema(wizard.value.call, wizardParams.value, wizardValues.value)
-}
-
-/** 递归收集必填但未填的参数路径（对象/对象数组内的必填子项也检查）。 */
-function wizardMissingRequired(schema: Record<string, SchemaNode>, args: Record<string, unknown>, prefix = ''): string[] {
-  const missing: string[] = []
-  for (const [key, node] of Object.entries(schema)) {
-    const path = prefix ? `${prefix}.${key}` : key
-    const v = args?.[key]
-    if (v === undefined) {
-      if (node.required) missing.push(path)
-      continue
-    }
-    if (node.type === 'object' && node.properties && v && typeof v === 'object' && !Array.isArray(v)) {
-      missing.push(...wizardMissingRequired(node.properties, v as Record<string, unknown>, path))
-    } else if (node.type === 'array' && node.items?.type === 'object' && node.items.properties && Array.isArray(v)) {
-      v.forEach((item, i) => {
-        if (item && typeof item === 'object') {
-          missing.push(...wizardMissingRequired(node.items!.properties!, item as Record<string, unknown>, `${path}[${i}]`))
-        }
-      })
-    }
+async function runHttpProbe(payload: {
+  oa: string
+  args: Record<string, unknown>
+}, target: 'wizard' | 'editor') {
+  const cref = target === 'wizard' ? wizardContractRef.value : editorContractRef.value
+  cref?.flush()
+  const f = target === 'wizard' ? wizardForm.value : form.value
+  const upstream = f.upstream.trim()
+  const path = f.path.trim()
+  if (!upstream || !path) {
+    ElMessage.warning('缺少业务上游或接口路径')
+    return
   }
-  return missing
+  const contract = toolPayload(f) as Record<string, any>
+  const r = await http.post<{ data: unknown }>('/v1/admin/tools/http-probe', {
+    oa: payload.oa.trim(),
+    args: payload.args,
+    upstream,
+    path,
+    method: 'GET',
+    timeout_seconds: f.timeout_seconds,
+    inject_identity_fields: contract.inject_identity_fields || [],
+    identity_bindings: contract.identity_bindings || [],
+    top_level_fields: contract.top_level_fields || [],
+    query_params_field: contract.query_params_field ?? null,
+    identity_params: contract.identity_params || {},
+    model_params: contract.model_params || {},
+  })
+  return r.data
 }
 
-/** 试调/入库前校验：必填参数不得为空；返回错误提示或空串。 */
-function wizardCheckRequired(args: Record<string, unknown>): string {
-  const missing = wizardMissingRequired(wizardParams.value, args)
-  return missing.length ? `必填参数未填写：${missing.join('、')}` : ''
-}
-
-async function wizardProbe() {
-  if (!wizard.value.oa.trim()) {
+async function runProbe(payload: {
+  oa: string
+  args: Record<string, unknown>
+  call: string
+  op: string
+  mode: 'export' | 'http'
+}, target: 'wizard' | 'editor') {
+  if (!payload.oa.trim()) {
     ElMessage.warning('请填写测试员工 OA 账号')
     return
   }
-  if (!wizard.value.method) {
-    ElMessage.warning('请先选择方法')
-    return
-  }
-  const args = wizardBuildArgs()
-  // 必填参数为空时不发起试调
-  const requiredErr = wizardCheckRequired(args)
-  if (requiredErr) {
-    ElMessage.warning(requiredErr)
-    return
-  }
-  wizardBusy.value = true
-  wizardError.value = ''
-  wizardProbeOk.value = false
-  try {
-    const r = await http.post<{ data: unknown }>('/v1/admin/tools/export-wizard/probe', {
-      service: wizard.value.service.trim(),
-      method: wizard.value.method.trim(),
-      oa: wizard.value.oa.trim(),
-      args,
-      call: wizard.value.call,
-      op: wizard.value.op,
-    })
-    wizardProbeOk.value = true
-    wizardProbePreview.value = JSON.stringify(r.data, null, 2).slice(0, 4000)
-    // 用返回样例自动补齐返回字段（保留已有 field 的手改 label）
-    const resultKind = wizard.value.resultKind === 'object' ? 'object' : 'list'
-    const merged = mergeProbeResultFields(r.data, wizard.value.resultRows, resultKind)
-    if (merged.length) {
-      wizard.value.resultRows = merged
-      const payload = r.data
-      if (Array.isArray(payload) || (payload && typeof payload === 'object' && Array.isArray((payload as { list?: unknown }).list))) {
-        wizard.value.resultKind = 'list'
-      }
-      ElMessage.success(`测试成功，已根据返回自动填入 ${merged.length} 个字段，可改后再入库`)
-    } else {
-      ElMessage.success('测试成功，可以入库')
-    }
-  } catch (e) {
+  if (target === 'wizard') {
+    wizardBusy.value = true
+    wizardError.value = ''
     wizardProbeOk.value = false
-    wizardError.value = errorMessage(e)
+    wizardLastProbe.value = null
+  } else {
+    editorProbeBusy.value = true
+    editorProbeError.value = ''
+    editorProbeOk.value = false
+    editorLastProbe.value = null
+  }
+  try {
+    let data: unknown
+    if (payload.mode === 'export') {
+      const service = target === 'wizard'
+        ? wizardForm.value.invoke_service.trim()
+        : form.value.invoke_service.trim()
+      const method = target === 'wizard'
+        ? wizardForm.value.invoke_method.trim()
+        : form.value.invoke_method.trim()
+      if (!service || !method) {
+        ElMessage.warning('缺少服务路径或方法名')
+        return
+      }
+      const r = await http.post<{ data: unknown }>('/v1/admin/tools/export-wizard/probe', {
+        service,
+        method,
+        oa: payload.oa.trim(),
+        args: payload.args,
+        call: payload.call,
+        op: payload.op,
+      })
+      data = r.data
+    } else {
+      data = await runHttpProbe(payload, target)
+    }
+    const argsPreview = JSON.stringify(payload.args ?? {}, null, 2).slice(0, 4000)
+    const preview = JSON.stringify(data, null, 2).slice(0, 4000)
+    const ref = target === 'wizard' ? wizardContractRef.value : editorContractRef.value
+    const filled = ref?.applyProbeData(data) ?? 0
+    const last = { args: payload.args, data }
+    if (target === 'wizard') {
+      wizardProbeOk.value = true
+      wizardProbeArgsPreview.value = argsPreview
+      wizardProbePreview.value = preview
+      wizardLastProbe.value = last
+    } else {
+      editorProbeOk.value = true
+      editorProbeArgsPreview.value = argsPreview
+      editorProbePreview.value = preview
+      editorLastProbe.value = last
+    }
+    if (filled) ElMessage.success(`测试成功，已根据返回自动填入 ${filled} 个字段`)
+    else ElMessage.success('测试成功')
+  } catch (e) {
+    const msg = errorMessage(e)
+    if (target === 'wizard') {
+      wizardProbeOk.value = false
+      wizardError.value = msg
+    } else {
+      editorProbeOk.value = false
+      editorProbeError.value = msg
+    }
   } finally {
-    wizardBusy.value = false
+    if (target === 'wizard') wizardBusy.value = false
+    else editorProbeBusy.value = false
+  }
+}
+
+function draftForEnrich(f: ToolForm) {
+  return {
+    name: f.name,
+    summary: f.summary,
+    description: f.description,
+    path: f.path,
+    invoke_service: f.invoke_service,
+    invoke_method: f.invoke_method,
+    model_params: f.modelParams,
+    result: {
+      kind: f.result_kind,
+      fields: f.fields.map((x) => x.key).filter(Boolean),
+      labels: Object.fromEntries(f.fields.filter((x) => x.key).map((x) => [x.key, x.label || x.key])),
+      list_columns: f.fields.filter((x) => x.inList && x.key).map((x) => x.key),
+    },
+  }
+}
+
+async function runEnrichSchema(target: 'wizard' | 'editor') {
+  const last = target === 'wizard' ? wizardLastProbe.value : editorLastProbe.value
+  if (!last) {
+    ElMessage.warning('请先测调成功')
+    return
+  }
+  const ref = target === 'wizard' ? wizardContractRef.value : editorContractRef.value
+  ref?.flush()
+  const f = target === 'wizard' ? wizardForm.value : form.value
+  if (target === 'wizard') wizardEnrichBusy.value = true
+  else editorEnrichBusy.value = true
+  try {
+    const r = await http.post<{
+      suggestion: EnrichSuggestion
+      skill: EnrichSkillDraft | null
+      warnings: string[]
+    }>('/v1/admin/tools/enrich-schema', {
+      probe_args: last.args,
+      probe_data: last.data,
+      draft: draftForEnrich(f),
+      include_skill: true,
+    })
+    const stats = mergeEnrichSuggestion(f, r.suggestion || {})
+    ref?.reloadFromForm()
+    if (r.skill) {
+      if (target === 'wizard') {
+        wizardSkillDraft.value = r.skill
+        wizardWithSkill.value = true
+      } else if (!editing.value) {
+        skillDraft.value = r.skill
+        withSkill.value = true
+      }
+    }
+    for (const w of r.warnings || []) draftWarnings.value = [...new Set([...draftWarnings.value, w])]
+    ElMessage.success(
+      `已智能合并 Schema（字段 ${stats.fieldCount}，参数说明 ${stats.paramHints}）`,
+    )
+  } catch (e) {
+    ElMessage.error(errorMessage(e))
+  } finally {
+    if (target === 'wizard') wizardEnrichBusy.value = false
+    else editorEnrichBusy.value = false
   }
 }
 
@@ -623,56 +682,60 @@ async function wizardSave() {
     ElMessage.warning('请先测试成功再入库')
     return
   }
-  if (!wizard.value.name.trim()) {
+  wizardContractRef.value?.flush()
+  wizardContractRef.value?.flattenModelParamsForSave()
+  if (!wizardForm.value.name.trim()) {
     ElMessage.warning('请填写工具名称')
     return
   }
-  const resultRows = wizard.value.resultRows
-    .map((r) => ({ field: r.field.trim(), label: r.label.trim() }))
+  const resultRows = wizardForm.value.fields
+    .map((r) => ({ field: r.key.trim(), label: r.label.trim() }))
     .filter((r) => r.field)
   if (!resultRows.length) {
     ElMessage.warning('请至少添加一个返回字段')
     return
   }
-  // 字段名只允许 a 或 a.b（一层点号），与后端一致
   const badField = resultRows.find((r) => !RESULT_FIELD_RE.test(r.field))
   if (badField) {
     ElMessage.warning(`返回字段名无效（仅支持 a 或 a.b 一层）：${badField.field}`)
     return
   }
+  const oa = wizardContractRef.value?.getProbeOa() || ''
+  if (!oa) {
+    ElMessage.warning('请填写测试员工 OA 账号')
+    return
+  }
+  const args = wizardContractRef.value?.buildProbeArgs() || {}
   const fields = resultRows.map((r) => r.field)
   const labels: Record<string, string> = {}
   for (const r of resultRows) labels[r.field] = r.label || r.field
-  const reasonText = wizard.value.reason.trim() || `接入方法 ${wizard.value.method}`
-  // 入库会再试调一次，同样要求必填参数已填
-  const args = wizardBuildArgs()
-  const requiredErr = wizardCheckRequired(args)
-  if (requiredErr) {
-    ElMessage.warning(requiredErr)
-    return
-  }
+  const reasonText = wizard.value.reason.trim() || `接入方法 ${wizardForm.value.invoke_method}`
   wizardBusy.value = true
   wizardError.value = ''
   try {
+    const toolName = wizardForm.value.name.trim()
     await http.post('/v1/admin/tools/export-wizard/save', {
       reason: reasonText,
-      service: wizard.value.service.trim(),
-      method: wizard.value.method.trim(),
-      oa: wizard.value.oa.trim(),
+      service: wizardForm.value.invoke_service.trim(),
+      method: wizardForm.value.invoke_method.trim(),
+      oa,
       args,
-      call: wizard.value.call,
+      call: wizardForm.value.invoke_call || 'named_args',
       op: wizard.value.op,
       risk: wizard.value.risk,
-      name: wizard.value.name.trim(),
-      summary: wizard.value.summary.trim(),
-      model_params: wizardBuildModelParams(),
+      name: toolName,
+      summary: wizardForm.value.summary.trim(),
+      model_params: wizardForm.value.modelParams,
       result: {
-        kind: wizard.value.resultKind,
+        kind: wizardForm.value.result_kind,
         fields,
         labels,
-        list_columns: wizard.value.resultKind === 'list' ? fields.slice(0, 6) : [],
+        list_columns: wizardForm.value.result_kind === 'list' ? fields.slice(0, 6) : [],
       },
     })
+    if (wizardSkillDraft.value && wizardWithSkill.value) {
+      await createSkill(wizardSkillDraft.value, toolName, reasonText)
+    }
     ElMessage.success('已入库，请到列表中启用')
     wizardOpen.value = false
     kindFilter.value = 'open_oa_invoke'
@@ -684,9 +747,10 @@ async function wizardSave() {
   }
 }
 
-async function createSkill(draft: SkillDraft, toolName: string) {
+async function createSkill(draft: SkillDraft | EnrichSkillDraft, toolName: string, reasonText?: string) {
   try {
-    await http.post('/v1/admin/skills', { ...draft, tools: [toolName], reason: reason.value.trim() })
+    const why = (reasonText || reason.value).trim() || '配套 Skill'
+    await http.post('/v1/admin/skills', { ...draft, tools: [toolName], reason: why })
     ElMessage.success(`已创建配套 Skill：${draft.display_name}`)
   } catch (e) {
     ElMessage.error(`Tool 已保存，但配套 Skill 创建失败：${errorMessage(e)}（可到 Skill 管理手工创建）`)
@@ -723,11 +787,12 @@ async function edit(name: string) {
     }
     editing.value = true
     form.value = toolFormFromSchema(d.current_schema)
-    syncParamRowsFromForm()
     syncCallSlotsFromForm()
-    advancedCollapse.value = Object.values(form.value.modelParams).some(
-      (n) => n.type === 'object' || n.type === 'array' || n.type === 'file',
-    ) ? ['adv'] : []
+    editorProbeOk.value = false
+    editorProbeError.value = ''
+    editorProbePreview.value = ''
+    editorProbeArgsPreview.value = ''
+    editorLastProbe.value = null
     // 配置里若仍是 office，把展示值对齐到已配置的上游 key，避免「未配置」误导
     if (!upstreams.value.some((u) => u.key === form.value.upstream)) {
       if (form.value.upstream === 'open_oa' && upstreams.value.some((u) => u.key === 'office')) {
@@ -737,6 +802,8 @@ async function edit(name: string) {
       }
     }
     editor.value = true
+    await nextTick()
+    editorContractRef.value?.reloadFromForm()
   } catch (e) {
     ElMessage.error(errorMessage(e))
   }
@@ -806,18 +873,12 @@ async function removeTool(row: ToolItem) {
   }
 }
 
-function addField() {
-  form.value.fields.push({ key: '', label: '', inList: form.value.result_kind === 'list' })
-}
-
 async function save() {
   if (reason.value.trim().length < 2) {
     ElMessage.warning('请填写变更原因（至少 2 个字，写入审计）')
     return
   }
-  syncFormFromParamRows()
-  applySlotsToToolForm(form.value, callSlots.value)
-  form.value.invoke_call = inferInvokeCall(callSlots.value)
+  editorContractRef.value?.flush()
   saving.value = true
   try {
     const body = { ...toolPayload(form.value), reason: reason.value.trim() }
@@ -999,98 +1060,28 @@ onMounted(load)
         <el-form-item label="超时（秒）">
           <el-input-number v-model="form.timeout_seconds" :min="1" :max="60" />
         </el-form-item>
+        <el-form-item label="Export 服务">
+          <el-input v-model="form.invoke_service" style="width: 280px" placeholder="可选：如 out_attendance/go_out_application" />
+          <el-input v-model="form.invoke_method" style="width: 240px; margin-left: 8px" placeholder="方法名（有服务+方法走 Export 测调）" />
+          <span class="hint">留空则按业务上游 + 接口路径做 HTTP 测调。</span>
+        </el-form-item>
 
-        <h4 class="sec">调用形参</h4>
-        <el-form-item v-if="form.invoke_service || form.invoke_method" label="Export 方法">
-          <el-input v-model="form.invoke_method" style="width: 280px" placeholder="如 getTravelExpensePageList" />
-          <span class="hint">预览用的方法名；open-oa 入库时与服务路径一起生效。</span>
-        </el-form-item>
-        <el-form-item v-else label="预览方法名">
-          <el-input v-model="form.invoke_method" style="width: 280px" :placeholder="form.name || '默认用 Tool 名'" />
-          <span class="hint">仅影响下方调用预览文案；HTTP GET Tool 可不填。</span>
-        </el-form-item>
-        <el-form-item label="形参与预览">
-          <CallSignatureEditor
-            :method-name="formPreviewMethod"
-            :slots="callSlots"
-            @update:slots="onCallSlotsUpdate"
-          />
-        </el-form-item>
-        <div class="hint" style="margin: -4px 0 12px 130px">
-          当前传参：注入身份={{ form.injectOa ? '是' : '否' }}
-          · 身份键={{ form.identityParamName || '—' }}
-          · 位置={{ form.identityPlacement === 'bag' ? '打包字段内' : '独立参数' }}
-          · 打包字段={{ form.query_params_field || '（无）' }}
-          · call={{ form.invoke_call }}
-        </div>
-
-        <h4 class="sec">模型可填的参数</h4>
-        <el-table :data="paramRows" size="small" border>
-          <el-table-column label="参数名" min-width="120">
-            <template #default="{ row }"><el-input v-model="row.name" size="small" placeholder="如 status" /></template>
-          </el-table-column>
-          <el-table-column label="类型" width="120">
-            <template #default="{ row }">
-              <el-select v-model="row.type" size="small" style="width: 100%">
-                <el-option v-for="t in PARAM_TYPES" :key="t" :value="t" :label="t" />
-              </el-select>
-            </template>
-          </el-table-column>
-          <el-table-column label="必填" width="70">
-            <template #default="{ row }"><el-checkbox v-model="row.required" /></template>
-          </el-table-column>
-          <el-table-column label="显示名" min-width="100">
-            <template #default="{ row }"><el-input v-model="row.label" size="small" /></template>
-          </el-table-column>
-          <el-table-column label="说明" min-width="140">
-            <template #default="{ row }"><el-input v-model="row.description" size="small" /></template>
-          </el-table-column>
-          <el-table-column label="顶层" width="70">
-            <template #default="{ row }">
-              <el-checkbox v-model="row.topLevel" :disabled="!form.query_params_field.trim() && form.identityPlacement !== 'bag'" />
-            </template>
-          </el-table-column>
-          <el-table-column label="" width="64">
-            <template #default="{ $index }">
-              <el-button link type="danger" size="small" @click="paramRows.splice($index, 1)">删除</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-        <el-button size="small" style="margin: 6px 0 4px" @click="addParamRow">添加参数</el-button>
-        <div class="hint">勾选「顶层」的参数直接作为查询参数；其余进入打包字段 JSON。无打包字段时全部平铺。删除/新增必填等不兼容变更保存后需在详情中激活。</div>
-        <el-collapse :model-value="advancedCollapse" style="margin-top: 8px" @change="onAdvancedCollapseChange">
-          <el-collapse-item title="高级：嵌套参数（对象/数组/文件）" name="adv">
-            <SchemaTreeEditor v-model="form.modelParams" mode="params" />
-            <div class="hint">改完高级树后，保存前会与上方表格合并；同名节点保留树中的嵌套结构。</div>
-          </el-collapse-item>
-        </el-collapse>
-
-        <h4 class="sec">返回结果</h4>
-        <el-form-item label="结果类型">
-          <el-radio-group v-model="form.result_kind">
-            <el-radio value="list">列表</el-radio>
-            <el-radio value="object">单条记录</el-radio>
-          </el-radio-group>
-        </el-form-item>
-        <div class="hint" style="margin-bottom: 6px">白名单：只有下列字段会回给模型/员工。字段名为上游返回的键，支持一层点路径（如 user.name）。</div>
-        <el-table :data="form.fields" size="small" border>
-          <el-table-column label="字段名（上游返回的键）" min-width="200">
-            <template #default="{ row }"><el-input v-model="row.key" size="small" placeholder="如 id、user.name" /></template>
-          </el-table-column>
-          <el-table-column label="显示名称" min-width="160">
-            <template #default="{ row }"><el-input v-model="row.label" size="small" placeholder="留空则详情中不显示" /></template>
-          </el-table-column>
-          <el-table-column v-if="form.result_kind === 'list'" label="列表中显示" width="100">
-            <template #default="{ row }"><el-checkbox v-model="row.inList" /></template>
-          </el-table-column>
-          <el-table-column label="" width="70">
-            <template #default="{ $index }">
-              <el-button link type="danger" size="small" @click="form.fields.splice($index, 1)">删除</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-        <el-button size="small" style="margin: 6px 0 4px" @click="addField">添加字段</el-button>
-        <div class="hint">未勾选「列表中显示」时默认显示前 6 个字段。</div>
+        <ToolContractForm
+          ref="editorContractRef"
+          :form="form"
+          :slots="callSlots"
+          :method-name="formPreviewMethod"
+          :show-probe="editorShowProbe"
+          :probe-busy="editorProbeBusy"
+          :probe-ok="editorProbeOk"
+          :probe-error="editorProbeError"
+          :probe-args-preview="editorProbeArgsPreview"
+          :probe-preview="editorProbePreview"
+          :enrich-busy="editorEnrichBusy"
+          @update:slots="onCallSlotsUpdate"
+          @probe="(p) => runProbe(p, 'editor')"
+          @enrich="() => runEnrichSchema('editor')"
+        />
 
         <h4 class="sec">变更原因</h4>
         <el-form-item label="原因" required>
@@ -1233,23 +1224,15 @@ onMounted(load)
       <template v-else>
         <div style="margin-bottom: 10px">
           <el-button link type="primary" @click="wizardStep = 'pick'">← 返回方法列表</el-button>
-          <span style="margin-left: 8px">当前方法：<code>{{ wizard.method }}</code></span>
+          <span style="margin-left: 8px">当前方法：<code>{{ wizardForm.invoke_method }}</code></span>
         </div>
         <el-form label-width="120px">
           <el-form-item label="工具名称" required>
-            <el-input v-model="wizard.name" maxlength="64" placeholder="对话里使用的工具英文名，建议小写+下划线" />
+            <el-input v-model="wizardForm.name" maxlength="64" placeholder="对话里使用的工具英文名，建议小写+下划线" />
             <div class="hint">入库后的 Tool 唯一名，例如 query_my_travel_expense_list</div>
           </el-form-item>
           <el-form-item label="用途说明">
-            <el-input v-model="wizard.summary" maxlength="255" placeholder="给管理员和模型看的中文说明" />
-          </el-form-item>
-          <el-form-item label="调用形参">
-            <CallSignatureEditor
-              :method-name="wizard.method"
-              :slots="wizardSlots"
-              @update:slots="onWizardSlotsUpdate"
-            />
-            <div class="hint">对应 invoke call={{ wizard.call }}；分页选「参数袋 + page/limit」。</div>
+            <el-input v-model="wizardForm.summary" maxlength="255" placeholder="给管理员和模型看的中文说明" />
           </el-form-item>
           <el-form-item label="操作类型">
             <el-radio-group v-model="wizard.op">
@@ -1263,71 +1246,56 @@ onMounted(load)
             </el-radio-group>
           </el-form-item>
 
-          <el-form-item label="请求参数">
-            <div style="width: 100%">
-              <div class="hint" style="margin-bottom: 6px">
-                左侧树配置参数结构（支持嵌套对象/数组/文件），将完整落库为 model_params；下方「测试值」仅本页试调，不落库。
-              </div>
-              <SchemaTreeEditor v-model="wizardParams" mode="params" />
-            </div>
-          </el-form-item>
+          <ToolContractForm
+            ref="wizardContractRef"
+            :form="wizardForm"
+            :slots="wizardSlots"
+            :method-name="wizardForm.invoke_method || wizard.method"
+            :show-probe="true"
+            :probe-busy="wizardBusy"
+            :probe-ok="wizardProbeOk"
+            :probe-error="wizardError"
+            :probe-args-preview="wizardProbeArgsPreview"
+            :probe-preview="wizardProbePreview"
+            :enrich-busy="wizardEnrichBusy"
+            :op="wizard.op"
+            @update:slots="onWizardSlotsUpdate"
+            @probe="(p) => runProbe(p, 'wizard')"
+            @enrich="() => runEnrichSchema('wizard')"
+          />
 
-          <el-form-item label="测试值">
-            <div style="width: 100%">
-              <div class="hint" style="margin-bottom: 6px">按上面的参数结构填写试调值；标记必填的参数为空时无法试调。</div>
-              <SchemaValueEditor v-model="wizardValues" :schema="wizardParams" />
-            </div>
-          </el-form-item>
+          <template v-if="wizardSkillDraft">
+            <h4 class="sec">配套 Skill（模型生成）</h4>
+            <el-form-item label="同时创建">
+              <el-checkbox v-model="wizardWithSkill">
+                入库后创建 Skill「{{ wizardSkillDraft.display_name }}」（{{ wizardSkillDraft.name }}）
+              </el-checkbox>
+            </el-form-item>
+            <template v-if="wizardWithSkill">
+              <el-form-item label="Skill 名">
+                <el-input v-model="wizardSkillDraft.name" />
+              </el-form-item>
+              <el-form-item label="显示名称">
+                <el-input v-model="wizardSkillDraft.display_name" />
+              </el-form-item>
+              <el-form-item label="用途说明">
+                <el-input v-model="wizardSkillDraft.description" type="textarea" :rows="2" />
+              </el-form-item>
+              <el-form-item label="使用说明">
+                <el-input v-model="wizardSkillDraft.instructions" type="textarea" :rows="2" />
+              </el-form-item>
+            </template>
+          </template>
 
-          <el-form-item label="返回形态">
-            <el-radio-group v-model="wizard.resultKind">
-              <el-radio-button v-for="o in RESULT_KIND_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</el-radio-button>
-            </el-radio-group>
-          </el-form-item>
-          <el-form-item label="返回字段" required>
-            <div style="width: 100%">
-              <div class="hint" style="margin-bottom: 6px">白名单字段：只有这里列出的字段会回给模型。「字段名」为接口里的英文键，支持一层点路径（如 user.name，不支持 a.b.c）；「中文名」用于展示。</div>
-              <el-table :data="wizard.resultRows" size="small" border>
-                <el-table-column label="字段名" min-width="140">
-                  <template #default="{ row }"><el-input v-model="row.field" placeholder="如 id、date" /></template>
-                </el-table-column>
-                <el-table-column label="中文名" min-width="140">
-                  <template #default="{ row }"><el-input v-model="row.label" placeholder="如 单号、日期" /></template>
-                </el-table-column>
-                <el-table-column label="" width="64">
-                  <template #default="{ $index }">
-                    <el-button link type="danger" @click="wizardRemoveResultRow($index)">删除</el-button>
-                  </template>
-                </el-table-column>
-              </el-table>
-              <el-button style="margin-top: 6px" @click="wizardAddResultRow">添加返回字段</el-button>
-            </div>
-          </el-form-item>
-
-          <el-form-item label="测试员工" required>
-            <el-input v-model="wizard.oa" placeholder="员工 OA 账号（USER_ID）" style="max-width: 280px" />
-            <div class="hint">用该员工身份真实调用接口，请使用你有权限的测试账号</div>
-          </el-form-item>
           <el-form-item label="审计原因">
             <el-input v-model="wizard.reason" maxlength="200" placeholder="写入操作审计，可留空自动生成" />
           </el-form-item>
         </el-form>
-
-        <el-alert
-          v-if="wizardProbeOk"
-          type="success"
-          :closable="false"
-          title="测试成功，可以入库"
-          style="margin-bottom: 8px"
-        />
-        <div v-if="wizardProbePreview" class="hint" style="margin-bottom: 4px">测试返回预览（仅供核对）：</div>
-        <pre v-if="wizardProbePreview" class="hint" style="max-height: 180px; overflow: auto; white-space: pre-wrap">{{ wizardProbePreview }}</pre>
       </template>
 
       <template #footer>
         <el-button @click="wizardOpen = false">关闭</el-button>
         <template v-if="wizardStep === 'config'">
-          <el-button :loading="wizardBusy" @click="wizardProbe">测试接口</el-button>
           <el-button type="primary" :loading="wizardBusy" :disabled="!wizardProbeOk" @click="wizardSave">测试成功后入库</el-button>
         </template>
       </template>

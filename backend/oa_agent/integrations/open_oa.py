@@ -79,6 +79,30 @@ def business_hint(body: object, max_len: int = MAX_HINT) -> str:
     return redact_secrets(text, max_len)
 
 
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+# ThinkPHP / 常见 PHP 错误页：SQLSTATE… 或 Exception: …
+_HTML_EXC_RE = re.compile(
+    r"(SQLSTATE\[[^\]]+\]:[^<\n]+|(?:PDOException|ErrorException|Error|Exception)\s*:\s*[^<\n]+)",
+    re.I,
+)
+
+
+def _extract_html_error(raw: str, max_len: int = 400) -> str:
+    """从 HTML 错误页抽出可读原因（title 或异常摘要）；抽不到则空串。"""
+    if not raw or "<" not in raw:
+        return ""
+    text = html.unescape(raw)
+    m = _HTML_EXC_RE.search(text)
+    if m:
+        return redact_secrets(" ".join(m.group(1).split()), max_len)
+    t = _TITLE_RE.search(text)
+    if t:
+        title = " ".join(_TAG_RE.sub(" ", t.group(1)).split())
+        if title and not re.match(r"(?i)^(ok|success)$", title):
+            return redact_secrets(title, max_len)
+    return ""
+
+
 class OpenOaError(Exception):
     """code: OFFICE_API_NOT_CONFIGURED | UPSTREAM_TIMEOUT | UPSTREAM_UNAVAILABLE | UPSTREAM_HTTP_ERROR |
     UPSTREAM_BIZ_ERROR | UPSTREAM_BAD_RESPONSE | OFFICE_TOKEN_EXPIRED | MINT_FAILED
@@ -167,18 +191,25 @@ class OpenOaClient:
             )
         except ConnectorError as exc:
             message = exc.message
+            user_message = exc.user_message or ""
             if not json_decode_ok and resp.status_code < 400:
+                # HTTP 200 却是 HTML（如 ThinkPHP 未捕获异常页）：抽出标题/异常摘要，便于测调看见真实原因
+                extracted = _extract_html_error(resp.text or "")
                 ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                snippet = " ".join((resp.text or "").split())[:180]
-                message = (
-                    f"open-oa 返回非 JSON（HTTP {resp.status_code}，"
-                    f"Content-Type={ct or '未知'}，URL={resp.url}，正文摘要：{snippet or '（空）'}）"
-                )
+                if extracted:
+                    message = extracted
+                    user_message = extracted
+                else:
+                    snippet = " ".join((resp.text or "").split())[:180]
+                    message = (
+                        f"open-oa 返回非 JSON（HTTP {resp.status_code}，"
+                        f"Content-Type={ct or '未知'}，URL={resp.url}，正文摘要：{snippet or '（空）'}）"
+                    )
             raise OpenOaError(
                 exc.code,
                 message,
                 exc.http_status,
-                user_message=exc.user_message,
+                user_message=user_message,
             ) from exc
 
     def mint(self, oa: str, gateway_secret: str | None) -> MintResult:

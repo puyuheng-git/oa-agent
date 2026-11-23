@@ -46,4 +46,36 @@ describe('flattenBagSchema', () => {
     expect(flat.foo?.type).toBe('string')
     expect(flat.n?.type).toBe('integer')
   })
+
+  it('keeps free object bag when no properties and no values', () => {
+    const flat = flattenBagSchema('one_by_params', {
+      params: { type: 'object', label: '参数' },
+      page: { type: 'integer' },
+    })
+    expect(flat.params?.type).toBe('object')
+    expect(flat.page?.type).toBe('integer')
+  })
+
+  it('converts unstructured array bag to free object instead of deleting', () => {
+    const flat = flattenBagSchema('one_by_params', {
+      params: { type: 'array', label: 'params' },
+      page: { type: 'integer' },
+    })
+    expect(flat.params?.type).toBe('object')
+    expect(flat.page?.type).toBe('integer')
+  })
+
+  it('keeps structured array bag as array', () => {
+    const flat = flattenBagSchema('page_list', {
+      data: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: { id: { type: 'integer' } },
+        },
+      },
+    })
+    expect(flat.data?.type).toBe('array')
+    expect(flat.data?.items?.properties?.id?.type).toBe('integer')
+  })
 })
