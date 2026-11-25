@@ -376,13 +376,27 @@ def employee_session(rt: AppRuntime, run: Run) -> tuple[ChatSession | None, dict
 
 # ---- 对话入口 ----
 
+def effective_message_max_chars(rt: AppRuntime) -> int:
+    """员工入口可用字数：按当前默认模型输入预算换算，并与滥用兜底取小。"""
+    from oa_agent.runtime.context_budget import entry_max_chars
+    from oa_agent.runtime.llm import resolve_model
+
+    try:
+        with rt.session() as db:
+            cfg = resolve_model(db, rt.vault, rt.tenant_id)
+            return entry_max_chars(cfg.params if cfg else None)
+    except Exception:  # noqa: BLE001 — 解析模型失败时仍允许对话，用兜底上限
+        return entry_max_chars(None)
+
+
 def guard_message(rt: AppRuntime, session: ChatSession, message: str, client_msg_id: str,
                   attachment_ids: list[str] | None = None) -> None:
     if not message.strip() and not attachment_ids:
         raise AppError(422, "VALIDATION_ERROR", "消息不能为空")
-    max_chars = int(setting(rt, "chat", "message_max_chars"))
+    # 仅滥用兜底 / 模型窗口换算上限；超长内容在调用模型前按预算压缩，不在此用固定 500/2000 拒绝
+    max_chars = effective_message_max_chars(rt)
     if message.strip() and len(message) > max_chars:
-        raise AppError(422, "VALIDATION_ERROR", f"消息不能超过 {max_chars} ")
+        raise AppError(422, "VALIDATION_ERROR", f"消息不能超过 {max_chars} 字")
     try:
         with rt.session() as db:
             if threads.get_owned(db, thread_id=session.thread_id, oa=session.oa) is None:

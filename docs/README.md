@@ -3,6 +3,7 @@
 | 目录 | 内容 |
 |------|------|
 | **[`STATUS.md`](STATUS.md)** | **完成度看板 + 后续扩展优先级（先看这里）** |
+| [`工单需求/`](工单需求/00-总览与拆分说明.md) | 后补需求工单（自然语言：背景/痛点/目的/总体需求；全生态 6 张） |
 | `design/` | 当前有效设计。`2026-10-09-oa-langgraph-design.md` 为权威设计；`2026-10-09-oa-service-side-design.md` 为 OA / Service 侧配套 |
 | `ops/` | `deployment.md` 部署与运维；`user-guide.md` 使用说明；[`integrate-external-system.md`](ops/integrate-external-system.md) 新系统接入；[`demo-idp.md`](ops/demo-idp.md) Demo IdP |
 | `delivery/` | 阶段交付报告（功能、文件、迁移、API、权限、测试结果、未完成项） |

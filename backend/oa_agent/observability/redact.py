@@ -51,3 +51,8 @@ def redact(text: str | None, limit: int = MAX_SUMMARY) -> str:
 
 def redact_secrets(text: str | None, limit: int | None = None) -> str:
     return _apply(text, _SECRET_RULES, limit)
+
+
+def redact_pii(text: str | None, limit: int | None = None) -> str:
+    """仅个人信息值形态（不含密钥规则以外的业务保留场景）；供模型 payload 使用。"""
+    return _apply(text, _PII_RULES, limit)

@@ -80,10 +80,17 @@ def test_budget_limits():
     assert check_budget_before_act(tool_call_count=3, limits=limits).finish_reason == FINISH_MAX_TOOL_CALLS
 
 
-def test_observation_prompt_has_summary_not_full_list():
-    summary = summarize_tool_data("office.list", {"list": [{"id": 1}, {"id": 2}], "total": 2}, kind="list")
-    assert "total=2" in summary
-    assert "[{'id'" not in summary
+def test_observation_prompt_includes_redacted_rows():
+    summary = summarize_tool_data(
+        "office.list",
+        {"list": [{"id": 1, "amount": 100, "id_card": "110101199001011234"}, {"id": 2, "amount": 200}], "total": 2},
+        kind="list",
+        columns=["id", "amount", "id_card"],
+        max_rows=20,
+    )
+    assert '"amount": 100' in summary or '"amount":100' in summary.replace(" ", "")
+    assert "110101199001011234" not in summary
+    assert "[已脱敏]" in summary
     obs = build_observation(
         task_id="t", run_id="r", execution_id="e", tool="office.list",
         round_no=1, step_index=0, status="success", summary=summary,
@@ -91,6 +98,26 @@ def test_observation_prompt_has_summary_not_full_list():
     text = format_observations_for_prompt([obs])
     assert "Tool observations" in text
     assert "office.list" in text
+
+
+def test_summarize_tool_data_object_kind_maps_to_record():
+    """legacy kind=object 应归一为 record，脱敏后返回合法 JSON，不抛错。"""
+    summary = summarize_tool_data(
+        "office.get",
+        {
+            "item": {
+                "id": 9,
+                "name": "Alice",
+                "id_card": "110101199001011234",
+            },
+        },
+        kind="object",
+        columns=["id", "name", "id_card"],
+    )
+    assert '"kind": "record"' in summary or '"kind":"record"' in summary.replace(" ", "")
+    assert '"id": 9' in summary or '"id":9' in summary.replace(" ", "")
+    assert "110101199001011234" not in summary
+    assert "[已脱敏]" in summary
 
 
 def test_observation_store_roundtrip(tmp_path: Path):

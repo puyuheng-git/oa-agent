@@ -650,7 +650,7 @@ onMounted(() => {
             placeholder="这个能力解决什么问题；模型据此判断何时使用" />
         </el-form-item>
         <el-form-item label="填参指引">
-          <el-input v-model="form.instructions" type="textarea" :rows="4" maxlength="2000" show-word-limit
+          <el-input v-model="form.instructions" type="textarea" :rows="4" maxlength="100000" show-word-limit
             placeholder="告诉模型如何把员工的话转换成参数，如：「上个月」换算为具体日期；年假对应 leave_type=1" />
         </el-form-item>
         <el-form-item label="示例问题">

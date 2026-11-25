@@ -54,11 +54,16 @@ def test_registry_model_params_pass_normalize_steps_and_validate_args(rt):
 
 
 def _ctx_for(spec):
-    return SimpleNamespace(tools=lambda: {spec.name: (spec, None)}, config={}, skills=[], model=None,
-                           num=lambda key: 10)
+    return SimpleNamespace(
+        tools=lambda: {spec.name: (spec, None)},
+        config=dict(oa_assistant.DEFAULT_CONFIG),
+        skills=[],
+        model=None,
+        num=lambda key: oa_assistant.DEFAULT_CONFIG[key],
+    )
 
 
-def test_builtin_time_result_surfaces_in_reply_without_feeding_model_history(rt):
+def test_builtin_time_result_surfaces_in_reply_and_feeds_redacted_history(rt):
     reg = _registry(rt)
     spec = reg.get("builtin.time")
     res = ToolExecutor(reg, {}).execute("builtin.time", {"timezone": "Asia/Shanghai"}, ID_ALICE, _Rec(), "n")
@@ -72,7 +77,8 @@ def test_builtin_time_result_surfaces_in_reply_without_feeding_model_history(rt)
     assert reply["data"]["kind"] == "text" and reply["data"]["tool"] == "builtin.time"
 
     summary = oa_assistant._history_summary(state, reply, _ctx_for(spec))
-    assert "Asia/Shanghai" not in summary and "builtin.time" in summary  # 外部文本不回灌模型
+    assert "builtin.time" in summary
+    assert "Asia/Shanghai" in summary or "UNTRUSTED_DATA" in summary  # 脱敏正文回灌模型
 
 
 def test_builtin_calc_result_surfaces_in_reply(rt):

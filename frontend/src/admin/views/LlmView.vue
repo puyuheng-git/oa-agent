@@ -34,6 +34,7 @@ const tierLabel = (v: string) => TIER_OPTIONS.find((o) => o.value === v)?.label 
 const mForm = reactive({
   provider_id: undefined as number | undefined, model_name: '', display_name: '',
   temperature: undefined as number | undefined, max_tokens: undefined as number | undefined,
+  max_input_tokens: undefined as number | undefined,
   purpose_tags: '', enabled: true,
   capabilities: ['text'] as string[], model_tier: 'large' as 'large' | 'small',
 })
@@ -239,10 +240,12 @@ function openModel(m?: any) {
   Object.assign(mForm, m
     ? {
       ...m, purpose_tags: (m.purpose_tags ?? []).join(', '), temperature: m.temperature ?? undefined, max_tokens: m.max_tokens ?? undefined,
+      max_input_tokens: m.max_input_tokens ?? undefined,
       capabilities: [...(m.capabilities ?? ['text'])], model_tier: m.model_tier ?? 'large',
     }
     : {
       provider_id: providers.value[0]?.id, model_name: '', display_name: '', temperature: undefined, max_tokens: undefined,
+      max_input_tokens: undefined,
       purpose_tags: '', enabled: true, capabilities: ['text'], model_tier: 'large',
     })
   remoteModels.value = []
@@ -270,7 +273,8 @@ async function saveModel() {
   }
   const body = {
     provider_id: mForm.provider_id, model_name: mForm.model_name, display_name: mForm.display_name,
-    temperature: mForm.temperature ?? null, max_tokens: mForm.max_tokens ?? null, enabled: mForm.enabled,
+    temperature: mForm.temperature ?? null, max_tokens: mForm.max_tokens ?? null,
+    max_input_tokens: mForm.max_input_tokens ?? null, enabled: mForm.enabled,
     capabilities: mForm.capabilities, model_tier: mForm.model_tier,
     purpose_tags: mForm.purpose_tags.split(',').map((s) => s.trim()).filter(Boolean),
   }
@@ -359,7 +363,8 @@ onMounted(load)
       </el-table-column>
       <el-table-column label="规模" width="90"><template #default="{ row }">{{ tierLabel(row.model_tier) }}</template></el-table-column>
       <el-table-column label="温度" width="80"><template #default="{ row }">{{ row.temperature ?? '默认' }}</template></el-table-column>
-      <el-table-column label="最大 Token" width="110"><template #default="{ row }">{{ row.max_tokens ?? '默认' }}</template></el-table-column>
+      <el-table-column label="输出 Token" width="110"><template #default="{ row }">{{ row.max_tokens ?? '默认' }}</template></el-table-column>
+      <el-table-column label="输入窗口" width="110"><template #default="{ row }">{{ row.max_input_tokens ?? '100000' }}</template></el-table-column>
       <el-table-column label="用途（兼容）" width="120"><template #default="{ row }">{{ row.purpose_tags.join('、') || '—' }}</template></el-table-column>
       <el-table-column label="状态" width="80"><template #default="{ row }">{{ row.enabled ? '启用' : '停用' }}</template></el-table-column>
       <el-table-column label="连接测试" min-width="220">
@@ -506,7 +511,11 @@ onMounted(load)
         </el-radio-group>
       </el-form-item>
       <el-form-item label="温度"><el-input-number v-model="mForm.temperature" :min="0" :max="2" :step="0.1" /></el-form-item>
-      <el-form-item label="最大 Token"><el-input-number v-model="mForm.max_tokens" :min="1" /></el-form-item>
+      <el-form-item label="输出 Token"><el-input-number v-model="mForm.max_tokens" :min="1" /></el-form-item>
+      <el-form-item label="输入窗口 Token">
+        <el-input-number v-model="mForm.max_input_tokens" :min="1" :max="10000000" />
+        <span class="form-hint">模型上下文窗口（输入侧）。留空=默认 100000；按厂商手册填写</span>
+      </el-form-item>
       <el-form-item label="用途标签"><el-input v-model="mForm.purpose_tags" placeholder="兼容旧逻辑，建议改用能力/规模与路由池（逗号分隔）" /></el-form-item>
       <el-form-item label="启用"><el-switch v-model="mForm.enabled" /></el-form-item>
     </el-form>
@@ -541,5 +550,10 @@ onMounted(load)
   gap: 8px;
   width: 100%;
   align-items: center;
+}
+.form-hint {
+  margin-left: 8px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 </style>

@@ -36,6 +36,8 @@ class ModelIn(BaseModel):
     display_name: str = Field(default="", max_length=128)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
+    max_input_tokens: int | None = Field(default=None, ge=1, le=10_000_000,
+                                         description="模型上下文窗口（输入侧）；留空=默认 100000")
     purpose_tags: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=lambda: ["text"])
     model_tier: Literal["large", "small"] = "large"
@@ -87,9 +89,11 @@ def _provider_summary(ctx: AdminCtx, p: LlmProvider) -> str:
 
 
 def _model_view(m: LlmModel, default_id: int | None = None) -> dict:
+    params = m.params_json or {}
     return {
         "id": m.id, "provider_id": m.provider_id, "model_name": m.model_name, "display_name": m.display_name,
-        "temperature": (m.params_json or {}).get("temperature"), "max_tokens": (m.params_json or {}).get("max_tokens"),
+        "temperature": params.get("temperature"), "max_tokens": params.get("max_tokens"),
+        "max_input_tokens": params.get("max_input_tokens"),
         "purpose_tags": m.purpose_tags or [], "capabilities": m.capabilities or ["text"],
         "model_tier": m.model_tier or "large", "is_default": default_id is not None and m.id == default_id,
         "enabled": m.enabled, "updated_by": m.updated_by, "updated_at": m.updated_at,
@@ -262,8 +266,12 @@ def _apply_model(m: LlmModel, body: ModelIn, actor: str) -> None:
     m.provider_id, m.model_name = body.provider_id, body.model_name
     m.display_name = body.display_name or body.model_name
     m.capabilities, m.model_tier = list(body.capabilities), body.model_tier
-    m.params_json = {k: v for k, v in {"temperature": body.temperature, "max_tokens": body.max_tokens}.items()
-                     if v is not None}
+    # 只持久化显式传入的采样/窗口参数；未传的键不保留（与历史 temperature/max_tokens 行为一致）
+    m.params_json = {k: v for k, v in {
+        "temperature": body.temperature,
+        "max_tokens": body.max_tokens,
+        "max_input_tokens": body.max_input_tokens,
+    }.items() if v is not None}
     m.purpose_tags = [t.strip() for t in body.purpose_tags if t.strip()]
     m.enabled, m.updated_by = body.enabled, actor
 
