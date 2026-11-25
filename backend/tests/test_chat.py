@@ -354,14 +354,20 @@ def test_office_biz_login_hint_maps_token_expired(chat, office):
 
 
 def test_duplicate_message_and_validation(chat, office):
+    from oa_agent.chat.service import effective_message_max_chars
+
     office.post(INVOKE_URL).mock(return_value=httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}}))
     h = open_chat(chat)
     payload = {"message": "查上周行程报销", "client_msg_id": "same-id-123"}
     assert chat.post("/v1/chat/messages", headers=h, json=payload).status_code == 200
     dup = chat.post("/v1/chat/messages", headers=h, json=payload)
     assert dup.status_code == 409 and dup.json()["error"]["code"] == "DUPLICATE_MESSAGE"
-    long = send(chat, h, "查" * 501)
-    assert long.status_code == 422
+    # 旧固定 500/2000 硬顶已取消：超过 2000 字仍应接受；仅超过滥用/模型窗口换算上限才 422
+    mid = send(chat, h, "查" * 2500)
+    assert mid.status_code == 200, mid.text
+    limit = effective_message_max_chars(runtime(chat))
+    over = send(chat, h, "查" * (limit + 1))
+    assert over.status_code == 422
 
 
 def test_monitoring_db_down_chat_still_works(chat, office):

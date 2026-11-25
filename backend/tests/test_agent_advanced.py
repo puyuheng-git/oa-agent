@@ -163,10 +163,11 @@ def test_stream_output_off_sends_only_done(chat, office, admin, monkeypatch):
 
 
 def test_sse_validation_errors_are_plain_json(chat, office, admin):
-    admin.put("/v1/admin/settings/chat", json={"values": {"message_max_chars": 20}})
+    # 入口不再用可配置的小字数硬顶；空消息仍应返回可读的 422 JSON（非 SSE）
     r = chat.post("/v1/chat/messages/stream", headers=open_chat(chat),
-                  json={"message": "长" * 21, "client_msg_id": uuid.uuid4().hex})
-    assert r.status_code == 422 and "20" in r.json()["error"]["message"]
+                  json={"message": "", "client_msg_id": uuid.uuid4().hex})
+    assert r.status_code == 422
+    assert "空" in r.json()["error"]["message"]
 
 
 # ---------------- 引用式串联 ----------------

@@ -246,10 +246,13 @@ def test_empty_message_without_attachment_rejected(chat):
 
 
 def test_body_over_max_chars_rejected_with_attachment(chat):
+    from oa_agent.chat.service import effective_message_max_chars
+
     h = open_chat(chat)
     file_id = _upload_csv(chat, h)
     rt = chat.app.state.runtime
-    limit = int(setting(rt, "chat", "message_max_chars"))
+    # 超过模型窗口换算 / 滥用兜底上限时仍拒绝；附件不得因此被标记进消息
+    limit = effective_message_max_chars(rt)
     resp = send(
         chat, h, "字" * (limit + 1),
         attachment_ids=[file_id], client_msg_id="att-max-chars-01",

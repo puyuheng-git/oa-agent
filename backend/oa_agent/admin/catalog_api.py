@@ -158,7 +158,7 @@ class SkillIn(ReasonIn):
     name: str = Field(max_length=64)
     display_name: str = Field(min_length=1, max_length=128)
     description: str = Field(max_length=2000)
-    instructions: str = Field("", max_length=2000)
+    instructions: str = Field("", max_length=100_000)
     examples: list[str] = Field(default_factory=list, max_length=10)
     tools: list[str] = Field(min_length=1, max_length=20)
     # 空串不限制 Tool.kind；写入 content_json.category

@@ -19,32 +19,41 @@ def new_result_id() -> str:
     return "res_" + secrets.token_hex(6)
 
 
-def summarize_tool_data(tool: str, data: dict[str, Any] | None, *, kind: str | None = None) -> str:
-    """模型可见摘要：list/record 不灌全表明细。"""
-    payload = data or {}
-    if kind == "text" or "text" in payload:
-        text = str(payload.get("text") or payload.get("content") or "")
-        if len(text) > 6000:
-            return text[:6000] + "\n…(truncated)"
-        return text or "(empty text)"
-    if "list" in payload or kind == "list":
-        rows = payload.get("list") or []
-        total = payload.get("total", len(rows) if isinstance(rows, list) else 0)
-        ids = []
-        if isinstance(rows, list):
-            for row in rows[:8]:
-                if isinstance(row, dict) and row.get("id") not in (None, ""):
-                    ids.append(str(row["id"]))
-        id_part = (" ids=" + ",".join(ids)) if ids else ""
-        return f"查询成功 tool={tool} total={total}{id_part}；明细由系统表格展示，请勿编造未出现的字段值。"
-    if kind == "record" or ("item" in payload and isinstance(payload.get("item"), dict)):
-        item = payload.get("item") if isinstance(payload.get("item"), dict) else payload
-        item_id = item.get("id") if isinstance(item, dict) else None
-        keys = ",".join(list(item.keys())[:12]) if isinstance(item, dict) else ""
-        return f"单条记录 tool={tool} id={item_id} fields={keys}；明细由系统卡片展示。"
-    # 通用
-    keys = ",".join(list(payload.keys())[:16])
-    return f"工具 {tool} 已返回字段：{keys or '(none)'}"
+def _normalize_payload_kind(kind: str | None, data: dict[str, Any]) -> str:
+    """将调用方 kind 归一成 build_model_payload 支持的 list/record/text。"""
+    raw = (kind or "").strip()
+    # legacy「object」与空 kind 都不得传入 build_model_payload
+    if raw == "object" or not raw:
+        if isinstance(data.get("list"), list) or isinstance(data.get("items"), list):
+            return "list"
+        if "text" in data:
+            return "text"
+        return "record"
+    return raw
+
+
+def summarize_tool_data(
+    tool: str,
+    data: dict[str, Any] | None,
+    *,
+    kind: str | None = None,
+    columns: list[str] | None = None,
+    max_rows: int = 20,
+    max_chars: int = 6000,
+) -> str:
+    """模型可见摘要：委托 build_model_payload，产出脱敏后的有界 JSON。"""
+    from oa_agent.runtime.model_payload import build_model_payload
+
+    payload_data = data or {}
+    normalized_kind = _normalize_payload_kind(kind, payload_data)
+    return build_model_payload(
+        tool=tool,
+        kind=normalized_kind,
+        data=payload_data,
+        columns=list(columns) if columns else None,
+        max_rows=max_rows,
+        max_chars=max_chars,
+    )
 
 
 def build_observation(

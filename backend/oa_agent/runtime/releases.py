@@ -60,24 +60,33 @@ FIELDS = (
      "help": "员工问「你能做什么」或问题无法处理时的回复。留空则按可用 Skill 的名称、说明和示例问题自动生成（推荐）；"
              "Skill 变化时自动更新）"},
     {"key": "chat_mode", "group": DIALOG, "label": "非查询问题（聊天模式）", "kind": "enum",
-     "options": [{"value": "llm", "label": "由模型直接回答（日常聊天、通用问答）"},
-                 {"value": "help", "label": "回复帮助文案"}],
-     "help": "与查询无关的问题（打招呼、闲聊、常识、写作润色等）怎么处理。仅「自动」意图解析且有可用模型时生效；否则回复帮助"},
+      "options": [{"value": "llm", "label": "由模型直接回答（日常聊天、通用问答）"},
+                  {"value": "help", "label": "回复帮助文案"}],
+      "help": "与查询无关的问题（打招呼、闲聊、常识、写作润色等）怎么处理。仅「自动」意图解析且有可用模型时生效；否则回复帮助"},
     {"key": "assistant_persona", "group": DIALOG, "label": "角色设定", "kind": "text", "max": 500,
-     "default": travel_query.DEFAULT_PERSONA,
-     "help": "提示词开头的身份描述，决定助手的自称和语气，如「你是 XX 公司的行政小助手『小 O』」。"
+      "default": travel_query.DEFAULT_PERSONA,
+      "help": "提示词开头的身份描述，决定助手的自称和语气，如「你是 XX 公司的行政小助手『小 O』」。"
              "输出格式与安全规则（不编造业务数据、不代办业务、身份由系统注入）固定在代码中，这里无法修改。留空恢复默认"},
     {"key": "chat_instructions", "group": DIALOG, "label": "回答补充要求", "kind": "text", "max": 1000,
-     "help": "追加给模型的回答要求，如语气、篇幅、可回答的范围（「只回答与工作相关的问题」）"
+      "help": "追加给模型的回答要求，如语气、篇幅、可回答的范围（「只回答与工作相关的问题」）"
              "不能放宽「不编造业务数据、不代办业务」的限制，写了也不生效"},
     {"key": "history_turns", "group": MEMORY, "label": "多轮追问：带给模型的对话轮数", "kind": "int",
      "min": 0, "max": 30, "unit": "",
      "help": "模型能看到本会话最近几轮对话（1 轮 = 员工一句 + 助手一句），用来理解「那上个月的呢」「第一条的详情」这类追问。"
              "轮数越多理解越连贯，但每次调用的 Token 越多、越慢。0 = 每句话独立理解。"
-             "查询结果在历史里只保留工具、条件和记录 ID，不含业务明细"},
+             "查询结果历史含脱敏业务明细（敏感字段除外）"},
     {"key": "history_message_chars", "group": MEMORY, "label": "每条历史消息的最大字数", "kind": "int",
      "min": 100, "max": 4000, "unit": "",
-     "help": "带给模型的每条历史消息超过该字数时截断，防止一条长回复占满上下文"},
+     "help": "主要限制员工原话；助手查询明细见 model_history_detail_chars。"
+             "带给模型的员工侧历史超过该字数时截断，防止一条长输入占满上下文"},
+    {"key": "model_result_max_rows", "group": MEMORY, "label": "回灌模型的列表最多行数", "kind": "int",
+     "min": 1, "max": 200, "unit": "",
+     "help": "列表/表格查询结果写入对话历史时，最多带给模型的行数（已脱敏）。"
+             "超出部分只保留在员工可见回复中，模型看不到。行数越多追问越准，Token 也越多"},
+    {"key": "model_history_detail_chars", "group": MEMORY, "label": "助手历史明细最大字数", "kind": "int",
+     "min": 500, "max": 20000, "unit": "",
+     "help": "助手侧历史（脱敏 JSON 查询明细）带给模型的最大字数。"
+             "员工原话仍受「每条历史消息的最大字数」限制。越大越完整，Token 越多"},
     {"key": "history_ref_ids", "group": MEMORY, "label": "查询摘要中保留的记录 ID ", "kind": "int",
      "min": 0, "max": 100, "unit": "",
      "help": "列表查询后，历史里按显示顺序记下前 N 条记录的 ID，员工说「第 3 条的详情」时模型据此选 ID。"
@@ -104,7 +113,7 @@ FIELDS = (
     {"key": "max_tool_steps", "group": OUTPUT, "label": "工具串联最大步数", "kind": "int",
      "min": 1, "max": 5, "unit": "",
      "help": "一个问题需要先用 A 再用 A 的结果查 B 时（如「我最近一笔报销的详情」），模型一次规划多个步骤，"
-             "后面步骤的参数引用前面步骤的返回字段，由服务端取值（模型看不到任何返回数据）"
+             "后面步骤的参数引用前面步骤的返回字段，由服务端取值；模型可见脱敏摘要。"
              "1 = 不串联，每次只调一个工具。步数越多越容易出现中途无数据而停止"},
     {"key": "max_table_rows", "group": OUTPUT, "label": "表格最多显示行数", "kind": "int",
      "min": 1, "max": 200, "unit": "",

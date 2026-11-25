@@ -60,7 +60,8 @@ class DevSessionIn(BaseModel):
 
 
 class MessageIn(BaseModel):
-    message: str = Field(max_length=2000)
+    # 入口不再用固定 2000 字硬顶；滥用上限与 context_budget.FALLBACK_MAX_MESSAGE_CHARS 对齐
+    message: str = Field(max_length=100_000)
     client_msg_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     attachment_ids: list[Annotated[str, Field(max_length=40)]] = Field(default_factory=list, max_length=5)
 
@@ -368,13 +369,13 @@ def _document_item(row: ExportFile) -> dict:
 
 def _session_extras(rt, *, oa: str, office_token: str = "") -> dict:
     """员工页面需要的能力与参数：可用功能、能否聊天、消息长度上限、转人工结果轮询参数。"""
-    from oa_agent.chat.service import skill_pack_menu
+    from oa_agent.chat.service import effective_message_max_chars, skill_pack_menu
 
     return {"skills": skill_menu(rt, oa=oa, office_token=office_token),
             "skill_packs": skill_pack_menu(rt, oa=oa),
             "workflows": workflow_menu(rt),
             "chat": chat_available(rt),
-            "message_max_chars": int(setting(rt, "chat", "message_max_chars")),
+            "message_max_chars": effective_message_max_chars(rt),
             "poll_interval_seconds": int(setting(rt, "chat", "result_poll_seconds")),
             "poll_max_minutes": int(setting(rt, "runtime", "intervention_expire_minutes")) + 5}
 
