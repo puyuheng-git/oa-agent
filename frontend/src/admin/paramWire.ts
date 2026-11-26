@@ -216,10 +216,9 @@ export function buildWirePreview(opts: {
     const key = opts.identityParamName || 'oa'
     if (opts.identityPlacement === 'bag' && hasBag) bagObj[key] = previewOa
     else if (method === 'POST' && !hasBag && contentType) {
-      // 独立身份：默认进 query（GET）或与 body 同通道
+      // 独立身份：与 body 同通道（有 body / JSON 进 body，否则进 query）
       if (jsonBody || contentType.includes('form')) {
-        if (method === 'GET') query[key] = previewOa
-        else if (Object.keys(body).length || jsonBody) body[key] = previewOa
+        if (Object.keys(body).length || jsonBody) body[key] = previewOa
         else query[key] = previewOa
       }
     } else {
