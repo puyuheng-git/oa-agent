@@ -111,10 +111,10 @@ FIELDS = (
     {"key": "compress_truncate_chars", "group": MEMORY, "label": "截断压缩：每条保留字数", "kind": "int",
      "min": 20, "max": 500, "unit": "", "help": "仅「截断压缩」使用：每条旧消息保留开头的字数"},
     {"key": "max_tool_steps", "group": OUTPUT, "label": "工具串联最大步数", "kind": "int",
-     "min": 1, "max": 5, "unit": "",
+     "min": 1, "max": 12, "unit": "",
      "help": "一个问题需要先用 A 再用 A 的结果查 B 时（如「我最近一笔报销的详情」），模型一次规划多个步骤，"
              "后面步骤的参数引用前面步骤的返回字段，由服务端取值；模型可见脱敏摘要。"
-             "1 = 不串联，每次只调一个工具。步数越多越容易出现中途无数据而停止"},
+             "1 = 不串联，每次只调一个工具。默认 8，便于多步自由编排"},
     {"key": "max_table_rows", "group": OUTPUT, "label": "表格最多显示行数", "kind": "int",
      "min": 1, "max": 200, "unit": "",
      "help": "列表结果在回复里最多显示的行数；超出时提示「显示前 N 条」。企业微信单条消息有 20KB 上限，过多的行会被截断"},

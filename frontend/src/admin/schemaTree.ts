@@ -18,6 +18,10 @@ export interface SchemaNode {
   multiple?: boolean
   properties?: Record<string, SchemaNode>
   items?: SchemaNode
+  /** HTTP/Export 放置：scalar | bag | query | body */
+  placement?: string
+  /** 线编：auto | flat | repeat | json */
+  encoding?: string
 }
 
 export const SCHEMA_TYPES: SchemaType[] = ['string', 'integer', 'number', 'boolean', 'object', 'array', 'file']
@@ -26,6 +30,7 @@ export const SCHEMA_MAX_DEPTH = 8
 // 直接透传的标量/简单字段（与后端白名单一致，properties/items 另行递归）
 const PASSTHROUGH_KEYS = [
   'format', 'enum', 'minimum', 'maximum', 'default', 'description', 'label', 'enum_labels', 'accept',
+  'placement', 'encoding',
 ] as const
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

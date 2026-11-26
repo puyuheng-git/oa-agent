@@ -46,6 +46,10 @@ class ToolSpec:
     invoke_method: str = ""
     invoke_call: str = "one_by_params"  # page_list | one_by_params | named_args
     invoke_op: str = "read"  # read | write
+    # OA Web invoke：旧脚本相对路径（仅服务端配置；模型不可填）
+    invoke_target: str = ""
+    # HTTP POST body Content-Type；GET / invoke 忽略
+    content_type: str = ""
 
     def label(self, key: str) -> str:
         return self.result_labels.get(key) or key

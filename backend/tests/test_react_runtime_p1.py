@@ -50,6 +50,27 @@ def test_ledger_uncertain_skips_retry(tmp_path: Path):
     assert ledger.should_skip_execute(again) is True
 
 
+def test_ledger_read_allows_requery_after_success(tmp_path: Path):
+    """只读同参在成功后仍可再执行，避免「已跳过重复执行」打断对话。"""
+    store = LedgerStore(tmp_path, "t1")
+    ledger = ExecutionLedger(store)
+    args = {"date_gte": "2026-01-01"}
+    first = ledger.reserve(
+        task_id="task1", run_id="run1", tool="office.list", args=args,
+        effect_type="read", idempotent=True,
+    )
+    ledger.mark_running(first["execution_id"])
+    ledger.mark_succeeded(first["execution_id"], result_id="res_1")
+    second = ledger.reserve(
+        task_id="task1", run_id="run1", tool="office.list", args=args,
+        effect_type="read", idempotent=True,
+    )
+    assert second["execution_id"] != first["execution_id"]
+    assert second["status"] == "reserved"
+    assert ledger.should_skip_execute(first) is False
+    assert ledger.should_skip_execute(second) is False
+
+
 def test_batch_dependency_skip():
     steps = prepare_batch_statuses([
         {"step_id": "a", "tool": "t1", "args": {}, "depends_on": []},

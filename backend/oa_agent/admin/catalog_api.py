@@ -69,7 +69,7 @@ with warnings.catch_warnings():
 
 
 class ToolIn(ReasonIn):
-    """后台表单只开"GET 只读、低风险、免确认的查"Tool"""
+    """后台表单：GET/POST HTTP；或 OA Web invoke_target；或 open-oa invoke_*。"""
 
     name: str = Field(max_length=64)
     summary: str = Field(max_length=255)
@@ -88,6 +88,8 @@ class ToolIn(ReasonIn):
     invoke_service: str = Field("", max_length=128)
     invoke_method: str = Field("", max_length=128)
     invoke_call: str = Field("one_by_params", max_length=32)
+    invoke_target: str = Field("", max_length=255)
+    content_type: str = Field("", max_length=64)
 
 
 class ApipostIn(BaseModel):
@@ -126,6 +128,8 @@ class HttpProbeIn(BaseModel):
     query_params_field: str | None = Field(None, max_length=64)
     identity_params: dict[str, str] = Field(default_factory=dict)
     model_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    invoke_target: str = Field("", max_length=255)
+    content_type: str = Field("", max_length=64)
 
 
 class EnrichSchemaIn(BaseModel):
@@ -227,13 +231,18 @@ def _office_guide(tool: Tool, schema: dict | None) -> dict:
             "只允许契约内 method + path + 参数白名单",
             "结果按 result.fields 白名单回图",
         ],
-        "http": {"method": method, "path": path, "upstream": upstream,
-                 "timeout_seconds": schema.get("timeout_seconds")},
+        "http": {
+            "method": method,
+            "path": path,
+            "upstream": upstream,
+            "timeout_seconds": schema.get("timeout_seconds"),
+            "invoke_target": schema.get("invoke_target") or None,
+        },
         "model_params": dict(schema.get("model_params") or {}),
         "identity_params": dict(schema.get("identity_params") or {}),
         "result": dict(schema.get("result") or {}),
-        "runtime": "业务上游 HTTP（员工 token）",
-        "edit_hint": "可在本页编辑 method/path/参数与结果字段，并走版本激活。",
+        "runtime": "业务上游 HTTP（员工 token；OA Web invoke 另带网关密钥与 target）",
+        "edit_hint": "可在本页编辑 method/path/参数与结果字段，并走版本激活；复用 general 旧口时填 invoke_target。",
     }
 
 
@@ -713,17 +722,35 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
 def _http_probe_spec(body: HttpProbeIn):
     """从表单契约片段构造临时 ToolSpec，供 build_request 与运行时一致。"""
     from oa_agent.executor.catalog import synthesize_identity_bindings, to_tool_spec
+    from oa_agent.integrations.open_oa import OA_WEB_INVOKE_PATH
 
+    inv_target = (body.invoke_target or "").strip().replace("\\", "/").lstrip("/")
     path = body.path.strip()
-    if not path.startswith("/") or path.startswith("//") or " " in path or "://" in path:
-        raise AppError(422, "VALIDATION_ERROR", "接口路径必须是以 / 开头的相对路径")
     method = (body.method or "GET").upper()
-    if method != "GET":
-        raise AppError(422, "VALIDATION_ERROR", "HTTP 测调一期仅支持 GET")
+    if inv_target:
+        path = OA_WEB_INVOKE_PATH
+        if method not in ("GET", "POST"):
+            raise AppError(422, "VALIDATION_ERROR", "OA Web invoke 测调仅支持 GET/POST")
+        if ".." in inv_target or "://" in inv_target:
+            raise AppError(422, "VALIDATION_ERROR", "invoke_target 不合法")
+    else:
+        if not path.startswith("/") or path.startswith("//") or " " in path or "://" in path:
+            raise AppError(422, "VALIDATION_ERROR", "接口路径必须是以 / 开头的相对路径")
+        if method not in ("GET", "POST"):
+            raise AppError(422, "VALIDATION_ERROR", "HTTP 测调仅支持 GET/POST")
     inject = [str(x) for x in (body.inject_identity_fields or []) if str(x).strip()]
     bindings = body.identity_bindings
     if bindings is None and inject:
         bindings = synthesize_identity_bindings(inject)
+    is_write = bool(inv_target) and method == "POST"
+    ct = (body.content_type or "").strip()
+    if method == "POST" and not inv_target:
+        if ct not in ("", "application/x-www-form-urlencoded", "application/json"):
+            raise AppError(422, "VALIDATION_ERROR", "content_type 不支持")
+        if not ct:
+            ct = "application/x-www-form-urlencoded"
+    else:
+        ct = ""
     schema = {
         "name": "http_probe_tmp",
         "summary": "http probe",
@@ -731,8 +758,8 @@ def _http_probe_spec(body: HttpProbeIn):
         "method": method,
         "path": path,
         "upstream": (body.upstream or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM,
-        "risk_level": "low",
-        "requires_confirmation": False,
+        "risk_level": "high" if is_write else "low",
+        "requires_confirmation": is_write,
         "timeout_seconds": float(body.timeout_seconds or 10),
         "inject_identity_fields": inject,
         "top_level_fields": [str(x) for x in (body.top_level_fields or []) if str(x).strip()],
@@ -742,6 +769,10 @@ def _http_probe_spec(body: HttpProbeIn):
         "model_params": dict(body.model_params or {}),
         "result": {"kind": "object", "fields": [], "labels": {}, "list_columns": []},
     }
+    if ct:
+        schema["content_type"] = ct
+    if inv_target:
+        schema["invoke_target"] = inv_target
     return to_tool_spec(schema, "probe", 0, "http-probe", kind="office")
 
 
@@ -749,7 +780,13 @@ def _http_probe_spec(body: HttpProbeIn):
 def http_probe(body: HttpProbeIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
     """普通 HTTP Tool 测调：mint 测试员工 token，按契约注入身份后请求所选上游。"""
     from oa_agent.chat import service as chat_service
-    from oa_agent.executor.executor import Identity, ToolError, build_request, validate_args
+    from oa_agent.executor.executor import Identity, ToolError, validate_args
+    from oa_agent.integrations.open_oa import (
+        GATEWAY_SECRET_HEADER,
+        OA_WEB_CONFIRM_HEADER,
+        OA_WEB_TARGET_HEADER,
+        sign_confirm_assertion,
+    )
 
     oa = body.oa.strip()
     if not oa:
@@ -770,9 +807,50 @@ def http_probe(body: HttpProbeIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
         raise AppError(502, "MINT_FAILED", f"签发测试员工令牌失败：{exc.message}") from exc
     identity = Identity(oa=minted.oa or oa, authorization=minted.authorization)
     try:
+        from oa_agent.executor.executor import build_wired_request
+
         clean, _ = validate_args(spec, dict(body.args or {}))
-        params = build_request(spec, clean, identity)
-        resp = client.get(spec.path, params, identity.authorization, timeout=spec.timeout_seconds)
+        inv_target = (spec.invoke_target or "").strip()
+        method = (spec.method or "GET").upper()
+        query, wired_body, content_type = build_wired_request(spec, clean, identity)
+        if inv_target:
+            # OA Web invoke：与运行时同闸（B2；写再加确认断言）
+            if not secret:
+                raise AppError(503, "OA_NOT_CONFIGURED", "未配置 AGENT_GATEWAY_SECRET")
+            extra = {
+                GATEWAY_SECRET_HEADER: secret,
+                OA_WEB_TARGET_HEADER: inv_target,
+            }
+            if method == "POST":
+                hmac_secret = oa_cfg.get("assertion_hmac_secret")
+                if not hmac_secret:
+                    raise AppError(503, "OA_NOT_CONFIGURED", "未配置 assertion HMAC，无法签发写确认断言")
+                assertion = sign_confirm_assertion(
+                    oa=identity.oa,
+                    action=spec.name,
+                    secret=hmac_secret,
+                )
+                extra[OA_WEB_CONFIRM_HEADER] = assertion
+                resp = client.post(
+                    spec.path, wired_body or clean, identity.authorization,
+                    timeout=spec.timeout_seconds, extra_headers=extra,
+                    content_type=content_type or "application/json",
+                    params=query or None,
+                )
+            else:
+                resp = client.get(
+                    spec.path, query, identity.authorization,
+                    timeout=spec.timeout_seconds, extra_headers=extra,
+                )
+        elif method == "POST":
+            resp = client.post(
+                spec.path, wired_body or {}, identity.authorization,
+                timeout=spec.timeout_seconds,
+                content_type=content_type,
+                params=query or None,
+            )
+        else:
+            resp = client.get(spec.path, query, identity.authorization, timeout=spec.timeout_seconds)
     except ToolError as exc:
         raise AppError(422, exc.code, exc.message) from exc
     except OpenOaError as exc:

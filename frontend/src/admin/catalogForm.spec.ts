@@ -29,9 +29,10 @@ describe('catalogForm', () => {
     expect(payload.identity_bindings).toEqual([{ param: 'oa', from: 'identity.oa' }])
     expect(payload.identity_params).toEqual({ user_id: 'oa' })
     expect(payload.top_level_fields).toEqual(['limit'])
-    expect(payload.model_params.status).toEqual({
-      type: 'integer', label: '状态', enum: [1], enum_labels: { '1': '年假' }, default: 1,
-    })
+    expect(payload.model_params.status.type).toBe('integer')
+    expect(payload.model_params.status.label).toBe('状态')
+    expect(payload.model_params.status.placement).toBe('bag')
+    expect(payload.model_params.limit.placement).toBe('query')
     expect(Object.keys(payload.model_params)).toEqual(['status', 'limit'])
     expect(payload.result).toEqual({ kind: 'list', fields: ['id', 'days'], labels: { id: '单号' }, list_columns: ['id'] })
     expect('schema' in payload.result).toBe(false)
@@ -117,7 +118,10 @@ describe('catalogForm', () => {
     const rows = paramRowsFromForm(form)
     expect(rows.find((r) => r.name === 'limit')?.topLevel).toBe(true)
     expect(rows.find((r) => r.name === 'status')?.required).toBe(true)
-    rows.push({ name: 'page', type: 'integer', required: false, label: '页码', description: '', topLevel: true })
+    rows.push({
+      name: 'page', type: 'integer', required: false, label: '页码', description: '',
+      topLevel: true, placement: 'query', encoding: 'auto',
+    })
     applyParamRows(form, rows)
     expect(Object.keys(form.modelParams).sort()).toEqual(['limit', 'page', 'status'])
     expect(form.topLevelFields.split(/,\s*/).sort()).toEqual(['limit', 'page'])

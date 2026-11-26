@@ -16,11 +16,18 @@ from oa_agent.observability.redact import redact, redact_secrets
 
 MINT_PATH = "/agent/token/mint"
 INVOKE_PATH = "/agent/invoke"
+# OA Webroot 统一反代（general/ds/agent/invoke.php）
+OA_WEB_INVOKE_PATH = "/general/ds/agent/invoke.php"
 EXPORT_DISCOVER_PATH = "/agent/export/discover"
 EXPORT_DESCRIBE_PATH = "/agent/export/describe"
 EXPORT_PROBE_PATH = "/agent/export/probe"
 DEFAULT_SUCCESS_CODES = ("0", "200")
 GATEWAY_SECRET_HEADER = "X-Agent-Gateway-Secret"
+OA_WEB_TARGET_HEADER = "X-Agent-Target"
+OA_WEB_CONFIRM_HEADER = "X-Agent-Confirm-Assertion"
+# 写确认断言 iss/aud（与登录 oa-host/oa-langgraph 区分；复用 assertion_hmac_secret）
+CONFIRM_ISS = "oa-langgraph"
+CONFIRM_AUD = "oa-general-write"
 DEFAULT_UPSTREAM = "open_oa"
 # 旧会话 / 旧 Tool 上游标识兼容
 LEGACY_UPSTREAM = "office"
@@ -246,19 +253,33 @@ class OpenOaClient:
         return MintResult(str(data["authorization"]), int(uid) if uid is not None else None, oa, max(0, ttl),
                           str(data.get("display_name") or oa))
 
-    def get(self, path: str, params: dict, authorization: str, timeout: float | None = None) -> OpenOaResponse:
-        resp, ms = self._send("GET", path, params=params, headers={"Authorization": authorization}, timeout=timeout)
+    def get(self, path: str, params: dict, authorization: str, timeout: float | None = None,
+            extra_headers: dict | None = None) -> OpenOaResponse:
+        headers = {"Authorization": authorization}
+        if extra_headers:
+            headers.update({k: v for k, v in extra_headers.items() if v})
+        resp, ms = self._send("GET", path, params=params, headers=headers, timeout=timeout)
         data, hint = self._unwrap(resp)
         return OpenOaResponse(data, resp.status_code, ms, hint)
 
     def post(self, path: str, body: dict, authorization: str, *, timeout: float | None = None,
-             idempotency_key: str | None = None, extra_headers: dict | None = None) -> OpenOaResponse:
+             idempotency_key: str | None = None, extra_headers: dict | None = None,
+             content_type: str | None = None, params: dict | None = None) -> OpenOaResponse:
+        """POST：默认 JSON body；content_type=form-urlencoded 时走 data=。"""
         headers = {"Authorization": authorization}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         if extra_headers:
             headers.update({k: v for k, v in extra_headers.items() if v})
-        resp, ms = self._send("POST", path, json=body, headers=headers, timeout=timeout)
+        ct = (content_type or "").strip().lower()
+        if ct == "application/x-www-form-urlencoded" or ct.endswith("form-urlencoded"):
+            resp, ms = self._send(
+                "POST", path, data=body or {}, params=params or None, headers=headers, timeout=timeout,
+            )
+        else:
+            resp, ms = self._send(
+                "POST", path, json=body or {}, params=params or None, headers=headers, timeout=timeout,
+            )
         data, hint = self._unwrap(resp)
         return OpenOaResponse(data, resp.status_code, ms, hint)
 
@@ -335,6 +356,44 @@ class OpenOaClient:
         )
         data, _ = self._unwrap(resp)
         return data
+
+
+def sign_confirm_assertion(
+    *,
+    oa: str,
+    action: str,
+    secret: str,
+    uid: int | None = None,
+    ttl_seconds: int = 120,
+) -> str:
+    """签发 OA Web invoke 写确认 HMAC（复用 assertion 密钥；iss/aud 与登录断言区分）。"""
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import secrets
+    import time
+
+    if not secret:
+        raise OpenOaError("OA_NOT_CONFIGURED", "未配置 OA assertion HMAC 密钥")
+    clean_oa = (oa or "").strip()
+    clean_action = (action or "").strip()
+    if not clean_oa or not clean_action:
+        raise OpenOaError("INVALID_ARGUMENT", "确认断言缺少 oa 或 action")
+    ttl = max(30, min(int(ttl_seconds or 120), 300))
+    payload = {
+        "oa": clean_oa,
+        "action": clean_action,
+        "exp": int(time.time()) + ttl,
+        "nonce": secrets.token_hex(16),
+        "iss": CONFIRM_ISS,
+        "aud": CONFIRM_AUD,
+    }
+    if uid is not None:
+        payload["uid"] = int(uid)
+    body = base64.urlsafe_b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode().rstrip("=")
+    sig = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    return body + "." + sig
 
 
 OfficeApiClient = OpenOaClient

@@ -1,16 +1,18 @@
 <script setup lang="ts">
 /**
  * 新建 Tool / 接入业务接口 共用契约区：
- * 身份+打包 → 只读调用预览；模型参数仅 Schema 树；复杂多袋形参折叠。
+ * 身份+打包 → 参数表（主）→ 请求预览 → 测调；Schema 树为高级。
  */
 import { computed, ref, watch } from 'vue'
 import CallSignatureEditor from './CallSignatureEditor.vue'
+import ParamTableEditor from './ParamTableEditor.vue'
 import SchemaTreeEditor from './SchemaTreeEditor.vue'
 import SchemaValueEditor from './SchemaValueEditor.vue'
 import { type FieldRow, type ToolForm } from '../catalogForm'
 import {
   applySlotsToToolForm, inferInvokeCall, previewCall, slotsFromToolForm, type CallSlot,
 } from '../callSignature'
+import { buildWirePreview, formatWirePreview } from '../paramWire'
 import { buildArgsFromValues, mergeValuesOnSchemaChange } from '../schemaValue'
 import { flattenBagSchema, unwrapBagArgs } from '../wizardCallArgs'
 import { mergeProbeResultFields } from '../probeResultFields'
@@ -55,8 +57,10 @@ const emit = defineEmits<{
 }>()
 
 const complexSigCollapse = ref<string[]>([])
+const advancedSchemaCollapse = ref<string[]>([])
 const probeOa = ref('')
 const probeValues = ref<Record<string, unknown>>({})
+const paramTableRef = ref<InstanceType<typeof ParamTableEditor> | null>(null)
 
 watch(
   () => props.form.modelParams,
@@ -70,9 +74,6 @@ watch(
 
 /** 由身份/打包/顶层推导的只读调用预览 */
 const callPreview = computed(() => previewCall(props.methodName, props.slots))
-const showTopLevelField = computed(() =>
-  !!(props.form.query_params_field.trim() || props.form.identityPlacement === 'bag'),
-)
 
 const hasExportTarget = computed(() =>
   !!(props.form.invoke_service.trim() && props.form.invoke_method.trim()),
@@ -88,8 +89,34 @@ const probeMode = computed<'export' | 'http' | null>(() => {
 const canProbe = computed(() => props.showProbe && !!probeMode.value)
 const probeHint = computed(() => {
   if (hasExportTarget.value) return ''
-  if (hasHttpTarget.value) return '将按业务上游 HTTP（GET）测调，身份注入与运行时一致'
+  if (hasHttpTarget.value) {
+    const m = (props.form.method || 'GET').toUpperCase()
+    return `将按业务上游 HTTP（${m}）测调，身份注入与运行时一致`
+  }
   return '填写 Export 服务路径+方法，或填写业务上游与接口路径后可测调'
+})
+
+const needsBagField = computed(() => {
+  if (props.form.identityPlacement === 'bag' && props.form.injectOa) return true
+  return Object.values(props.form.modelParams).some((n) => n.placement === 'bag')
+})
+
+const wirePreviewText = computed(() => {
+  const top = (props.form.topLevelFields || '').split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean)
+  const preview = buildWirePreview({
+    isExport: hasExportTarget.value,
+    method: props.form.method || 'GET',
+    contentType: props.form.content_type || null,
+    bagField: props.form.query_params_field,
+    identityParamName: props.form.identityParamName,
+    injectOa: props.form.injectOa,
+    identityPlacement: props.form.identityPlacement,
+    modelParams: props.form.modelParams,
+    topLevelFields: top,
+    values: props.showProbe ? probeValues.value : {},
+    previewOa: probeOa.value.trim() || '<oa>',
+  })
+  return `${preview.note}\n${formatWirePreview(preview)}`
 })
 
 /** 复杂形参编辑器为源：写回 form，再通知父组件更新槽位 */
@@ -99,7 +126,7 @@ function onSlotsUpdate(slots: CallSlot[]) {
   emit('update:slots', slots)
 }
 
-/** 身份/打包/顶层改动时反推槽位预览；form 为源，禁止用槽位清掉 injectOa */
+/** 身份/打包改动时反推槽位预览；form 为源 */
 function syncSlotsFromIdentity() {
   if (props.form.injectOa && props.form.identityPlacement === 'bag' && !props.form.query_params_field.trim()) {
     props.form.query_params_field = 'params'
@@ -107,6 +134,10 @@ function syncSlotsFromIdentity() {
   const next = slotsFromToolForm(props.form)
   props.form.invoke_call = inferInvokeCall(next)
   emit('update:slots', next)
+}
+
+function onParamTableChange() {
+  syncSlotsFromIdentity()
 }
 
 function addField() {
@@ -123,6 +154,7 @@ function buildProbeArgs(): Record<string, unknown> {
 
 function runProbe() {
   if (!probeOa.value.trim() || !probeMode.value) return
+  paramTableRef.value?.flush()
   const call = inferInvokeCall(props.slots)
   props.form.invoke_call = call
   emit('probe', {
@@ -161,6 +193,7 @@ function applyProbeData(data: unknown) {
  * 日常路径以 form 为准；仅展开「复杂调用形参」时槽位可能是源。
  */
 function flush() {
+  paramTableRef.value?.flush()
   const complexOpen = complexSigCollapse.value.includes('sig')
   if (complexOpen) {
     if (props.form.injectOa && props.form.identityPlacement === 'bag') {
@@ -175,7 +208,6 @@ function flush() {
     }
     return
   }
-  // 身份/打包/顶层 → 槽位
   const next = slotsFromToolForm(props.form)
   props.form.invoke_call = inferInvokeCall(next)
   emit('update:slots', next)
@@ -191,13 +223,13 @@ function getProbeOa() {
   return probeOa.value.trim()
 }
 
-/** 兼容父组件：modelParams 已由树直接绑定，无需再同步扁平行 */
 function reloadFromForm() {
   syncSlotsFromIdentity()
+  paramTableRef.value?.reload()
 }
 
 function syncParamRowsFromForm() {
-  // no-op：保留 expose 以免父组件调用报错
+  paramTableRef.value?.reload()
 }
 
 defineExpose({
@@ -216,7 +248,7 @@ defineExpose({
     <h4 class="sec">身份注入</h4>
     <el-form-item label="注入员工身份">
       <el-switch v-model="form.injectOa" @change="syncSlotsFromIdentity" />
-      <span class="hint">开启后由服务端写入当前员工账号，模型无法伪造。业务上游须按 token 校验本人数据。</span>
+      <span class="hint">开启后由服务端写入当前员工账号，模型无法伪造。</span>
     </el-form-item>
     <template v-if="form.injectOa">
       <el-form-item label="写入参数名" required>
@@ -226,7 +258,6 @@ defineExpose({
           placeholder="如 oa 或 user_id"
           @change="syncSlotsFromIdentity"
         />
-        <span class="hint">请求/方法里的键名；值始终是当前员工账号。</span>
       </el-form-item>
       <el-form-item label="身份放在哪">
         <el-radio-group v-model="form.identityPlacement" @change="syncSlotsFromIdentity">
@@ -234,43 +265,18 @@ defineExpose({
           <el-radio value="bag">写入打包字段内</el-radio>
         </el-radio-group>
       </el-form-item>
-      <el-form-item v-if="form.identityPlacement === 'bag'" label="打包字段名" required>
-        <el-input
-          v-model="form.query_params_field"
-          style="width: 200px"
-          placeholder="如 params、queryParams"
-          @change="syncSlotsFromIdentity"
-        />
-      </el-form-item>
-      <el-form-item v-else label="参数打包字段">
-        <el-input
-          v-model="form.query_params_field"
-          style="width: 200px"
-          placeholder="可选"
-          @change="syncSlotsFromIdentity"
-        />
-        <span class="hint">身份仍独立；未列入顶层的模型参数可进此 JSON。</span>
-      </el-form-item>
     </template>
-    <el-form-item v-else label="参数打包字段">
+    <el-form-item v-if="needsBagField || form.query_params_field" label="打包字段名">
       <el-input
         v-model="form.query_params_field"
         style="width: 200px"
-        placeholder="可选，如 params"
+        placeholder="如 params、queryParams"
         @change="syncSlotsFromIdentity"
       />
-    </el-form-item>
-    <el-form-item v-if="showTopLevelField" label="顶层参数">
-      <el-input
-        v-model="form.topLevelFields"
-        style="width: 320px"
-        placeholder="如 page, limit"
-        @change="syncSlotsFromIdentity"
-      />
-      <span class="hint">逗号分隔；这些根参数作为独立形参，其余进入打包字段。</span>
+      <span class="hint">参数表「装入袋」或身份进袋时使用。</span>
     </el-form-item>
 
-    <h4 class="sec">调用预览</h4>
+    <h4 class="sec">调用签名</h4>
     <div class="preview-box">
       <code class="preview-code">{{ callPreview }}</code>
     </div>
@@ -279,7 +285,6 @@ defineExpose({
       · 注入={{ form.injectOa ? '是' : '否' }}
       · 身份键={{ form.identityParamName || '—' }}
       · 打包={{ form.query_params_field || '（无）' }}
-      · 顶层={{ form.topLevelFields || '（无）' }}
     </div>
     <el-collapse v-model="complexSigCollapse" style="margin-bottom: 8px">
       <el-collapse-item title="复杂调用形参（多袋等）" name="sig">
@@ -293,9 +298,23 @@ defineExpose({
 
     <h4 class="sec">模型可填的参数</h4>
     <div class="hint" style="margin-bottom: 8px; margin-left: 0">
-      在此维护模型可见参数（含对象/数组/文件）；与上方打包、顶层共同决定请求形态。
+      表格维护顶层参数的类型、放置与编码；嵌套结构用下方高级 Schema。
     </div>
-    <SchemaTreeEditor v-model="form.modelParams" mode="params" />
+    <ParamTableEditor
+      ref="paramTableRef"
+      :form="form"
+      :is-export="hasExportTarget"
+      @change="onParamTableChange"
+    />
+    <el-collapse v-model="advancedSchemaCollapse" style="margin: 8px 0">
+      <el-collapse-item title="高级：Schema 树（嵌套 object/array）" name="schema">
+        <SchemaTreeEditor v-model="form.modelParams" mode="params" />
+      </el-collapse-item>
+    </el-collapse>
+
+    <h4 class="sec">请求预览</h4>
+    <div class="hint" style="margin-bottom: 4px; margin-left: 0">按当前参数表与测试值即时生成（测调前可核对类型编码）。</div>
+    <pre class="probe-pre wire-pre">{{ wirePreviewText }}</pre>
 
     <template v-if="showProbe">
       <h4 class="sec">测试接口</h4>
@@ -308,7 +327,7 @@ defineExpose({
       />
       <el-form-item label="测试员工" required>
         <el-input v-model="probeOa" placeholder="员工 OA 账号" style="max-width: 280px" />
-        <span class="hint">用该员工身份真实调用，请使用有权限的测试账号</span>
+        <span class="hint">用该员工身份真实调用</span>
       </el-form-item>
       <el-form-item label="测试值">
         <div style="width: 100%">
@@ -423,5 +442,9 @@ defineExpose({
   margin: 0;
   background: var(--el-fill-color-light);
   border-radius: 6px;
+}
+.wire-pre {
+  max-height: 220px;
+  margin-bottom: 8px;
 }
 </style>

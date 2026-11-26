@@ -522,7 +522,8 @@ async function runHttpProbe(payload: {
     args: payload.args,
     upstream,
     path,
-    method: 'GET',
+    method: (contract.method as string) || f.method || 'GET',
+    content_type: (contract.content_type as string) || f.content_type || '',
     timeout_seconds: f.timeout_seconds,
     inject_identity_fields: contract.inject_identity_fields || [],
     identity_bindings: contract.identity_bindings || [],
@@ -1052,9 +1053,32 @@ onMounted(load)
           </el-select>
           <span class="hint">上游在「连接配置 → 业务上游 / 连接器」的「业务上游地址」中维护；改上游属于不兼容变更。</span>
         </el-form-item>
+        <el-form-item label="HTTP 方法" required>
+          <el-radio-group
+            v-model="form.method"
+            :disabled="!!(form.invoke_service.trim() && form.invoke_method.trim())"
+            @change="() => {
+              if (form.method === 'GET') form.content_type = ''
+              else if (!form.content_type) form.content_type = 'application/x-www-form-urlencoded'
+            }"
+          >
+            <el-radio value="GET">GET</el-radio>
+            <el-radio value="POST">POST</el-radio>
+          </el-radio-group>
+          <span v-if="form.invoke_service.trim() && form.invoke_method.trim()" class="hint">Export 固定 POST</span>
+        </el-form-item>
+        <el-form-item
+          v-if="form.method === 'POST' && !(form.invoke_service.trim() && form.invoke_method.trim())"
+          label="Content-Type"
+        >
+          <el-select v-model="form.content_type" style="width: 360px">
+            <el-option label="application/x-www-form-urlencoded（$_POST）" value="application/x-www-form-urlencoded" />
+            <el-option label="application/json" value="application/json" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="接口路径" required>
           <el-input v-model="form.path" placeholder="所选地址下的相对路径，如 /hr/leave/index">
-            <template #prepend>GET</template>
+            <template #prepend>{{ (form.invoke_service.trim() && form.invoke_method.trim()) ? 'POST' : (form.method || 'GET') }}</template>
           </el-input>
         </el-form-item>
         <el-form-item label="超时（秒）">
@@ -1062,7 +1086,7 @@ onMounted(load)
         </el-form-item>
         <el-form-item label="Export 服务">
           <el-input v-model="form.invoke_service" style="width: 280px" placeholder="可选：如 out_attendance/go_out_application" />
-          <el-input v-model="form.invoke_method" style="width: 240px; margin-left: 8px" placeholder="方法名（有服务+方法走 Export 测调）" />
+          <el-input v-model="form.invoke_method" style="width: 240px; margin-left: 8px" placeholder="方法名（有服务+方法走 Export）" />
           <span class="hint">留空则按业务上游 + 接口路径做 HTTP 测调。</span>
         </el-form-item>
 

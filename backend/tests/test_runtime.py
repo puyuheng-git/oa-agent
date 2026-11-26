@@ -141,8 +141,10 @@ def test_validate_args_drops_identity_and_caps_limit():
     clean, dropped = validate_args(spec, {"oa": "lisi", "limit": 999, "evil": 1, "date_gte": "2026-09-01"})
     assert "oa" not in clean and set(dropped) == {"oa", "evil"}
     assert clean["limit"] == 20 and clean["page"] == 1
+    # 行程报销 fixture 为 open_oa_invoke：无 query_params_field，参数平铺（POST body / invoke args）
     req = build_request(spec, clean, Identity(oa="zhangsan", authorization="t"))
-    assert json.loads(req["queryParams"]) == {"date_gte": "2026-09-01", "oa": "zhangsan"}
+    assert req.get("date_gte") == "2026-09-01"
+    assert "queryParams" not in req
     with pytest.raises(ToolError):
         validate_args(spec, {"date_gte": "2026-13-01"})
     with pytest.raises(ToolError):

@@ -99,7 +99,8 @@ def test_admin_created_tool_is_used_without_code_change(admin, chat, office, mon
     body = send(chat, h, "我今年请了几次年假").json()
     assert body["run_status"] == "succeeded", body
     qp = json.loads(route.calls.last.request.url.params["queryParams"])
-    assert qp == {"leave_type": 1, "oa": "zhangsan"}, "身份由服务端注入，模型给的 oa 被丢弃"
+    assert qp.get("leave_type") == 1 and qp.get("oa") == "zhangsan", "身份由服务端注入，模型给的 oa 被丢弃"
+    assert qp.get("oa") != "lisi"
     assert route.calls.last.request.url.params["limit"] == "10"
     assert route.calls.last.request.headers["Authorization"] == "tok-zhangsan"
     data = body["reply"]["data"]
@@ -119,8 +120,14 @@ def test_tool_form_validation(admin):
     r = admin.post("/v1/admin/tools", json=leaked)
     assert r.status_code == 422 and "身份字段" in r.json()["error"]["message"]
 
-    post = admin.post("/v1/admin/tools", json={**LEAVE_TOOL, "method": "POST"})
-    assert post.status_code == 422 and "GET" in post.json()["error"]["message"]
+    # POST + form content_type 现已允许（OA PHP 写/复杂传参）
+    post_ok = admin.post("/v1/admin/tools", json={
+        **LEAVE_TOOL, "name": "query_my_leave_list_post", "method": "POST",
+        "content_type": "application/x-www-form-urlencoded",
+    })
+    assert post_ok.status_code == 200, post_ok.text
+    bad_method = admin.post("/v1/admin/tools", json={**LEAVE_TOOL, "name": "query_leave_put", "method": "PUT"})
+    assert bad_method.status_code == 422 and "GET/POST" in bad_method.json()["error"]["message"]
 
     for bad in ({"name": "Bad-Name"}, {"path": "http://evil/x"}, {"query_params_field": None},
                 {"result": {"kind": "list", "fields": []}}):

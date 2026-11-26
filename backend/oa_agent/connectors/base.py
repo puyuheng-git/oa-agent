@@ -52,6 +52,7 @@ class Connector(Protocol):
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        form_body: dict[str, Any] | None = None,
         authorization: str,
         timeout: float | None = None,
         idempotency_key: str | None = None,

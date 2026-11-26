@@ -117,12 +117,11 @@ class ExecutionLedger:
         effect_type: str = "read",
         idempotent: bool = True,
     ) -> dict[str, Any]:
-        """执行前预留。写操作若已有成功/进行中同指纹记录则复用，禁止新开副作用。"""
+        """执行前预留。写操作若已有同指纹记录则复用；只读允许同参再次执行。"""
         fp = request_fingerprint(tool, args)
         existing = self.store.find_by_fingerprint(task_id=task_id, fingerprint=fp)
+        # 仅写/高副作用复用账本，避免重复落库；查询类不因「已成功」而拦截重试
         if existing is not None and effect_type in _WRITE_EFFECTS:
-            return existing
-        if existing is not None and existing.get("status") == STATUS_SUCCEEDED:
             return existing
 
         eid = new_execution_id()
@@ -288,13 +287,18 @@ class ExecutionLedger:
         return rec
 
     def should_skip_execute(self, record: dict[str, Any]) -> bool:
-        """已成功或 uncertain/running 写操作：跳过实际调用，复用账本。"""
+        """写操作已成功/uncertain/running：跳过实际调用；只读不因「已成功」拦截。"""
         status = record.get("status")
+        effect = record.get("effect_type")
+        is_write = effect in _WRITE_EFFECTS
+        # 只读：允许同参再查，避免把「已跳过重复执行」灌给员工
         if status == STATUS_SUCCEEDED:
+            return bool(is_write)
+        if status in (STATUS_UNCERTAIN, STATUS_MANUAL):
+            return bool(is_write)
+        if status == STATUS_CANCELLED:
             return True
-        if status in (STATUS_UNCERTAIN, STATUS_MANUAL, STATUS_CANCELLED):
-            return True
-        if status == STATUS_RUNNING and record.get("effect_type") in _WRITE_EFFECTS:
+        if status == STATUS_RUNNING and is_write:
             return True
         return False
 

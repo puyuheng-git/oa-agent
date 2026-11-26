@@ -74,6 +74,7 @@ class HttpJsonConnector:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        form_body: dict[str, Any] | None = None,
         authorization: str,
         timeout: float | None = None,
         idempotency_key: str | None = None,
@@ -85,6 +86,7 @@ class HttpJsonConnector:
                 path,
                 params=params,
                 json_body=json_body,
+                form_body=form_body,
                 authorization=authorization,
                 timeout=timeout,
                 idempotency_key=idempotency_key,
@@ -95,6 +97,7 @@ class HttpJsonConnector:
             path,
             params=params,
             json_body=json_body,
+            form_body=form_body,
             authorization=authorization,
             timeout=timeout,
             idempotency_key=idempotency_key,
@@ -108,6 +111,7 @@ class HttpJsonConnector:
         *,
         params: dict[str, Any] | None,
         json_body: dict[str, Any] | None,
+        form_body: dict[str, Any] | None = None,
         authorization: str,
         timeout: float | None,
         idempotency_key: str | None,
@@ -118,14 +122,27 @@ class HttpJsonConnector:
             if method.upper() == "GET":
                 resp = self._client.get(path, params or {}, authorization, timeout)
             elif method.upper() == "POST":
-                resp = self._client.post(
-                    path,
-                    json_body or {},
-                    authorization,
-                    timeout=timeout,
-                    idempotency_key=idempotency_key,
-                    extra_headers=extra_headers,
-                )
+                if form_body is not None:
+                    resp = self._client.post(
+                        path,
+                        form_body,
+                        authorization,
+                        timeout=timeout,
+                        idempotency_key=idempotency_key,
+                        extra_headers=extra_headers,
+                        content_type="application/x-www-form-urlencoded",
+                        params=params,
+                    )
+                else:
+                    resp = self._client.post(
+                        path,
+                        json_body or {},
+                        authorization,
+                        timeout=timeout,
+                        idempotency_key=idempotency_key,
+                        extra_headers=extra_headers,
+                        params=params,
+                    )
             else:
                 raise ConnectorError("UPSTREAM_HTTP_ERROR", f"不支持的 HTTP 方法：{method}")
         except OfficeApiError as exc:
@@ -149,6 +166,7 @@ class HttpJsonConnector:
         *,
         params: dict[str, Any] | None,
         json_body: dict[str, Any] | None,
+        form_body: dict[str, Any] | None = None,
         authorization: str,
         timeout: float | None,
         idempotency_key: str | None,
@@ -174,8 +192,14 @@ class HttpJsonConnector:
             ) as client:
                 if verb == "GET":
                     resp = client.request("GET", path, params=params or {}, headers=headers)
+                elif form_body is not None:
+                    resp = client.request(
+                        "POST", path, data=form_body or {}, params=params or None, headers=headers,
+                    )
                 else:
-                    resp = client.request("POST", path, json=json_body or {}, headers=headers)
+                    resp = client.request(
+                        "POST", path, json=json_body or {}, params=params or None, headers=headers,
+                    )
         except httpx.TimeoutException as exc:
             raise ConnectorError("UPSTREAM_TIMEOUT", f"上游超时：{type(exc).__name__}") from exc
         except httpx.HTTPError as exc:

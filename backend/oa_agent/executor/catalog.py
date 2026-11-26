@@ -24,7 +24,13 @@ from sqlalchemy.orm import Session
 
 from oa_agent.db.models import Skill, SkillVersion, Tool, ToolVersion
 from oa_agent.db.types import utcnow
-from oa_agent.integrations.open_oa import DEFAULT_UPSTREAM, INVOKE_PATH, LEGACY_UPSTREAM, UPSTREAM_KEY_RE
+from oa_agent.integrations.open_oa import (
+    DEFAULT_UPSTREAM,
+    INVOKE_PATH,
+    LEGACY_UPSTREAM,
+    OA_WEB_INVOKE_PATH,
+    UPSTREAM_KEY_RE,
+)
 from oa_agent.executor.builtin_catalog import (
     TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_model_params, ensure_builtin_tools,
 )
@@ -140,8 +146,13 @@ def _normalize_schema_node(path: str, rule: Any, errors: list[str], depth: int =
         errors.append(f"{path} 嵌套深度超过 {SCHEMA_MAX_DEPTH}")
         return {}
     out = {k: rule[k] for k in ("type", "format", "enum", "minimum", "maximum", "default", "required", "description",
-                                "label", "enum_labels", "accept", "multiple")
+                                "label", "enum_labels", "accept", "multiple", "placement", "encoding")
            if k in rule and rule[k] not in (None, "", [], {})}
+    # placement / encoding 白名单
+    if "placement" in out and out["placement"] not in ("scalar", "bag", "query", "body"):
+        out.pop("placement", None)
+    if "encoding" in out and out["encoding"] not in ("auto", "flat", "repeat", "json"):
+        out.pop("encoding", None)
     if out.get("type", "string") not in PARAM_TYPES:
         errors.append(f"{path}.type 只支持 string / integer / number / boolean / object / array / file")
     out.setdefault("type", "string")
@@ -303,6 +314,26 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
             spec["path"] = INVOKE_PATH
             if method.upper() != "POST":
                 errors.append(f"{name} 声明 invoke_* 时 method 须为 POST")
+    # OA Webroot 统一 invoke：服务端固定 target，禁止进 model_params
+    inv_target = str(xa.get("invoke_target") or "").strip().replace("\\", "/")
+    if inv_target:
+        if inv_target.startswith("/") or ".." in inv_target or "://" in inv_target:
+            errors.append(f"{name}.invoke_target 须为 webroot 相对路径（如 general/ds/.../api.php）")
+        elif inv_target in params:
+            errors.append(f"{name}.invoke_target 不能与模型参数同名")
+        else:
+            spec["invoke_target"] = inv_target.lstrip("/")
+            spec["path"] = OA_WEB_INVOKE_PATH
+            if method.upper() not in ("GET", "POST"):
+                errors.append(f"{name} 声明 invoke_target 时 method 只支持 GET/POST")
+            if method.upper() == "POST":
+                spec["requires_confirmation"] = True
+                if spec.get("risk_level") == "low":
+                    spec["risk_level"] = "high"
+    ct = str(xa.get("content_type") or "").strip()
+    if ct in ("application/x-www-form-urlencoded", "application/json") and method.upper() == "POST":
+        if not inv_s and not inv_m:
+            spec["content_type"] = ct
     return spec, errors
 
 
@@ -383,7 +414,7 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
 def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
     """后台表单 → 与 OpenAPI 导入相同的规范化定义。
 
-    默认只开放 GET 只读；若带 invoke_service/method（open-oa 调用），允许 POST 并保留 ANew 目标。
+    HTTP 支持 GET/POST（POST 可带 content_type）；invoke_service/method 时强制 POST 走 open-oa 调用。
     """
     name = str(form.get("name") or "").strip()
     errors: list[str] = []
@@ -392,13 +423,37 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
     method = str(form.get("method") or "GET").upper()
     inv_s = str(form.get("invoke_service") or "").strip()
     inv_m = str(form.get("invoke_method") or "").strip()
+    inv_target = str(form.get("invoke_target") or "").strip()
     is_invoke = bool(inv_s and inv_m)
+    is_oa_web = bool(inv_target)
+    content_type = str(form.get("content_type") or "").strip()
     if is_invoke:
         method = "POST"
-    elif method != "GET":
-        errors.append("一期只支持 GET 只读查询接口（写操作需要员工确认流程）")
+        content_type = ""
+    elif is_oa_web:
+        if method not in ("GET", "POST"):
+            errors.append("OA Web invoke 仅支持 GET/POST")
+        path_forced = OA_WEB_INVOKE_PATH
+    elif method not in ("GET", "POST"):
+        errors.append("HTTP Tool 仅支持 GET/POST")
+        path_forced = None
+    else:
+        path_forced = None
+        if method == "POST":
+            if content_type not in (
+                "",
+                "application/x-www-form-urlencoded",
+                "application/json",
+            ):
+                errors.append("content_type 仅支持 application/x-www-form-urlencoded 或 application/json")
+            if not content_type:
+                content_type = "application/x-www-form-urlencoded"
+        else:
+            content_type = ""
     path = str(form.get("path") or "").strip()
-    if not is_invoke and (not path.startswith("/") or path.startswith("//") or " " in path or "://" in path):
+    if is_oa_web:
+        path = path_forced or OA_WEB_INVOKE_PATH
+    if not is_invoke and not is_oa_web and (not path.startswith("/") or path.startswith("//") or " " in path or "://" in path):
         errors.append("接口路径必须是以 / 开头的相对路径（地址在「连接配置 → 业务上游 / 连接器」中配置，Tool 里只选地址）")
     result = form.get("result") or {}
     xa = {
@@ -406,7 +461,7 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
         "description": form.get("description") or "",
         "upstream": form.get("upstream") or DEFAULT_UPSTREAM,
         "risk_level": form.get("risk_level") or "low",
-        "requires_confirmation": bool(form.get("requires_confirmation")),
+        "requires_confirmation": bool(form.get("requires_confirmation")) or (is_oa_web and method == "POST"),
         "timeout_seconds": form.get("timeout_seconds", 10),
         "inject_identity_fields": form.get("inject_identity_fields") or [],
         "top_level_fields": form.get("top_level_fields") or [],
@@ -417,6 +472,12 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
                    "labels": result.get("labels") or {}, "list_columns": result.get("list_columns") or [],
                    "schema": result.get("schema")},
     }
+    if content_type:
+        xa["content_type"] = content_type
+    if is_oa_web:
+        xa["invoke_target"] = inv_target
+        if method == "POST" and xa["risk_level"] == "low":
+            xa["risk_level"] = "high"
     if is_invoke:
         xa["invoke_service"] = inv_s
         xa["invoke_method"] = inv_m
@@ -509,7 +570,7 @@ def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
         breaking = breaking or is_breaking
         diff.append({"field": field_, "change": change, "old": before, "new": after, "breaking": is_breaking})
 
-    for key in ("method", "path", "query_params_field", "risk_level", "requires_confirmation"):
+    for key in ("method", "path", "query_params_field", "risk_level", "requires_confirmation", "content_type"):
         if old.get(key) != new.get(key):
             add(key, "changed", old.get(key), new.get(key), True)
     old_up = _canonical_upstream(old.get("upstream"))
@@ -701,6 +762,8 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
         invoke_method=str(schema.get("invoke_method") or ""),
         invoke_call=str(schema.get("invoke_call") or "one_by_params"),
         invoke_op=str(schema.get("invoke_op") or ("write" if schema.get("requires_confirmation") else "read")),
+        invoke_target=str(schema.get("invoke_target") or ""),
+        content_type=str(schema.get("content_type") or ""),
     )
 
 
@@ -779,8 +842,11 @@ def registration_blockers(tool: Tool, has_version: bool, method: str | None = No
         reasons.append("规范未启用（x-agent.enabled 不为 true 或已从规范移除）")
     if tool.risk_level != "low" or tool.requires_confirmation:
         reasons.append("非低风险或需员工确认（写操作须确认流程）")
-    if kind == "office" and method and method.upper() != "GET":
+    inv_target = str((schema or {}).get("invoke_target") or "").strip()
+    if kind == "office" and method and method.upper() != "GET" and not inv_target:
         reasons.append("office 类型一期只执行 GET 只读接口")
+    if kind == "office" and inv_target and method and method.upper() not in ("GET", "POST"):
+        reasons.append("OA Web invoke 仅支持 GET/POST")
     if kind == "open_oa_invoke":
         if method and method.upper() != "POST":
             reasons.append("open_oa_invoke 须为 POST /agent/invoke")
