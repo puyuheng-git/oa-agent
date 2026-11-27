@@ -10,7 +10,7 @@ import {
 } from './paramWire'
 
 export interface FieldRow {
-  /** 返回字段键；允许一层点路径，如 `user.name` */
+  /** 返回字段键；允许多级点路径，如 `user.name`、`get.params1` */
   key: string
   label: string
   inList: boolean
@@ -43,6 +43,8 @@ export interface ToolForm {
   method: string
   /** POST 时 body Content-Type；GET 忽略 */
   content_type: HttpContentType | ''
+  /** 请求参数字符集：OA PHP 用 gbk；JSON 用 utf-8 */
+  request_charset: 'gbk' | 'utf-8' | ''
   timeout_seconds: number
   /** 是否由服务端注入当前员工账号 */
   injectOa: boolean
@@ -86,11 +88,11 @@ export interface SkillForm {
 export function emptyToolForm(defaultUpstream = 'open_oa'): ToolForm {
   return {
     name: '', summary: '', description: '', upstream: defaultUpstream || 'open_oa', path: '/',
-    method: 'GET', content_type: '',
+    method: 'GET', content_type: '', request_charset: 'gbk',
     timeout_seconds: 10, injectOa: true, identityParamName: 'oa', identityPlacement: 'bag',
     query_params_field: 'queryParams', identityParams: '', result_kind: 'list',
     modelParams: {}, topLevelFields: '', fields: [],
-    invoke_service: '', invoke_method: '', invoke_call: 'one_by_params',
+    invoke_service: '', invoke_method: '', invoke_call: 'named_args',
   }
 }
 
@@ -266,6 +268,15 @@ export function toolPayload(form: ToolForm): Record<string, unknown> {
   } else if (method === 'POST') {
     payload.content_type = 'application/x-www-form-urlencoded'
   }
+  // 非 Export：落库字符集（默认 OA GBK）
+  const cs = (form.request_charset || '').trim().toLowerCase()
+  if (cs === 'gbk' || cs === 'utf-8') {
+    payload.request_charset = cs
+  } else if ((payload.content_type as string) === 'application/json') {
+    payload.request_charset = 'utf-8'
+  } else {
+    payload.request_charset = 'gbk'
+  }
   // open-oa：同时有 service+method 时按 invoke 落库
   const invSvc = form.invoke_service.trim()
   const invMethod = form.invoke_method.trim()
@@ -275,6 +286,7 @@ export function toolPayload(form: ToolForm): Record<string, unknown> {
     payload.invoke_call = (form.invoke_call || 'one_by_params').trim() || 'one_by_params'
     payload.method = 'POST'
     delete payload.content_type
+    delete payload.request_charset
   }
   return payload
 }
@@ -305,6 +317,13 @@ export function toolFormFromSchema(schema: Record<string, any>): ToolForm {
   const invSvc = String(schema.invoke_service || '').trim()
   const invMethod = String(schema.invoke_method || '').trim()
   const isExport = !!(invSvc && invMethod)
+  const csRaw = String(schema.request_charset || '').trim().toLowerCase()
+  let request_charset: 'gbk' | 'utf-8' | '' = ''
+  if (isExport) request_charset = ''
+  else if (csRaw === 'gbk' || csRaw === 'gb2312') request_charset = 'gbk'
+  else if (csRaw === 'utf-8' || csRaw === 'utf8') request_charset = 'utf-8'
+  else if (content_type === 'application/json') request_charset = 'utf-8'
+  else request_charset = 'gbk'
   const topSet = new Set(top)
   const modelParams = Object.fromEntries(
     Object.entries<unknown>(schema.model_params || {}).map(([name, rule]) => {
@@ -328,6 +347,7 @@ export function toolFormFromSchema(schema: Record<string, any>): ToolForm {
     path: schema.path || '/',
     method: isExport ? 'POST' : method,
     content_type: isExport ? '' : content_type,
+    request_charset: isExport ? '' : request_charset,
     timeout_seconds: schema.timeout_seconds ?? 10,
     injectOa: id.inject,
     identityParamName: id.name,

@@ -1,13 +1,15 @@
-// 从向导 probe 成功返回的 data 推断 result.fields / labels（顶层 + 一层点路径）。
+// 从向导 probe 成功返回的 data 推断 result.fields / labels（顶层 + 多级点路径）。
 
-const FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/
+/** 与后端 RESULT_FIELD_RE 对齐：最多 8 段 */
+const FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}(\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,7}$/
+const MAX_DEPTH = 4
 
 export interface ProbeFieldRow {
   field: string
   label: string
 }
 
-/** 从一条对象行提取字段：顶层键 + 一层 object 的 a.b；数组整段只保留顶层键。 */
+/** 从一条对象行提取字段：顶层键 + 嵌套 object 的点路径；数组整段只保留顶层键。 */
 export function fieldsFromRow(row: Record<string, unknown>, max = 40): ProbeFieldRow[] {
   const out: ProbeFieldRow[] = []
   const seen = new Set<string>()
@@ -16,14 +18,16 @@ export function fieldsFromRow(row: Record<string, unknown>, max = 40): ProbeFiel
     seen.add(field)
     out.push({ field, label })
   }
-  for (const [k, v] of Object.entries(row)) {
-    add(k, k)
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      for (const sk of Object.keys(v as Record<string, unknown>)) {
-        add(`${k}.${sk}`, sk)
+  const walk = (obj: Record<string, unknown>, prefix: string, depth: number) => {
+    for (const [k, v] of Object.entries(obj)) {
+      const path = prefix ? `${prefix}.${k}` : k
+      add(path, k)
+      if (depth < MAX_DEPTH && v && typeof v === 'object' && !Array.isArray(v)) {
+        walk(v as Record<string, unknown>, path, depth + 1)
       }
     }
   }
+  walk(row, '', 0)
   return out
 }
 

@@ -2,12 +2,14 @@
 
 placement: scalar | bag | query | body
 encoding: auto | flat | repeat | json
+  - form/query 下 object / 袋参数用 PHP 多维数组（name[key]=），不用 JSON 字符串
+  - application/json body 仍保真嵌套对象
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
+from urllib.parse import urlencode
 
 PLACEMENTS = frozenset({"scalar", "bag", "query", "body"})
 ENCODINGS = frozenset({"auto", "flat", "repeat", "json"})
@@ -21,7 +23,7 @@ _SCALAR = frozenset({"string", "integer", "number", "boolean", "file"})
 def recommend_encoding(rule: dict) -> str:
     t = rule.get("type") or "string"
     if t == "object":
-        return "json"
+        return "json"  # form 下实际展开为 name[key]= 多维数组
     if t == "array":
         item = (rule.get("items") or {}).get("type") or "string"
         if item in _SCALAR and item != "file":
@@ -75,6 +77,35 @@ def encode_flat_value(value: Any) -> str:
     return str(value)
 
 
+def flatten_php_form(prefix: str, value: Any) -> dict[str, Any]:
+    """把 dict/list 展成 PHP 多维表单键：a[b]=1、a[b][c]=2、a[]=1。
+
+    OA PHP 的 $_GET/$_POST 会还原成多维数组，无需 json_decode。
+    """
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if v is None or v == "":
+                continue
+            key = f"{prefix}[{k}]"
+            out.update(flatten_php_form(key, v))
+        return out
+    if isinstance(value, list):
+        out = {}
+        scalar_items: list[Any] = []
+        for i, v in enumerate(value):
+            if v is None or v == "":
+                continue
+            if isinstance(v, (dict, list)):
+                out.update(flatten_php_form(f"{prefix}[{i}]", v))
+            else:
+                scalar_items.append(encode_flat_value(v))
+        if scalar_items:
+            out[f"{prefix}[]"] = scalar_items
+        return out
+    return {prefix: encode_flat_value(value)}
+
+
 def encode_param_value(
     name: str,
     value: Any,
@@ -87,7 +118,8 @@ def encode_param_value(
     if encoding == "json":
         if json_body:
             return {name: value}
-        return {name: json.dumps(value, ensure_ascii=False, separators=(",", ":"))}
+        # form/query：多维数组，不用 JSON 字符串
+        return flatten_php_form(name, value)
     if encoding == "repeat":
         items = value if isinstance(value, list) else [value]
         out_list = []
@@ -100,8 +132,41 @@ def encode_param_value(
     if isinstance(value, list):
         return {name: ",".join(encode_flat_value(v) for v in value)}
     if isinstance(value, dict):
-        return {name: json.dumps(value, ensure_ascii=False, separators=(",", ":"))}
+        return flatten_php_form(name, value)
     return {name: encode_flat_value(value)}
+
+
+def normalize_request_charset(charset: str | None, content_type: str | None) -> str:
+    """解析有效字符集：gbk | utf-8。"""
+    raw = (charset or "").strip().lower()
+    if raw in ("gb2312", "gbk"):
+        return "gbk"
+    if raw in ("utf-8", "utf8"):
+        return "utf-8"
+    ct = (content_type or "").strip().lower()
+    if ct.startswith("application/json"):
+        return "utf-8"
+    # OA PHP 默认 GBK（GET query 与 form-urlencoded）
+    return "gbk"
+
+
+def encode_www_form(data: dict[str, Any], charset: str = "utf-8") -> tuple[bytes, str]:
+    """按指定字符集做 application/x-www-form-urlencoded。
+
+    返回 (body_bytes, Content-Type 含 charset)。OA 端读 $_POST 时字节按 GBK 解释。
+    """
+    enc = "gbk" if (charset or "").lower() in ("gbk", "gb2312") else "utf-8"
+    # doseq：list 值展开为多键（配合 ids[]= / name[key][]=）
+    text = urlencode(data or {}, doseq=True, encoding=enc, errors="replace")
+    return text.encode("ascii"), f"application/x-www-form-urlencoded; charset={enc}"
+
+
+def encode_query_string(params: dict[str, Any] | None, charset: str = "utf-8") -> str:
+    """查询串（不含 ?）；空 params 返回空串。"""
+    if not params:
+        return ""
+    enc = "gbk" if (charset or "").lower() in ("gbk", "gb2312") else "utf-8"
+    return urlencode(params, doseq=True, encoding=enc, errors="replace")
 
 
 def build_wired_parts(
@@ -119,6 +184,8 @@ def build_wired_parts(
 
     identity_pairs: [(param_name, value), ...]
     identity_into_bag: True 时写入袋，否则按独立参数写入 query（或 POST 时与 body 同通道）。
+
+    袋 / 对象在 form、query 下展开为 PHP 多维数组键（name[key]=），不用 JSON 字符串。
     """
     method_u = (method or "GET").upper()
     has_bag = bool(bag_field and str(bag_field).strip())
@@ -144,8 +211,17 @@ def build_wired_parts(
         placement = infer_placement(
             name, rule, is_export=False, method=method_u, top_level=top, has_bag=has_bag,
         )
-        enc = resolve_encoding(rule, rule.get("encoding"), ct, placement if placement != "bag" else "bag")
-        target = "query" if method_u == "GET" and placement == "body" else placement
+        # POST form：全部进 body（$_POST）；POST JSON：仅显式 placement=query 留 query
+        if method_u == "POST":
+            if placement == "bag":
+                target = "bag"
+            elif json_body and rule.get("placement") == "query":
+                target = "query"
+            else:
+                target = "body"
+        else:
+            target = "query" if placement == "body" else placement
+        enc = resolve_encoding(rule, rule.get("encoding"), ct, target if target != "bag" else "bag")
         encoded = encode_param_value(
             name, val, enc, json_body=json_body and target == "body",
         )
@@ -161,25 +237,20 @@ def build_wired_parts(
             continue
         if identity_into_bag and has_bag:
             bag_obj[param] = value
-        elif method_u == "POST" and (body or json_body) and not identity_into_bag:
-            # 独立身份：有 body 时跟 body 走，否则 query
-            if body or json_body:
-                body[param] = value
-            else:
-                query[param] = value
+        elif method_u == "POST" and not identity_into_bag:
+            body[param] = value
         else:
             query[param] = value
 
     if has_bag and bag_obj:
         if json_body and method_u == "POST":
             body[bag_name] = bag_obj
-        elif method_u == "POST" and ct and "form" in ct and body:
-            body[bag_name] = json.dumps(bag_obj, ensure_ascii=False, separators=(",", ":"))
         else:
-            # GET 或 POST 但 body 空：袋放 query
-            if method_u == "POST" and body:
-                body[bag_name] = json.dumps(bag_obj, ensure_ascii=False, separators=(",", ":"))
+            # form/query：queryParams[status]=1&queryParams[oa]=zhang
+            flat = flatten_php_form(bag_name, bag_obj)
+            if method_u == "POST":
+                body.update(flat)
             else:
-                query[bag_name] = json.dumps(bag_obj, ensure_ascii=False, separators=(",", ":"))
+                query.update(flat)
 
     return query, (body if method_u == "POST" else None), ct

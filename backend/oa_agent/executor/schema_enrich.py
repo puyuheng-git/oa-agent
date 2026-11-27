@@ -16,14 +16,14 @@ ENRICH_PROMPT = """你在帮管理员配置 OA 助手的查询 Tool。根据测�
   "summary": "给管理员看的短名称说明（不超过 40 字）",
   "description": "给模型看的用途说明：员工问什么问题时该用它、能查到什么（不超过 120 字）",
   "result_kind": "list 或 object",
-  "fields": [{{"field": "返回字段名，支持一层点路径如 user.name", "label": "中文显示名"}}],
+  "fields": [{{"field": "返回字段名，支持多级点路径如 user.name、get.params1", "label": "中文显示名"}}],
   "list_columns": ["列表中优先展示的字段，最多 {max_columns} 个，必须是 fields 中的 field"],
   "params": {{"参数名": {{"label": "显示名", "description": "给模型的填参说明（不超过 60 字）"}}}},
   "skill": {{"name": "小写字母数字下划线的 Skill 名", "display_name": "员工看到的功能名（不超过 10 字）",
             "description": "这个能力解决什么问题", "instructions": "把员工的话转换成参数的指引",
             "examples": ["3 到 5 条员工可能的提问"]}}}}
 员工只能查询本人的数据，身份由系统注入，不要在参数说明里让模型填写员工身份。
-fields 只能从测调返回样例中出现的键推断（含一层点路径），不要编造不存在的字段。
+fields 只能从测调返回样例中出现的键推断（含多级点路径），不要编造不存在的字段。
 params 只能补全「当前草稿已有参数」的 label/description，不要新增草稿里没有的参数名。
 
 当前草稿名称：{name}
@@ -43,31 +43,29 @@ def _truncate_json(obj: Any, limit: int = 6000) -> str:
     return text[:limit] + "…"
 
 
-def _collect_keys(data: Any, out: set[str] | None = None) -> set[str]:
-    """从测调返回收集可用字段路径（顶层键 + 一层点路径）。"""
+def _collect_keys(data: Any, out: set[str] | None = None, *, _depth: int = 0, _prefix: str = "") -> set[str]:
+    """从测调返回收集可用字段路径（顶层键 + 多级点路径，深度上限 4）。"""
     if out is None:
         out = set()
     if isinstance(data, list):
         if data and isinstance(data[0], dict):
-            _collect_keys(data[0], out)
+            _collect_keys(data[0], out, _depth=_depth, _prefix=_prefix)
         return out
     if not isinstance(data, dict):
         return out
-    for key in ("list", "data", "items", "rows", "info"):
-        nested = data.get(key)
-        if isinstance(nested, list) and nested and isinstance(nested[0], dict):
-            return _collect_keys(nested[0], out)
-        if isinstance(nested, dict) and key == "info":
-            return _collect_keys(nested, out)
+    if _depth == 0 and not _prefix:
+        for key in ("list", "data", "items", "rows", "info"):
+            nested = data.get(key)
+            if isinstance(nested, list) and nested and isinstance(nested[0], dict):
+                return _collect_keys(nested[0], out)
+            if isinstance(nested, dict) and key == "info":
+                return _collect_keys(nested, out)
     for k, v in data.items():
-        name = str(k)
+        name = f"{_prefix}.{k}" if _prefix else str(k)
         if RESULT_FIELD_RE.fullmatch(name):
             out.add(name)
-        if isinstance(v, dict):
-            for sk in v:
-                child = f"{name}.{sk}"
-                if RESULT_FIELD_RE.fullmatch(child):
-                    out.add(child)
+        if _depth < 4 and isinstance(v, dict):
+            _collect_keys(v, out, _depth=_depth + 1, _prefix=name)
     return out
 
 

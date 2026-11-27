@@ -71,7 +71,8 @@ export function inferPlacement(
     return opts.isExport ? 'scalar' : 'query'
   }
   if (opts.hasBag) return 'bag'
-  if (opts.isExport) return 'bag'
+  // Export 无袋时默认独立形参（named_args）；勿一律当成袋
+  if (opts.isExport) return 'scalar'
   return (opts.method || 'GET').toUpperCase() === 'POST' ? 'body' : 'query'
 }
 
@@ -83,10 +84,40 @@ export function encodeFlatValue(value: unknown): string {
 }
 
 /**
+ * 把对象/数组展成 PHP 多维表单键：a[b]=1、a[]=1。
+ * OA $_GET/$_POST 可直接还原成多维数组，无需 json_decode。
+ */
+export function flattenPhpForm(prefix: string, value: unknown): Record<string, unknown> {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v === undefined || v === null || v === '') continue
+      Object.assign(out, flattenPhpForm(`${prefix}[${k}]`, v))
+    }
+    return out
+  }
+  if (Array.isArray(value)) {
+    const out: Record<string, unknown> = {}
+    const scalars: unknown[] = []
+    value.forEach((v, i) => {
+      if (v === undefined || v === null || v === '') return
+      if (v !== null && typeof v === 'object') {
+        Object.assign(out, flattenPhpForm(`${prefix}[${i}]`, v))
+      } else {
+        scalars.push(encodeFlatValue(v))
+      }
+    })
+    if (scalars.length) out[`${prefix}[]`] = scalars
+    return out
+  }
+  return { [prefix]: encodeFlatValue(value) }
+}
+
+/**
  * 将单个参数编成 wire 片段。
  * - flat: { name: "v" }
  * - repeat: { "name[]": ["a","b"] }
- * - json: { name: "{\"a\":1}" } 或 JSON body 下 { name: native }
+ * - json: form 下为多维数组 name[key]=；JSON body 下为原生对象
  */
 export function encodeParamValue(
   name: string,
@@ -101,7 +132,7 @@ export function encodeParamValue(
   }
   if (encoding === 'json') {
     if (jsonBody) return { [name]: value }
-    return { [name]: JSON.stringify(value) }
+    return flattenPhpForm(name, value)
   }
   if (encoding === 'repeat') {
     const list = Array.isArray(value) ? value : [value]
@@ -112,7 +143,7 @@ export function encodeParamValue(
     return { [name]: value.map(encodeFlatValue).join(',') }
   }
   if (value !== null && typeof value === 'object') {
-    return { [name]: JSON.stringify(value) }
+    return flattenPhpForm(name, value)
   }
   return { [name]: encodeFlatValue(value) }
 }
@@ -192,18 +223,25 @@ export function buildWirePreview(opts: {
     })
     const val = opts.values[name]
     if (val === undefined || val === null || val === '') continue
+    // POST form：全部进 body（$_POST）；POST JSON：仅显式 query 留 query
+    let targetPlacement: ParamPlacement
+    if (method === 'POST') {
+      const explicit = (node as SchemaNode & { placement?: string }).placement
+      if (placement === 'bag') targetPlacement = 'bag'
+      else if (jsonBody && explicit === 'query') targetPlacement = 'query'
+      else targetPlacement = 'body'
+    } else {
+      targetPlacement = placement === 'body' ? 'query' : placement
+    }
     const enc = resolveEncoding(
       node,
       (node as SchemaNode & { encoding?: ParamEncoding }).encoding,
       contentType,
-      placement === 'bag' ? 'bag' : placement,
+      targetPlacement === 'bag' ? 'bag' : targetPlacement,
     )
-    const targetPlacement =
-      method === 'GET' && placement === 'body' ? 'query' : placement
     const encoded = encodeParamValue(name, val, enc, { jsonBody: jsonBody && targetPlacement === 'body' })
 
     if (targetPlacement === 'bag' && hasBag) {
-      // 袋内始终用原生值聚合，袋整体再按 content-type 写出
       bagObj[name] = val
     } else if (targetPlacement === 'body' && method === 'POST') {
       Object.assign(body, encoded)
@@ -215,12 +253,9 @@ export function buildWirePreview(opts: {
   if (opts.injectOa) {
     const key = opts.identityParamName || 'oa'
     if (opts.identityPlacement === 'bag' && hasBag) bagObj[key] = previewOa
-    else if (method === 'POST' && !hasBag && contentType) {
-      // 独立身份：与 body 同通道（有 body / JSON 进 body，否则进 query）
-      if (jsonBody || contentType.includes('form')) {
-        if (Object.keys(body).length || jsonBody) body[key] = previewOa
-        else query[key] = previewOa
-      }
+    else if (method === 'POST') {
+      // POST 独立身份进 body（$_POST）
+      body[key] = previewOa
     } else {
       query[key] = previewOa
     }
@@ -230,10 +265,11 @@ export function buildWirePreview(opts: {
     const bagName = opts.bagField.trim()
     if (jsonBody && method === 'POST') {
       body[bagName] = bagObj
-    } else if (method === 'POST' && contentType?.includes('form') && Object.keys(body).length) {
-      body[bagName] = JSON.stringify(bagObj)
     } else {
-      query[bagName] = JSON.stringify(bagObj)
+      // form/query：queryParams[status]=1，不用 JSON 字符串
+      const flat = flattenPhpForm(bagName, bagObj)
+      if (method === 'POST') Object.assign(body, flat)
+      else Object.assign(query, flat)
     }
   }
 
@@ -244,10 +280,10 @@ export function buildWirePreview(opts: {
     body: method === 'POST' ? body : null,
     exportArgs: null,
     note: method === 'GET'
-      ? 'GET：参数在 query；布尔 0/1；数组默认 name[]='
+      ? 'GET：参数在 query；袋/对象用 name[key]= 多维数组；中文默认 GBK'
       : jsonBody
-        ? 'POST JSON：body 类型保真'
-        : 'POST form：application/x-www-form-urlencoded',
+        ? 'POST JSON：body 类型保真（UTF-8）'
+        : 'POST form：参数在 $_POST；袋/对象用 name[key]= 多维数组；中文默认 GBK',
   }
 }
 

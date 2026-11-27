@@ -18,6 +18,8 @@ MINT_PATH = "/agent/token/mint"
 INVOKE_PATH = "/agent/invoke"
 # OA Webroot 统一反代（general/ds/agent/invoke.php）
 OA_WEB_INVOKE_PATH = "/general/ds/agent/invoke.php"
+# 业务上游标识为此值时，一律经 invoke.php 鉴权再 include Tool.path / invoke_target
+OA_WEB_UPSTREAM_KEY = "oa"
 EXPORT_DISCOVER_PATH = "/agent/export/discover"
 EXPORT_DESCRIBE_PATH = "/agent/export/describe"
 EXPORT_PROBE_PATH = "/agent/export/probe"
@@ -87,25 +89,38 @@ def business_hint(body: object, max_len: int = MAX_HINT) -> str:
 
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_H12_RE = re.compile(r"<h[12][^>]*>(.*?)</h[12]>", re.I | re.S)
 # ThinkPHP / 常见 PHP 错误页：SQLSTATE… 或 Exception: …
 _HTML_EXC_RE = re.compile(
     r"(SQLSTATE\[[^\]]+\]:[^<\n]+|(?:PDOException|ErrorException|Error|Exception)\s*:\s*[^<\n]+)",
     re.I,
 )
+# open-oa ViewHandle 通用标题，正文 h1/h2 才有业务原因（如「网关密钥无效」）
+_GENERIC_HTML_TITLE_RE = re.compile(
+    r"(?i)^(500\s*)?页面错误|internal server error|error|ok|success$",
+)
 
 
 def _extract_html_error(raw: str, max_len: int = 400) -> str:
-    """从 HTML 错误页抽出可读原因（title 或异常摘要）；抽不到则空串。"""
+    """从 HTML 错误页抽出可读原因（异常摘要 / h1h2 业务文案 / title）。"""
     if not raw or "<" not in raw:
         return ""
     text = html.unescape(raw)
     m = _HTML_EXC_RE.search(text)
     if m:
         return redact_secrets(" ".join(m.group(1).split()), max_len)
+    # 优先取非数字、非通用标题的 h1/h2（ThinkPHP 业务异常页）
+    for hm in _H12_RE.finditer(text):
+        piece = " ".join(_TAG_RE.sub(" ", hm.group(1)).split()).strip()
+        if not piece or piece.isdigit() or _GENERIC_HTML_TITLE_RE.match(piece):
+            continue
+        return redact_secrets(piece, max_len)
     t = _TITLE_RE.search(text)
     if t:
         title = " ".join(_TAG_RE.sub(" ", t.group(1)).split())
-        if title and not re.match(r"(?i)^(ok|success)$", title):
+        if title and not _GENERIC_HTML_TITLE_RE.match(title):
+            return redact_secrets(title, max_len)
+        if title:
             return redact_secrets(title, max_len)
     return ""
 
@@ -254,31 +269,43 @@ class OpenOaClient:
                           str(data.get("display_name") or oa))
 
     def get(self, path: str, params: dict, authorization: str, timeout: float | None = None,
-            extra_headers: dict | None = None) -> OpenOaResponse:
+            extra_headers: dict | None = None, request_charset: str | None = None) -> OpenOaResponse:
+        from oa_agent.executor.param_wire import encode_query_string
+
         headers = {"Authorization": authorization}
         if extra_headers:
             headers.update({k: v for k, v in extra_headers.items() if v})
-        resp, ms = self._send("GET", path, params=params, headers=headers, timeout=timeout)
+        # 按字符集手写 query，避免默认 UTF-8 导致 OA GBK 乱码
+        charset = (request_charset or "utf-8").strip() or "utf-8"
+        qs = encode_query_string(params or {}, charset)
+        url = f"{path}?{qs}" if qs else path
+        resp, ms = self._send("GET", url, headers=headers, timeout=timeout)
         data, hint = self._unwrap(resp)
         return OpenOaResponse(data, resp.status_code, ms, hint)
 
     def post(self, path: str, body: dict, authorization: str, *, timeout: float | None = None,
              idempotency_key: str | None = None, extra_headers: dict | None = None,
-             content_type: str | None = None, params: dict | None = None) -> OpenOaResponse:
-        """POST：默认 JSON body；content_type=form-urlencoded 时走 data=。"""
+             content_type: str | None = None, params: dict | None = None,
+             request_charset: str | None = None) -> OpenOaResponse:
+        """POST：默认 JSON body；content_type=form-urlencoded 时按 request_charset 编码。"""
+        from oa_agent.executor.param_wire import encode_query_string, encode_www_form
+
         headers = {"Authorization": authorization}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         if extra_headers:
             headers.update({k: v for k, v in extra_headers.items() if v})
+        charset = (request_charset or "utf-8").strip() or "utf-8"
+        qs = encode_query_string(params, charset)
+        url = f"{path}?{qs}" if qs else path
         ct = (content_type or "").strip().lower()
-        if ct == "application/x-www-form-urlencoded" or ct.endswith("form-urlencoded"):
-            resp, ms = self._send(
-                "POST", path, data=body or {}, params=params or None, headers=headers, timeout=timeout,
-            )
+        if ct.startswith("application/x-www-form-urlencoded") or ct.endswith("form-urlencoded"):
+            raw, form_ct = encode_www_form(body or {}, charset)
+            headers = {**headers, "Content-Type": form_ct}
+            resp, ms = self._send("POST", url, content=raw, headers=headers, timeout=timeout)
         else:
             resp, ms = self._send(
-                "POST", path, json=body or {}, params=params or None, headers=headers, timeout=timeout,
+                "POST", url, json=body or {}, headers=headers, timeout=timeout,
             )
         data, hint = self._unwrap(resp)
         return OpenOaResponse(data, resp.status_code, ms, hint)
@@ -329,11 +356,12 @@ class OpenOaClient:
         method: str,
         oa: str,
         args: dict,
-        call: str = "one_by_params",
+        call: str = "named_args",
         op: str = "read",
         gateway_secret: str,
         idempotency_key: str = "",
         timeout: float | None = None,
+        identity_args: dict | None = None,
     ):
         """向导：指定测试员工真调一次。"""
         headers = self._gateway_headers(gateway_secret)
@@ -342,8 +370,9 @@ class OpenOaClient:
             "method": method,
             "oa": oa,
             "args": args or {},
-            "call": call or "one_by_params",
+            "call": call or "named_args",
             "op": op or "read",
+            "identity_args": dict(identity_args or {}),
         }
         if idempotency_key:
             body["idempotency_key"] = idempotency_key
@@ -356,6 +385,24 @@ class OpenOaClient:
         )
         data, _ = self._unwrap(resp)
         return data
+
+
+def is_oa_web_upstream(upstream: str | None) -> bool:
+    """业务上游标识是否为 OA Web（须走 invoke.php）。"""
+    return (upstream or "").strip() == OA_WEB_UPSTREAM_KEY
+
+
+def resolve_oa_web_target(*, invoke_target: str = "", path: str = "") -> str:
+    """解析 include 目标：优先 invoke_target，否则用接口 path（排除 invoke.php 自身）。"""
+    target = (invoke_target or "").strip().replace("\\", "/").lstrip("/")
+    if target:
+        return target
+    raw = (path or "").strip().replace("\\", "/").lstrip("/")
+    if not raw:
+        return ""
+    if raw.rstrip("/") == OA_WEB_INVOKE_PATH.strip("/").lstrip("/"):
+        return ""
+    return raw
 
 
 def sign_confirm_assertion(

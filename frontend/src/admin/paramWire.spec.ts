@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  buildWirePreview, encodeFlatValue, encodeParamValue, recommendEncoding, resolveEncoding,
+  buildWirePreview, encodeFlatValue, encodeParamValue, flattenPhpForm,
+  recommendEncoding, resolveEncoding,
 } from './paramWire'
 
 describe('paramWire', () => {
@@ -56,7 +57,19 @@ describe('paramWire', () => {
     })
     expect(preview.query.limit).toBe('10')
     expect(preview.query['ids[]']).toEqual([1, 2])
-    expect(JSON.parse(String(preview.query.queryParams))).toEqual({ status: 1, oa: 'zhangsan' })
+    expect(preview.query['queryParams[status]']).toBe('1')
+    expect(preview.query['queryParams[oa]']).toBe('zhangsan')
+  })
+
+  it('flattens object to PHP nested keys', () => {
+    expect(flattenPhpForm('params', { status: 1, oa: 'zhang' })).toEqual({
+      'params[status]': '1',
+      'params[oa]': 'zhang',
+    })
+    expect(encodeParamValue('filter', { a: 1, b: true }, 'json', { jsonBody: false })).toEqual({
+      'filter[a]': '1',
+      'filter[b]': '1',
+    })
   })
 
   it('builds export args with native types', () => {
@@ -79,5 +92,31 @@ describe('paramWire', () => {
       page: 2,
       params: { flag: true, oa: '<oa>' },
     })
+  })
+
+  it('POST form puts all former query/top_level params into body ($_POST)', () => {
+    const preview = buildWirePreview({
+      isExport: false,
+      method: 'POST',
+      contentType: 'application/x-www-form-urlencoded',
+      bagField: 'queryParams',
+      identityParamName: 'oa',
+      injectOa: true,
+      identityPlacement: 'bag',
+      modelParams: {
+        keyword: { type: 'string', placement: 'query' },
+        status: { type: 'integer', placement: 'bag' },
+        page: { type: 'integer' },
+      },
+      topLevelFields: ['page'],
+      values: { keyword: '请假', status: 1, page: 2 },
+      previewOa: 'zhangsan',
+    })
+    expect(preview.query).toEqual({})
+    expect(preview.body).toBeTruthy()
+    expect(preview.body!.keyword).toBe('请假')
+    expect(preview.body!.page).toBe('2')
+    expect(preview.body!['queryParams[status]']).toBe('1')
+    expect(preview.body!['queryParams[oa]']).toBe('zhangsan')
   })
 })

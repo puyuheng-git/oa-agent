@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
  * 新建 Tool / 接入业务接口 共用契约区：
- * 身份+打包 → 参数表（主）→ 请求预览 → 测调；Schema 树为高级。
+ * 默认极简（参数表+测调）；专家模式展开身份/槽位/放置/Schema。
  */
 import { computed, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
 import CallSignatureEditor from './CallSignatureEditor.vue'
 import ParamTableEditor from './ParamTableEditor.vue'
 import SchemaTreeEditor from './SchemaTreeEditor.vue'
@@ -16,11 +17,18 @@ import { buildWirePreview, formatWirePreview } from '../paramWire'
 import { buildArgsFromValues, mergeValuesOnSchemaChange } from '../schemaValue'
 import { flattenBagSchema, unwrapBagArgs } from '../wizardCallArgs'
 import { mergeProbeResultFields } from '../probeResultFields'
+import {
+  ensureSimpleWireDefaults,
+  formatMissingRequiredMessage,
+  missingRequiredParamNames,
+} from '../simpleWire'
 
 const props = withDefaults(defineProps<{
   form: ToolForm
   slots: CallSlot[]
   methodName: string
+  /** simple=业务极简；expert=研发全量 */
+  contractMode?: 'simple' | 'expert'
   /** 是否展示测调区（新建/编辑/向导均为 true） */
   showProbe?: boolean
   probeBusy?: boolean
@@ -34,6 +42,7 @@ const props = withDefaults(defineProps<{
   /** 测调用的操作类型 */
   op?: string
 }>(), {
+  contractMode: 'simple',
   showProbe: false,
   probeBusy: false,
   probeOk: false,
@@ -46,16 +55,19 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   (e: 'update:slots', v: CallSlot[]): void
+  (e: 'update:contractMode', v: 'simple' | 'expert'): void
   (e: 'probe', payload: {
     oa: string
     args: Record<string, unknown>
     call: string
     op: string
     mode: 'export' | 'http'
+    identity_args: Record<string, string>
   }): void
   (e: 'enrich'): void
 }>()
 
+const isSimple = computed(() => props.contractMode !== 'expert')
 const complexSigCollapse = ref<string[]>([])
 const advancedSchemaCollapse = ref<string[]>([])
 const probeOa = ref('')
@@ -66,10 +78,18 @@ watch(
   () => props.form.modelParams,
   (next, prev) => {
     if (props.showProbe) {
+      // Schema 变更时保留已填值，并用 default 补齐新键
       probeValues.value = mergeValuesOnSchemaChange(prev ?? {}, next ?? {}, probeValues.value)
     }
   },
   { deep: true },
+)
+
+watch(
+  () => props.showProbe,
+  (on) => {
+    if (on) seedProbeDefaults()
+  },
 )
 
 /** 由身份/打包/顶层推导的只读调用预览 */
@@ -119,6 +139,20 @@ const wirePreviewText = computed(() => {
   return `${preview.note}\n${formatWirePreview(preview)}`
 })
 
+const simpleWireSummary = computed(() => {
+  const id = props.form.injectOa
+    ? `身份自动注入（${props.form.identityParamName || 'oa'}）`
+    : '未注入身份'
+  const call = props.form.invoke_call || '—'
+  if (hasExportTarget.value) return `${id} · call=${call}`
+  const m = (props.form.method || 'GET').toUpperCase()
+  return `${id} · HTTP ${m}`
+})
+
+function setContractMode(mode: 'simple' | 'expert') {
+  emit('update:contractMode', mode)
+}
+
 /** 复杂形参编辑器为源：写回 form，再通知父组件更新槽位 */
 function onSlotsUpdate(slots: CallSlot[]) {
   applySlotsToToolForm(props.form, slots)
@@ -146,23 +180,43 @@ function addField() {
   })
 }
 
+function seedProbeDefaults() {
+  if (!props.showProbe) return
+  probeValues.value = mergeValuesOnSchemaChange({}, props.form.modelParams, probeValues.value)
+}
+
 function buildProbeArgs(): Record<string, unknown> {
   const call = inferInvokeCall(props.slots)
   const raw = buildArgsFromValues(props.form.modelParams, probeValues.value)
   return unwrapBagArgs(call, raw)
 }
 
+/** 按表单「写入参数名」生成强制身份实参，不写死 oa/userId */
+function buildIdentityArgs(oa: string): Record<string, string> {
+  if (!props.form.injectOa) return {}
+  const key = (props.form.identityParamName || 'oa').trim() || 'oa'
+  return { [key]: oa }
+}
+
 function runProbe() {
   if (!probeOa.value.trim() || !probeMode.value) return
   paramTableRef.value?.flush()
+  ensureSimpleWireDefaults(props.form, props.contractMode)
+  const missing = missingRequiredParamNames(props.form.modelParams, probeValues.value)
+  if (missing.length) {
+    ElMessage.warning(formatMissingRequiredMessage(missing))
+    return
+  }
   const call = inferInvokeCall(props.slots)
   props.form.invoke_call = call
+  const oa = probeOa.value.trim()
   emit('probe', {
-    oa: probeOa.value.trim(),
+    oa,
     args: buildProbeArgs(),
     call,
     op: props.op || 'read',
     mode: probeMode.value,
+    identity_args: buildIdentityArgs(oa),
   })
 }
 
@@ -194,7 +248,8 @@ function applyProbeData(data: unknown) {
  */
 function flush() {
   paramTableRef.value?.flush()
-  const complexOpen = complexSigCollapse.value.includes('sig')
+  ensureSimpleWireDefaults(props.form, props.contractMode)
+  const complexOpen = !isSimple.value && complexSigCollapse.value.includes('sig')
   if (complexOpen) {
     if (props.form.injectOa && props.form.identityPlacement === 'bag') {
       const bag = props.slots.find((s) => s.role === 'bag')
@@ -224,8 +279,10 @@ function getProbeOa() {
 }
 
 function reloadFromForm() {
+  ensureSimpleWireDefaults(props.form, props.contractMode)
   syncSlotsFromIdentity()
   paramTableRef.value?.reload()
+  seedProbeDefaults()
 }
 
 function syncParamRowsFromForm() {
@@ -240,80 +297,100 @@ defineExpose({
   reloadFromForm,
   getProbeOa,
   buildProbeArgs,
+  buildIdentityArgs,
 })
 </script>
 
 <template>
   <div class="contract-form">
-    <h4 class="sec">身份注入</h4>
-    <el-form-item label="注入员工身份">
-      <el-switch v-model="form.injectOa" @change="syncSlotsFromIdentity" />
-      <span class="hint">开启后由服务端写入当前员工账号，模型无法伪造。</span>
-    </el-form-item>
-    <template v-if="form.injectOa">
-      <el-form-item label="写入参数名" required>
+    <div class="mode-bar">
+      <span class="mode-label">配置模式</span>
+      <el-radio-group
+        :model-value="contractMode"
+        size="small"
+        @update:model-value="(v: string | number | boolean | undefined) => setContractMode(v === 'expert' ? 'expert' : 'simple')"
+      >
+        <el-radio-button value="simple">极简</el-radio-button>
+        <el-radio-button value="expert">专家</el-radio-button>
+      </el-radio-group>
+      <span class="hint mode-hint">{{ isSimple ? '业务默认：只填参数说明与测调值' : '可改身份、形参槽位、放置与编码' }}</span>
+    </div>
+
+    <template v-if="isSimple">
+      <div class="simple-summary">{{ simpleWireSummary }} · 员工身份由服务端写入，模型无法伪造</div>
+    </template>
+    <template v-else>
+      <h4 class="sec">身份注入</h4>
+      <el-form-item label="注入员工身份">
+        <el-switch v-model="form.injectOa" @change="syncSlotsFromIdentity" />
+        <span class="hint">开启后由服务端写入当前员工账号，模型无法伪造。</span>
+      </el-form-item>
+      <template v-if="form.injectOa">
+        <el-form-item label="写入参数名" required>
+          <el-input
+            v-model="form.identityParamName"
+            style="width: 200px"
+            placeholder="如 oa 或 user_id"
+            @change="syncSlotsFromIdentity"
+          />
+        </el-form-item>
+        <el-form-item label="身份放在哪">
+          <el-radio-group v-model="form.identityPlacement" @change="syncSlotsFromIdentity">
+            <el-radio value="independent">独立参数</el-radio>
+            <el-radio value="bag">写入打包字段内</el-radio>
+          </el-radio-group>
+        </el-form-item>
+      </template>
+      <el-form-item v-if="needsBagField || form.query_params_field" label="打包字段名">
         <el-input
-          v-model="form.identityParamName"
+          v-model="form.query_params_field"
           style="width: 200px"
-          placeholder="如 oa 或 user_id"
+          placeholder="如 params、queryParams"
           @change="syncSlotsFromIdentity"
         />
+        <span class="hint">参数表「装入袋」或身份进袋时使用。</span>
       </el-form-item>
-      <el-form-item label="身份放在哪">
-        <el-radio-group v-model="form.identityPlacement" @change="syncSlotsFromIdentity">
-          <el-radio value="independent">独立参数</el-radio>
-          <el-radio value="bag">写入打包字段内</el-radio>
-        </el-radio-group>
-      </el-form-item>
-    </template>
-    <el-form-item v-if="needsBagField || form.query_params_field" label="打包字段名">
-      <el-input
-        v-model="form.query_params_field"
-        style="width: 200px"
-        placeholder="如 params、queryParams"
-        @change="syncSlotsFromIdentity"
-      />
-      <span class="hint">参数表「装入袋」或身份进袋时使用。</span>
-    </el-form-item>
 
-    <h4 class="sec">调用签名</h4>
-    <div class="preview-box">
-      <code class="preview-code">{{ callPreview }}</code>
-    </div>
-    <div class="hint sync-hint">
-      call={{ form.invoke_call || '—' }}
-      · 注入={{ form.injectOa ? '是' : '否' }}
-      · 身份键={{ form.identityParamName || '—' }}
-      · 打包={{ form.query_params_field || '（无）' }}
-    </div>
-    <el-collapse v-model="complexSigCollapse" style="margin-bottom: 8px">
-      <el-collapse-item title="复杂调用形参（多袋等）" name="sig">
-        <CallSignatureEditor
-          :method-name="methodName"
-          :slots="slots"
-          @update:slots="onSlotsUpdate"
-        />
-      </el-collapse-item>
-    </el-collapse>
+      <h4 class="sec">调用签名</h4>
+      <div class="preview-box">
+        <code class="preview-code">{{ callPreview }}</code>
+      </div>
+      <div class="hint sync-hint">
+        call={{ form.invoke_call || '—' }}
+        · 注入={{ form.injectOa ? '是' : '否' }}
+        · 身份键={{ form.identityParamName || '—' }}
+        · 打包={{ form.query_params_field || '（无）' }}
+      </div>
+      <el-collapse v-model="complexSigCollapse" style="margin-bottom: 8px">
+        <el-collapse-item title="复杂调用形参（多袋等）" name="sig">
+          <CallSignatureEditor
+            :method-name="methodName"
+            :slots="slots"
+            @update:slots="onSlotsUpdate"
+          />
+        </el-collapse-item>
+      </el-collapse>
+    </template>
 
     <h4 class="sec">模型可填的参数</h4>
-    <div class="hint" style="margin-bottom: 8px; margin-left: 0">
+    <div v-if="!isSimple" class="hint" style="margin-bottom: 8px; margin-left: 0">
       表格维护顶层参数的类型、放置与编码；嵌套结构用下方高级 Schema。
     </div>
     <ParamTableEditor
       ref="paramTableRef"
       :form="form"
       :is-export="hasExportTarget"
+      :simple="isSimple"
       @change="onParamTableChange"
     />
-    <el-collapse v-model="advancedSchemaCollapse" style="margin: 8px 0">
+    <el-collapse v-if="!isSimple" v-model="advancedSchemaCollapse" style="margin: 8px 0">
       <el-collapse-item title="高级：Schema 树（嵌套 object/array）" name="schema">
         <SchemaTreeEditor v-model="form.modelParams" mode="params" />
       </el-collapse-item>
     </el-collapse>
 
     <h4 class="sec">请求预览</h4>
-    <div class="hint" style="margin-bottom: 4px; margin-left: 0">按当前参数表与测试值即时生成（测调前可核对类型编码）。</div>
+    <div class="hint" style="margin-bottom: 4px; margin-left: 0">按当前参数表与测试值即时生成（测调前可核对）。</div>
     <pre class="probe-pre wire-pre">{{ wirePreviewText }}</pre>
 
     <template v-if="showProbe">
@@ -372,7 +449,7 @@ defineExpose({
       </el-radio-group>
     </el-form-item>
     <div class="hint" style="margin-bottom: 6px; margin-left: 0">
-      白名单字段；测调成功后可自动回填。字段名支持一层点路径（如 user.name）。
+      白名单字段；测调成功后可自动回填。字段名支持多级点路径（如 user.name、get.params1）。
     </div>
     <el-table :data="form.fields" size="small" border>
       <el-table-column label="字段名" min-width="180">
@@ -395,6 +472,29 @@ defineExpose({
 </template>
 
 <style scoped>
+.mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.mode-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+.mode-hint {
+  margin-left: 0;
+}
+.simple-summary {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--el-text-color-regular);
+  background: var(--el-fill-color-light);
+  border-radius: 6px;
+  line-height: 1.5;
+}
 .sec {
   margin: 16px 0 10px;
   font-size: 14px;

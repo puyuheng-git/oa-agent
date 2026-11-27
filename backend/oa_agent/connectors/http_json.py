@@ -9,6 +9,7 @@ import httpx
 
 from oa_agent.connectors.base import ConnectorError, ConnectorResult
 from oa_agent.connectors.envelope import parse_envelope
+from oa_agent.executor.param_wire import encode_query_string, encode_www_form
 from oa_agent.integrations.office_api import (
     DEFAULT_SUCCESS_CODES,
     MAX_HINT,
@@ -79,6 +80,7 @@ class HttpJsonConnector:
         timeout: float | None = None,
         idempotency_key: str | None = None,
         extra_headers: dict[str, str] | None = None,
+        request_charset: str | None = None,
     ) -> ConnectorResult:
         if self._delegate:
             return self._invoke_via_client(
@@ -91,6 +93,7 @@ class HttpJsonConnector:
                 timeout=timeout,
                 idempotency_key=idempotency_key,
                 extra_headers=extra_headers,
+                request_charset=request_charset,
             )
         return self._invoke_direct(
             method,
@@ -102,6 +105,7 @@ class HttpJsonConnector:
             timeout=timeout,
             idempotency_key=idempotency_key,
             extra_headers=extra_headers,
+            request_charset=request_charset,
         )
 
     def _invoke_via_client(
@@ -116,11 +120,15 @@ class HttpJsonConnector:
         timeout: float | None,
         idempotency_key: str | None,
         extra_headers: dict[str, str] | None = None,
+        request_charset: str | None = None,
     ) -> ConnectorResult:
         assert self._client is not None
         try:
             if method.upper() == "GET":
-                resp = self._client.get(path, params or {}, authorization, timeout)
+                resp = self._client.get(
+                    path, params or {}, authorization, timeout,
+                    request_charset=request_charset,
+                )
             elif method.upper() == "POST":
                 if form_body is not None:
                     resp = self._client.post(
@@ -132,6 +140,7 @@ class HttpJsonConnector:
                         extra_headers=extra_headers,
                         content_type="application/x-www-form-urlencoded",
                         params=params,
+                        request_charset=request_charset,
                     )
                 else:
                     resp = self._client.post(
@@ -142,6 +151,7 @@ class HttpJsonConnector:
                         idempotency_key=idempotency_key,
                         extra_headers=extra_headers,
                         params=params,
+                        request_charset=request_charset,
                     )
             else:
                 raise ConnectorError("UPSTREAM_HTTP_ERROR", f"不支持的 HTTP 方法：{method}")
@@ -171,6 +181,7 @@ class HttpJsonConnector:
         timeout: float | None,
         idempotency_key: str | None,
         extra_headers: dict[str, str] | None = None,
+        request_charset: str | None = None,
     ) -> ConnectorResult:
         assert self._base_url is not None
         verb = method.upper()
@@ -183,6 +194,11 @@ class HttpJsonConnector:
         if extra_headers:
             headers.update({k: v for k, v in extra_headers.items() if v})
 
+        charset = (request_charset or "utf-8").strip() or "utf-8"
+        # 按字符集手写 query，避免 httpx 默认 UTF-8 导致 OA GBK 乱码
+        qs = encode_query_string(params, charset)
+        url = f"{path}?{qs}" if qs else path
+
         started = time.perf_counter()
         try:
             with httpx.Client(
@@ -191,14 +207,14 @@ class HttpJsonConnector:
                 transport=self._transport,
             ) as client:
                 if verb == "GET":
-                    resp = client.request("GET", path, params=params or {}, headers=headers)
+                    resp = client.request("GET", url, headers=headers)
                 elif form_body is not None:
-                    resp = client.request(
-                        "POST", path, data=form_body or {}, params=params or None, headers=headers,
-                    )
+                    raw, ct = encode_www_form(form_body or {}, charset)
+                    headers = {**headers, "Content-Type": ct}
+                    resp = client.request("POST", url, content=raw, headers=headers)
                 else:
                     resp = client.request(
-                        "POST", path, json=json_body or {}, params=params or None, headers=headers,
+                        "POST", url, json=json_body or {}, headers=headers,
                     )
         except httpx.TimeoutException as exc:
             raise ConnectorError("UPSTREAM_TIMEOUT", f"上游超时：{type(exc).__name__}") from exc

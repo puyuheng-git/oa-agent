@@ -1,8 +1,7 @@
 """Tool / Skill 注册表（设计 §8、§13 P4）。
 
 - Tool / Skill 以管理后台为准（source_file = "admin"）；也可由测试夹具通过 sync_* 批量写入。
-  规范化 → 校验 → 哈希 → 与当前版本比较：unchanged 不动；compatible 自动生效；
-  breaking 存为待激活版本，需管理员激活。
+  规范化 → 校验 → 哈希 → 与当前版本比较：unchanged 不动；有变更则新建版本并立即生效。
 - 运行时注册表只包含：管理员启用 + 规范启用 + 低风险免确认 + 有当前版本 的 Tool。
 - Skill 声明说明、填参指引、示例问题与可用 Tool；依赖不可用时 Skill 校验失败，对话不会使用它。
 """
@@ -29,7 +28,10 @@ from oa_agent.integrations.open_oa import (
     INVOKE_PATH,
     LEGACY_UPSTREAM,
     OA_WEB_INVOKE_PATH,
+    OA_WEB_UPSTREAM_KEY,
     UPSTREAM_KEY_RE,
+    is_oa_web_upstream,
+    resolve_oa_web_target,
 )
 from oa_agent.executor.builtin_catalog import (
     TEXT_RESULT_FIELDS, TEXT_RESULT_KIND, builtin_model_params, ensure_builtin_tools,
@@ -44,12 +46,14 @@ OPENAPI_DIR = REPO_ROOT / "openapi"
 SKILLS_DIR = REPO_ROOT / "skills"
 PARAM_TYPES = {"string", "integer", "number", "boolean", "object", "array", "file"}
 SCHEMA_MAX_DEPTH = 8
-RESULT_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+# 返回白名单：多级点路径 a.b.c（每段同标识符规则，总长 ≤ 128）
+RESULT_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}(\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,7}$")
 IDENTITY_FIELDS = {"oa"}
 RESULT_KINDS = {"list", "object"}
 RISK_LEVELS = {"low", "medium", "high"}
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+RESULT_FIELD_MAX_LEN = 128
 # identity_bindings.from：现网 oa / principal_id / principal.external_keys.*
 _BINDING_FROM_SIMPLE = frozenset({"oa", "identity.oa", "principal_id", "identity.principal_id"})
 _EXTERNAL_KEY_FROM_RE = re.compile(r"^principal\.external_keys\.([A-Za-z_][A-Za-z0-9_]{0,63})$")
@@ -113,7 +117,10 @@ def _normalize_identity_bindings(
         errors.append(f"{name}.model_params 不得包含身份绑定参数 {sorted(leaked)}（身份只能由服务端注入）")
     return bindings, explicit
 
-UNCHANGED, COMPATIBLE, BREAKING, INITIAL = "unchanged", "compatible", "breaking", "initial"
+UNCHANGED, UPDATED, INITIAL = "unchanged", "updated", "initial"
+# 历史常量别名（旧版本行 / 审计文案可能仍出现）
+COMPATIBLE = UPDATED
+BREAKING = UPDATED
 
 
 class SpecError(Exception):
@@ -231,13 +238,17 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
     if kind not in RESULT_KINDS:
         errors.append(f"{name}.result.kind 只支持 list / object")
     fields_raw = list(result.get("fields") or [])
-    # 字段名只允许单段或一层点号（如 user.name）；非法字段记错并丢弃
+    # 字段名支持多级点路径（如 get.params1、user.dept.name）；非法字段记错并丢弃
     fields = []
     for f in fields_raw:
-        if isinstance(f, str) and RESULT_FIELD_RE.fullmatch(f):
+        if (
+            isinstance(f, str)
+            and len(f) <= RESULT_FIELD_MAX_LEN
+            and RESULT_FIELD_RE.fullmatch(f)
+        ):
             fields.append(f)
         else:
-            errors.append(f"{name}.result.fields 字段名无效（仅支持 a 或 a.b 一层）：{f}")
+            errors.append(f"{name}.result.fields 字段名无效（须为 a 或 a.b.c 点路径）：{f}")
     if not fields:
         errors.append(f"{name}.result.fields 不能为空（只返回白名单字段）")
     labels = result.get("labels") or {}
@@ -314,26 +325,54 @@ def normalize_operation(api_path: str, method: str, op: dict) -> tuple[dict, lis
             spec["path"] = INVOKE_PATH
             if method.upper() != "POST":
                 errors.append(f"{name} 声明 invoke_* 时 method 须为 POST")
-    # OA Webroot 统一 invoke：服务端固定 target，禁止进 model_params
+            # 表单编辑也曾把 invoke_call 放进 x-agent，必须落库；否则运行时会误默认 one_by_params
+            call = str(xa.get("invoke_call") or xa.get("call") or "named_args").strip() or "named_args"
+            if call not in ("one_by_params", "page_list", "named_args"):
+                errors.append(f"{name}.invoke_call 取值无效")
+            else:
+                spec["invoke_call"] = call
+            op_kind = str(xa.get("invoke_op") or "").strip()
+            if op_kind in ("read", "write"):
+                spec["invoke_op"] = op_kind
+    # OA Web：upstream=oa 或显式 invoke_target → 经 invoke.php；path 保留为业务 php 文件
     inv_target = str(xa.get("invoke_target") or "").strip().replace("\\", "/")
-    if inv_target:
-        if inv_target.startswith("/") or ".." in inv_target or "://" in inv_target:
-            errors.append(f"{name}.invoke_target 须为 webroot 相对路径（如 general/ds/.../api.php）")
-        elif inv_target in params:
-            errors.append(f"{name}.invoke_target 不能与模型参数同名")
+    if is_oa_web_upstream(upstream) and not inv_target:
+        inv_target = resolve_oa_web_target(path=api_path)
+    if inv_target or is_oa_web_upstream(upstream):
+        target = inv_target.lstrip("/") if inv_target else ""
+        if not target:
+            errors.append(f"{name} 上游为 {OA_WEB_UPSTREAM_KEY} 时须配置接口路径（旧 php 文件）")
+        elif ".." in target or "://" in target:
+            errors.append(f"{name} 的 OA 接口路径须为 webroot 相对路径（如 general/ds/.../api.php）")
+        elif target in params:
+            errors.append(f"{name} 的接口路径/invoke_target 不能与模型参数同名")
         else:
-            spec["invoke_target"] = inv_target.lstrip("/")
-            spec["path"] = OA_WEB_INVOKE_PATH
+            spec["invoke_target"] = target
+            # path 存业务文件路径，便于后台展示；出站 URL 由执行器固定为 invoke.php
+            if not (api_path or "").strip() or (api_path or "").rstrip("/") == OA_WEB_INVOKE_PATH.rstrip("/"):
+                spec["path"] = "/" + target
             if method.upper() not in ("GET", "POST"):
-                errors.append(f"{name} 声明 invoke_target 时 method 只支持 GET/POST")
+                errors.append(f"{name} 走 OA Web invoke 时 method 只支持 GET/POST")
             if method.upper() == "POST":
                 spec["requires_confirmation"] = True
                 if spec.get("risk_level") == "low":
                     spec["risk_level"] = "high"
+        # 保证上游标识写入 schema（默认 open_oa 不写；oa 必须写）
+        if is_oa_web_upstream(upstream):
+            spec["upstream"] = OA_WEB_UPSTREAM_KEY
     ct = str(xa.get("content_type") or "").strip()
     if ct in ("application/x-www-form-urlencoded", "application/json") and method.upper() == "POST":
         if not inv_s and not inv_m:
             spec["content_type"] = ct
+    # 请求参数字符集：OA PHP 多为 GBK；JSON / Export 用 utf-8
+    charset = str(xa.get("request_charset") or "").strip().lower()
+    if charset in ("gbk", "gb2312", "utf-8", "utf8"):
+        if charset in ("gb2312",):
+            charset = "gbk"
+        if charset == "utf8":
+            charset = "utf-8"
+        if not inv_s and not inv_m:
+            spec["request_charset"] = charset
     return spec, errors
 
 
@@ -373,6 +412,14 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
     risk = str(item.get("risk") or "low")
     op_kind = str(item.get("op") or "read")
     requires_confirmation = op_kind == "write" or risk != "low"
+    # 写入参数名 → 身份源（如 userId→oa）；从模型可填参数中剔除，避免双源
+    identity_params: dict[str, str] = {}
+    for raw_k, raw_v in (item.get("identity_params") or {}).items():
+        pk = str(raw_k or "").strip()
+        if not pk:
+            continue
+        identity_params[pk] = str(raw_v or "").strip() or "oa"
+        model_params.pop(pk, None)
     xa = {
         "enabled": True,
         "description": str(item.get("summary") or "")[:MAX_TEXT],
@@ -381,6 +428,7 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
         "requires_confirmation": requires_confirmation,
         "timeout_seconds": 10,
         "inject_identity_fields": [],
+        "identity_params": identity_params,
         "model_params": model_params,
         "result": {
             "kind": returns.get("kind") or "object",
@@ -400,7 +448,8 @@ def normalize_open_oa_catalog_item(item: dict) -> tuple[dict, list[str]]:
     if spec:
         spec["invoke_service"] = service
         spec["invoke_method"] = method
-        call = str(item.get("call") or "one_by_params").strip() or "one_by_params"
+        # 无袋多形参 Export 用 named_args；缺省勿再落 one_by_params（会只传 1 个数组）
+        call = str(item.get("call") or "named_args").strip() or "named_args"
         if call not in ("one_by_params", "page_list", "named_args"):
             errors.append(f"{name}.call 取值无效")
         else:
@@ -424,21 +473,25 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
     inv_s = str(form.get("invoke_service") or "").strip()
     inv_m = str(form.get("invoke_method") or "").strip()
     inv_target = str(form.get("invoke_target") or "").strip()
+    upstream_key = str(form.get("upstream") or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
     is_invoke = bool(inv_s and inv_m)
-    is_oa_web = bool(inv_target)
+    # 上游标识 oa：接口 path 即旧 php 文件，出站固定走 invoke.php
+    is_oa_web = bool(inv_target) or is_oa_web_upstream(upstream_key)
     content_type = str(form.get("content_type") or "").strip()
+    path = str(form.get("path") or "").strip()
     if is_invoke:
         method = "POST"
         content_type = ""
     elif is_oa_web:
         if method not in ("GET", "POST"):
             errors.append("OA Web invoke 仅支持 GET/POST")
-        path_forced = OA_WEB_INVOKE_PATH
-    elif method not in ("GET", "POST"):
-        errors.append("HTTP Tool 仅支持 GET/POST")
-        path_forced = None
-    else:
-        path_forced = None
+        # path / invoke_target 解析为目标文件
+        if not inv_target:
+            inv_target = resolve_oa_web_target(path=path)
+        if not inv_target:
+            errors.append(f"上游为 {OA_WEB_UPSTREAM_KEY} 时请填写接口路径（如 /general/ds/.../api.php）")
+        else:
+            path = "/" + inv_target.lstrip("/")
         if method == "POST":
             if content_type not in (
                 "",
@@ -450,16 +503,27 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
                 content_type = "application/x-www-form-urlencoded"
         else:
             content_type = ""
-    path = str(form.get("path") or "").strip()
-    if is_oa_web:
-        path = path_forced or OA_WEB_INVOKE_PATH
+    elif method not in ("GET", "POST"):
+        errors.append("HTTP Tool 仅支持 GET/POST")
+    else:
+        if method == "POST":
+            if content_type not in (
+                "",
+                "application/x-www-form-urlencoded",
+                "application/json",
+            ):
+                errors.append("content_type 仅支持 application/x-www-form-urlencoded 或 application/json")
+            if not content_type:
+                content_type = "application/x-www-form-urlencoded"
+        else:
+            content_type = ""
     if not is_invoke and not is_oa_web and (not path.startswith("/") or path.startswith("//") or " " in path or "://" in path):
         errors.append("接口路径必须是以 / 开头的相对路径（地址在「连接配置 → 业务上游 / 连接器」中配置，Tool 里只选地址）")
     result = form.get("result") or {}
     xa = {
         "enabled": True,
         "description": form.get("description") or "",
-        "upstream": form.get("upstream") or DEFAULT_UPSTREAM,
+        "upstream": OA_WEB_UPSTREAM_KEY if is_oa_web and not is_invoke else upstream_key,
         "risk_level": form.get("risk_level") or "low",
         "requires_confirmation": bool(form.get("requires_confirmation")) or (is_oa_web and method == "POST"),
         "timeout_seconds": form.get("timeout_seconds", 10),
@@ -474,16 +538,31 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
     }
     if content_type:
         xa["content_type"] = content_type
-    if is_oa_web:
-        xa["invoke_target"] = inv_target
+    # 非 Export：默认 OA PHP 用 gbk；JSON 用 utf-8。表单可显式覆盖。
+    if not is_invoke:
+        raw_cs = str(form.get("request_charset") or "").strip().lower()
+        if raw_cs in ("gb2312",):
+            raw_cs = "gbk"
+        if raw_cs == "utf8":
+            raw_cs = "utf-8"
+        if raw_cs in ("gbk", "utf-8"):
+            xa["request_charset"] = raw_cs
+        elif content_type == "application/json":
+            xa["request_charset"] = "utf-8"
+        else:
+            # GET query / form-urlencoded 默认 GBK，避免 OA 端中文乱码
+            xa["request_charset"] = "gbk"
+    if is_oa_web and not is_invoke:
+        xa["invoke_target"] = inv_target.lstrip("/") if inv_target else ""
+        xa["upstream"] = OA_WEB_UPSTREAM_KEY
         if method == "POST" and xa["risk_level"] == "low":
             xa["risk_level"] = "high"
     if is_invoke:
         xa["invoke_service"] = inv_s
         xa["invoke_method"] = inv_m
-        call = str(form.get("invoke_call") or form.get("call") or "one_by_params").strip()
+        call = str(form.get("invoke_call") or form.get("call") or "named_args").strip() or "named_args"
         if call not in ("one_by_params", "page_list", "named_args"):
-            call = "one_by_params"
+            call = "named_args"
         xa["invoke_call"] = call
         path = INVOKE_PATH
     op = {
@@ -495,10 +574,13 @@ def normalize_tool_form(form: dict) -> tuple[dict, list[str]]:
         op["x-agent"]["identity_bindings"] = form.get("identity_bindings") or []
     if not str(op["summary"]).strip():
         errors.append("请填写 Tool 名称说明（summary）")
-    for key in [*(op["x-agent"]["model_params"] or {}), *(op["x-agent"]["result"]["fields"] or []),
-                *(op["x-agent"]["identity_params"] or {})]:
+    # model_params / identity_params：单段标识符；result.fields：多级点路径
+    for key in [*(op["x-agent"]["model_params"] or {}), *(op["x-agent"]["identity_params"] or {})]:
         if not isinstance(key, str) or not FIELD_RE.match(key):
             errors.append(f"字段名 {key!r} 只能用字母、数字、下划线")
+    for key in (op["x-agent"]["result"]["fields"] or []):
+        if not isinstance(key, str) or len(key) > RESULT_FIELD_MAX_LEN or not RESULT_FIELD_RE.fullmatch(key):
+            errors.append(f"返回字段名 {key!r} 须为字母数字下划线，可用多级点路径（如 get.params1）")
     spec, errs = normalize_operation(path or "/", method, op)
     return spec, errors + errs
 
@@ -536,7 +618,7 @@ def schema_part(spec: dict) -> dict:
     return {k: v for k, v in spec.items() if k != "spec_enabled"}
 
 
-# ---------------- 兼容性 ----------------
+# ---------------- 版本差异（仅展示，不再做兼容性闸门） ----------------
 
 def _canonical_upstream(value: str | None) -> str:
     """office / open_oa / 缺省 视为同一默认上游。"""
@@ -547,7 +629,7 @@ def _canonical_upstream(value: str | None) -> str:
 
 
 def _schema_for_compare(schema: dict) -> dict:
-    """比较前归一化：默认上游不入哈希差异（兼容库内仍写着 office 的旧版本）。"""
+    """比较前归一化：默认上游不入哈希差异（库内仍写着 office 的旧版本）。"""
     out = dict(schema)
     upstream = _canonical_upstream(out.get("upstream"))
     if upstream == DEFAULT_UPSTREAM:
@@ -558,32 +640,36 @@ def _schema_for_compare(schema: dict) -> dict:
 
 
 def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
+    """比较两个 schema：unchanged / initial / updated，并给出字段级 diff。
+
+    变更一律可立即生效，不再区分兼容 / 不兼容。
+    """
     if old is None:
         return INITIAL, []
     if canonical_hash(_schema_for_compare(old)) == canonical_hash(_schema_for_compare(new)):
         return UNCHANGED, []
     diff: list[dict] = []
-    breaking = False
 
-    def add(field_: str, change: str, before=None, after=None, is_breaking=False):
-        nonlocal breaking
-        breaking = breaking or is_breaking
-        diff.append({"field": field_, "change": change, "old": before, "new": after, "breaking": is_breaking})
+    def add(field_: str, change: str, before=None, after=None):
+        diff.append({"field": field_, "change": change, "old": before, "new": after})
 
-    for key in ("method", "path", "query_params_field", "risk_level", "requires_confirmation", "content_type"):
+    for key in (
+        "method", "path", "query_params_field", "risk_level", "requires_confirmation",
+        "content_type", "request_charset",
+    ):
         if old.get(key) != new.get(key):
-            add(key, "changed", old.get(key), new.get(key), True)
+            add(key, "changed", old.get(key), new.get(key))
     old_up = _canonical_upstream(old.get("upstream"))
     new_up = _canonical_upstream(new.get("upstream"))
     if old_up != new_up:
-        add("upstream", "changed", old.get("upstream", DEFAULT_UPSTREAM), new.get("upstream", DEFAULT_UPSTREAM), True)
+        add("upstream", "changed", old.get("upstream", DEFAULT_UPSTREAM), new.get("upstream", DEFAULT_UPSTREAM))
     for key in ("inject_identity_fields", "top_level_fields"):
         if old.get(key) != new.get(key):
-            add(key, "changed", old.get(key), new.get(key), True)
+            add(key, "changed", old.get(key), new.get(key))
     if (old.get("identity_params") or {}) != (new.get("identity_params") or {}):
-        add("identity_params", "changed", old.get("identity_params"), new.get("identity_params"), True)
+        add("identity_params", "changed", old.get("identity_params"), new.get("identity_params"))
     if (old.get("identity_bindings") or []) != (new.get("identity_bindings") or []):
-        add("identity_bindings", "changed", old.get("identity_bindings"), new.get("identity_bindings"), True)
+        add("identity_bindings", "changed", old.get("identity_bindings"), new.get("identity_bindings"))
     for key in ("summary", "description", "timeout_seconds"):
         if old.get(key) != new.get(key):
             add(key, "changed", old.get(key), new.get(key))
@@ -593,36 +679,25 @@ def compare(old: dict | None, new: dict) -> tuple[str, list[dict]]:
         before, after = old_params.get(name), new_params.get(name)
         f = f"model_params.{name}"
         if after is None:
-            add(f, "removed", before, None, True)
+            add(f, "removed", before, None)
         elif before is None:
-            add(f, "added", None, after, bool(after.get("required")))
+            add(f, "added", None, after)
         elif before != after:
-            is_breaking = (
-                before.get("type") != after.get("type")
-                or (after.get("required") and not before.get("required"))
-                or ("enum" in after and not set(before.get("enum") or after["enum"]) <= set(after["enum"]))
-                or before.get("format") != after.get("format")
-                or (after.get("maximum") is not None and (before.get("maximum") is None
-                                                          or after["maximum"] < before["maximum"]))
-                or (after.get("minimum") is not None and (before.get("minimum") is None
-                                                          or after["minimum"] > before["minimum"]))
-            )
-            add(f, "changed", before, after, bool(is_breaking))
+            add(f, "changed", before, after)
 
     old_res, new_res = old.get("result") or {}, new.get("result") or {}
     if old_res.get("kind") != new_res.get("kind"):
-        add("result.kind", "changed", old_res.get("kind"), new_res.get("kind"), True)
+        add("result.kind", "changed", old_res.get("kind"), new_res.get("kind"))
     removed = [f for f in old_res.get("fields", []) if f not in new_res.get("fields", [])]
     added = [f for f in new_res.get("fields", []) if f not in old_res.get("fields", [])]
     if removed:
-        add("result.fields", "removed", removed, None, True)
+        add("result.fields", "removed", removed, None)
     if added:
         add("result.fields", "added", None, added)
-    # schema 仅为返回结构元数据，变更可见但不算 breaking
     for key in ("labels", "list_columns", "schema"):
         if old_res.get(key) != new_res.get(key):
             add(f"result.{key}", "changed", old_res.get(key), new_res.get(key))
-    return (BREAKING if breaking else COMPATIBLE), diff
+    return UPDATED, diff
 
 
 # ---------------- Skill ----------------
@@ -760,10 +835,11 @@ def to_tool_spec(schema: dict, spec_version: str, version_no: int, schema_hash: 
         identity_bindings=bindings,
         invoke_service=str(schema.get("invoke_service") or ""),
         invoke_method=str(schema.get("invoke_method") or ""),
-        invoke_call=str(schema.get("invoke_call") or "one_by_params"),
+        invoke_call=str(schema.get("invoke_call") or "named_args"),
         invoke_op=str(schema.get("invoke_op") or ("write" if schema.get("requires_confirmation") else "read")),
         invoke_target=str(schema.get("invoke_target") or ""),
         content_type=str(schema.get("content_type") or ""),
+        request_charset=str(schema.get("request_charset") or ""),
     )
 
 
@@ -843,10 +919,14 @@ def registration_blockers(tool: Tool, has_version: bool, method: str | None = No
     if tool.risk_level != "low" or tool.requires_confirmation:
         reasons.append("非低风险或需员工确认（写操作须确认流程）")
     inv_target = str((schema or {}).get("invoke_target") or "").strip()
-    if kind == "office" and method and method.upper() != "GET" and not inv_target:
-        reasons.append("office 类型一期只执行 GET 只读接口")
-    if kind == "office" and inv_target and method and method.upper() not in ("GET", "POST"):
-        reasons.append("OA Web invoke 仅支持 GET/POST")
+    upstream = str((schema or {}).get("upstream") or "").strip()
+    is_oa_web = bool(inv_target) or is_oa_web_upstream(upstream)
+    if kind == "office" and method and method.upper() not in ("GET", "POST"):
+        reasons.append("office 类型仅支持 GET/POST")
+    if kind == "office" and is_oa_web:
+        target = resolve_oa_web_target(invoke_target=inv_target, path=str((schema or {}).get("path") or ""))
+        if not target:
+            reasons.append(f"上游为 {OA_WEB_UPSTREAM_KEY} 时须配置接口路径（旧 php 文件）")
     if kind == "open_oa_invoke":
         if method and method.upper() != "POST":
             reasons.append("open_oa_invoke 须为 POST /agent/invoke")
@@ -1001,30 +1081,23 @@ class Catalog:
         tool.last_sync_at, tool.last_sync_error = now, None
         level, diff = compare(current.schema_json if current else None, schema)
         if level == UNCHANGED:
-            if pending is not None:  # 规范已回到当前版本：放弃待激活版本
-                tool.pending_version_id = None
+            tool.pending_version_id = None  # 清掉历史遗留的待激活
             self._apply_flags(tool, current.schema_json)
             tool.last_sync_result = UNCHANGED
             return {"name": tool.name, "result": UNCHANGED, "version_no": current.version_no}
-        if pending is not None and pending.schema_hash == digest:
-            tool.last_sync_result = "breaking_pending"
-            return {"name": tool.name, "result": "breaking_pending", "version_no": pending.version_no}
         version_no = (db.scalar(sa.select(sa.func.max(ToolVersion.version_no))
                                 .where(ToolVersion.tool_id == tool.id)) or 0) + 1
+        # 变更一律立即生效，不再区分兼容性 / 待激活
         version = ToolVersion(tool_id=tool.id, version_no=version_no, spec_version=spec_version, schema_json=schema,
                               schema_hash=digest, compat_level=level, diff_json=diff or None, created_by=operator,
                               created_at=now)
         db.add(version)
         db.flush()
-        if level == BREAKING:
-            tool.pending_version_id = version.id
-            tool.last_sync_result = "breaking_pending"
-        else:
-            tool.current_version_id, tool.pending_version_id = version.id, None
-            self._apply_flags(tool, schema)
-            tool.last_sync_result = level
+        tool.current_version_id, tool.pending_version_id = version.id, None
+        self._apply_flags(tool, schema)
+        tool.last_sync_result = level
         tool.updated_by = operator
-        return {"name": tool.name, "result": tool.last_sync_result, "version_no": version_no, "compat": level}
+        return {"name": tool.name, "result": tool.last_sync_result, "version_no": version_no}
 
     @staticmethod
     def _apply_flags(tool: Tool, schema: dict) -> None:
@@ -1032,13 +1105,13 @@ class Catalog:
         tool.requires_confirmation = schema["requires_confirmation"]
 
     def activate_version(self, db: Session, tool: Tool, version_no: int, operator: str) -> ToolVersion:
+        """回退 / 切到历史版本（保存时已立即生效，不再有「待激活」闸门）。"""
         version = db.scalar(sa.select(ToolVersion).where(ToolVersion.tool_id == tool.id,
                                                          ToolVersion.version_no == version_no))
         if version is None:
             raise LookupError(version_no)
         tool.current_version_id = version.id
-        if tool.pending_version_id == version.id:
-            tool.pending_version_id = None
+        tool.pending_version_id = None
         self._apply_flags(tool, version.schema_json)
         tool.updated_by = operator
         return version
@@ -1099,7 +1172,7 @@ class Catalog:
         return db.scalar(sa.select(model.id).where(model.tenant_id == self.tenant, model.name == name)) is not None
 
     def save_tool(self, db: Session, spec: dict, operator: str) -> dict:
-        """后台保存：兼容变更立即生效，不兼容变更待激活。"""
+        """后台保存：有变更则新建版本并立即生效。"""
         return self._sync_tool(db, ADMIN_SOURCE, ADMIN_SOURCE, spec, operator, utcnow())
 
     def save_skill(self, db: Session, content: dict, operator: str) -> Skill:

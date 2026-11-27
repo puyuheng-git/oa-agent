@@ -201,7 +201,7 @@ def _write_version(db: Session, tool: Tool, schema: dict, operator: str, now) ->
     version_no = (db.scalar(sa.select(sa.func.max(ToolVersion.version_no)).where(ToolVersion.tool_id == tool.id))
                   or 0) + 1
     version = ToolVersion(tool_id=tool.id, version_no=version_no, spec_version="mcp", schema_json=schema,
-                          schema_hash=digest, compat_level="initial" if current is None else "compatible",
+                          schema_hash=digest, compat_level="initial" if current is None else "updated",
                           created_by=operator, created_at=now)
     db.add(version)
     db.flush()

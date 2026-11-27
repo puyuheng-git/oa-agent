@@ -20,6 +20,8 @@ from oa_agent.integrations.open_oa import (
     OA_WEB_TARGET_HEADER,
     OfficeApiClient,
     OfficeApiError,
+    is_oa_web_upstream,
+    resolve_oa_web_target,
     sign_confirm_assertion,
 )
 from oa_agent.executor.invoke_args import unwrap_bag_args
@@ -92,11 +94,15 @@ def authorization_for(
 
 
 def _bound_param_names(spec: ToolSpec) -> set[str]:
-    """身份绑定目标参数名：模型不得写入。"""
+    """身份绑定目标参数名：模型不得写入（含 identity_params 的写入键）。"""
     names = set(getattr(spec, "inject_identity_fields", None) or ())
     for binding in getattr(spec, "identity_bindings", None) or ():
         if isinstance(binding, dict) and binding.get("param"):
             names.add(str(binding["param"]))
+    for param in (getattr(spec, "identity_params", None) or {}):
+        key = str(param or "").strip()
+        if key:
+            names.add(key)
     return names
 
 
@@ -109,6 +115,27 @@ def _effective_identity_bindings(spec: ToolSpec) -> list[dict]:
         {"param": f, "from": f"identity.{f}" if f == "oa" else f}
         for f in (getattr(spec, "inject_identity_fields", None) or ())
     ]
+
+
+def collect_open_oa_identity_args(spec: ToolSpec, identity: Identity) -> dict[str, str]:
+    """按工具配置的写入参数名收集强制身份实参（不写死 oa/userId）。"""
+    out: dict[str, str] = {}
+    for binding in _effective_identity_bindings(spec):
+        param = str(binding.get("param") or "").strip()
+        if not param:
+            continue
+        val = resolve_identity_binding(identity, str(binding.get("from") or ""))
+        if val != "":
+            out[param] = val
+    for param, source in (getattr(spec, "identity_params", None) or {}).items():
+        key = str(param or "").strip()
+        if not key:
+            continue
+        src = str(source or "").strip() or "oa"
+        val = resolve_identity_binding(identity, f"identity.{src}" if src in ("oa",) else src)
+        if val != "":
+            out[key] = val
+    return out
 
 
 def resolve_identity_binding(identity: Identity, source: str) -> str:
@@ -133,12 +160,15 @@ def resolve_identity_binding(identity: Identity, source: str) -> str:
 
 def _resolve_invoke_call(spec: ToolSpec) -> str:
     """解析 open_oa invoke 的 call。含 page+limit 的列表必须用 page_list，
-    否则 page/limit 会被吞进 PHP $params，上游永远走默认每页 10 条。"""
+    否则 page/limit 会被吞进 PHP $params，上游永远走默认每页 10 条。
+    缺省用 named_args：避免多形参 Export 被 one_by_params 只传入 1 个数组。"""
     call = (getattr(spec, "invoke_call", None) or "").strip()
     model_params = getattr(spec, "model_params", None) or {}
     if "page" in model_params and "limit" in model_params:
         return "page_list"
-    return call or "one_by_params"
+    if call in ("one_by_params", "page_list", "named_args"):
+        return call
+    return "named_args"
 
 
 def _check_node(path: str, rule: dict, value: object) -> object:
@@ -312,12 +342,22 @@ def build_wired_request(spec: ToolSpec, args: dict, identity: Identity) -> tuple
         identity_into_bag=identity_into_bag,
     )
     for name, field in spec.identity_params.items():
-        # 独立身份参数：优先写 query；POST 且 body 已有内容时写 body
-        if body is not None and (body or (ct == "application/json")):
+        # 独立身份：POST 一律进 body（$_POST）；GET 进 query
+        if body is not None:
             body[name] = getattr(identity, field)
         else:
             query[name] = getattr(identity, field)
     return query, body, ct
+
+
+def _dig(row: dict, path: str):
+    """按点路径取值：a.b.c → row['a']['b']['c']；中途非 dict 则失败。"""
+    cur: object = row
+    for seg in path.split("."):
+        if not isinstance(cur, dict) or seg not in cur:
+            return None, False
+        cur = cur[seg]
+    return cur, True
 
 
 def _pick(row: dict, fields: tuple[str, ...], remark_limit: int = REMARK_LIMIT) -> dict:
@@ -326,11 +366,10 @@ def _pick(row: dict, fields: tuple[str, ...], remark_limit: int = REMARK_LIMIT) 
         if f in row:
             out[f] = row[f]
         elif "." in f:
-            # 一层点路径：user.name → row["user"]["name"]，输出键保留点号
-            left, right = f.split(".", 1)
-            nested = row.get(left)
-            if isinstance(nested, dict) and right in nested:
-                out[f] = nested[right]
+            # 多级点路径：get.params1 → row["get"]["params1"]，输出键保留点号
+            val, ok = _dig(row, f)
+            if ok:
+                out[f] = val
     if isinstance(out.get("remark"), str) and len(out["remark"]) > remark_limit:
         out["remark"] = out["remark"][:remark_limit] + "…"
     return out
@@ -476,9 +515,12 @@ class ToolExecutor:
                                 node_name: str) -> dict:
         """kind=open_oa_invoke：POST /agent/invoke，body 含固定 service/method + 已校验 args。"""
         clean, dropped = validate_args(spec, args)
+        bound = _bound_param_names(spec)
         for key in list(clean):
-            if key in MCP_DROPPED_ARGS or key in _bound_param_names(spec):
+            if key in MCP_DROPPED_ARGS or key in bound:
                 clean.pop(key, None)
+        # 按配置写入参数名收集身份；经 identity_args 交给桥接强制覆盖（不写死 oa/userId）
+        identity_args = collect_open_oa_identity_args(spec, identity)
         connector_id = spec.upstream or DEFAULT_UPSTREAM
         service = (spec.invoke_service or "").strip()
         method = (spec.invoke_method or "").strip()
@@ -495,16 +537,20 @@ class ToolExecutor:
         rec.tool_call_count += 1
         rec.event(
             "tool_call_start", node_name=node_name, tool_name=spec.name, tool_version=spec.version,
-            input_summary=clean,
+            input_summary={**clean, **identity_args},
             metadata={
                 "path": spec.path or INVOKE_PATH, "upstream": spec.upstream, "connector_id": connector_id,
                 "kind": "open_oa_invoke", "invoke_service": service, "invoke_method": method,
                 "invoke_call": call, "invoke_op": op,
+                "identity_arg_keys": sorted(identity_args.keys()),
                 **({"dropped_fields": dropped} if dropped else {}),
             },
         )
         started = time.perf_counter()
-        body = {"service": service, "method": method, "args": clean, "call": call, "op": op}
+        body = {
+            "service": service, "method": method, "args": clean, "call": call, "op": op,
+            "identity_args": identity_args,
+        }
         try:
             connector, client = self._resolve_client(spec.upstream)
             if connector is None and client is None:
@@ -564,10 +610,13 @@ class ToolExecutor:
         if not self.gateway_secret:
             raise ToolError("UPSTREAM_NOT_CONFIGURED", "未配置 AGENT_GATEWAY_SECRET，无法调用 OA Web invoke",
                             user_message=MSG_NOT_AVAILABLE)
-        target = (spec.invoke_target or "").strip().lstrip("/")
+        target = resolve_oa_web_target(invoke_target=spec.invoke_target or "", path=spec.path or "")
         if not target:
-            raise ToolError("TOOL_NOT_AVAILABLE", f"OA Web invoke 未配置 invoke_target：{spec.name}",
-                            user_message=MSG_NOT_AVAILABLE)
+            raise ToolError(
+                "TOOL_NOT_AVAILABLE",
+                f"OA Web invoke 缺少目标接口路径（upstream=oa 时 path 应为旧 php 文件）：{spec.name}",
+                user_message=MSG_NOT_AVAILABLE,
+            )
         headers = {
             GATEWAY_SECRET_HEADER: self.gateway_secret,
             OA_WEB_TARGET_HEADER: target,
@@ -586,7 +635,7 @@ class ToolExecutor:
 
     def _execute_oa_web_invoke(self, spec: ToolSpec, args: dict, identity: Identity, rec: RunRecorder,
                                node_name: str) -> dict:
-        """office + invoke_target：打 /general/ds/agent/invoke.php，带 B2（+ 写确认）头。"""
+        """upstream=oa 或显式 invoke_target：HTTP 打 invoke.php，再 include 接口 path。"""
         clean, dropped = validate_args(spec, args)
         for key in list(clean):
             if key in MCP_DROPPED_ARGS or key in _bound_param_names(spec):
@@ -599,44 +648,70 @@ class ToolExecutor:
         else:
             method = "GET"
         connector_id = spec.upstream or DEFAULT_UPSTREAM
-        path = (spec.path or OA_WEB_INVOKE_PATH).strip() or OA_WEB_INVOKE_PATH
+        # 出站 URL 固定走统一鉴权入口；业务文件在 X-Agent-Target
+        path = OA_WEB_INVOKE_PATH
+        target = resolve_oa_web_target(invoke_target=spec.invoke_target or "", path=spec.path or "")
         rec.tool_call_count += 1
         rec.event(
             "tool_call_start", node_name=node_name, tool_name=spec.name, tool_version=spec.version,
             input_summary=clean,
             metadata={
                 "path": path, "upstream": spec.upstream, "connector_id": connector_id,
-                "kind": "oa_web_invoke", "invoke_target": spec.invoke_target, "method": method,
+                "kind": "oa_web_invoke", "invoke_target": target, "method": method,
                 **({"dropped_fields": dropped} if dropped else {}),
             },
         )
         started = time.perf_counter()
         try:
-            params = build_request(spec, clean, identity) if method == "GET" else dict(clean)
+            from oa_agent.executor.param_wire import normalize_request_charset
+
+            query, body, content_type = build_wired_request(spec, clean, identity)
             # 身份字段仍注入到 params/body，OA invoke 会再次覆盖
             if method == "POST":
+                target = body if body is not None else query
                 for binding in _effective_identity_bindings(spec):
                     param = str(binding.get("param") or "")
                     source = str(binding.get("from") or "")
                     if param and source == "identity.oa":
-                        params[param] = identity.oa
+                        target[param] = identity.oa
+            # OA Web：未声明 content_type 时写口默认 form-urlencoded（$_POST）
+            if method == "POST" and not (content_type or "").strip():
+                content_type = "application/x-www-form-urlencoded"
+            charset = normalize_request_charset(
+                spec.request_charset or "gbk", content_type,
+            )
             connector, client = self._resolve_client(spec.upstream)
             if connector is None and client is None:
                 raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 OA Web 上游：{spec.upstream}")
             share_office = client is not None or bool(getattr(connector, "shares_employee_token", False))
             auth = authorization_for(identity, connector_id, allow_office_fallback=share_office)
             extra = self._oa_web_extra_headers(spec, identity, is_write=is_write)
+            form_body = None
+            json_body = None
+            if method == "POST":
+                if (content_type or "").startswith("application/x-www-form-urlencoded"):
+                    form_body = body or {}
+                else:
+                    json_body = body or {}
             if connector is not None:
                 resp = connector.invoke(
                     method, path,
-                    params=params if method == "GET" else None,
-                    json_body=params if method == "POST" else None,
+                    params=query if query else None,
+                    json_body=json_body,
+                    form_body=form_body,
                     authorization=auth, timeout=spec.timeout_seconds, extra_headers=extra,
+                    request_charset=charset,
                 )
             elif method == "GET":
-                resp = client.get(path, params, auth, timeout=spec.timeout_seconds, extra_headers=extra)
+                resp = client.get(
+                    path, query, auth, timeout=spec.timeout_seconds, extra_headers=extra,
+                    request_charset=charset,
+                )
             else:
-                resp = client.post(path, params, auth, timeout=spec.timeout_seconds, extra_headers=extra)
+                resp = client.post(
+                    path, body or {}, auth, timeout=spec.timeout_seconds, extra_headers=extra,
+                    content_type=content_type, params=query or None, request_charset=charset,
+                )
             result = compact(spec, resp.data, clean, self.remark_limit)
         except (OfficeApiError, ConnectorError, ToolError) as exc:
             rec.event(
@@ -674,7 +749,12 @@ class ToolExecutor:
             return self._execute_builtin(spec, args, identity, rec, node_name)
         if spec.kind == "open_oa_invoke":
             return self._execute_open_oa_invoke(spec, args, identity, rec, node_name)
-        if (spec.invoke_target or "").strip() or (spec.path or "").rstrip("/") == OA_WEB_INVOKE_PATH.rstrip("/"):
+        # 上游标识 oa：一律经 invoke.php 鉴权后 include 接口 path
+        if (
+            is_oa_web_upstream(spec.upstream)
+            or (spec.invoke_target or "").strip()
+            or (spec.path or "").rstrip("/") == OA_WEB_INVOKE_PATH.rstrip("/")
+        ):
             return self._execute_oa_web_invoke(spec, args, identity, rec, node_name)
         clean, dropped = validate_args(spec, args)
         connector_id = spec.upstream or DEFAULT_UPSTREAM
@@ -687,6 +767,9 @@ class ToolExecutor:
         try:
             method = (spec.method or "GET").upper()
             query, body, content_type = build_wired_request(spec, clean, identity)
+            from oa_agent.executor.param_wire import normalize_request_charset
+
+            charset = normalize_request_charset(spec.request_charset, content_type)
             connector, client = self._resolve_client(spec.upstream)
             if connector is None and client is None:
                 raise ToolError("UPSTREAM_NOT_CONFIGURED", f"未配置 open-oa 地址：{spec.upstream}")
@@ -711,13 +794,16 @@ class ToolExecutor:
                     form_body=form_body,
                     authorization=auth,
                     timeout=spec.timeout_seconds,
+                    request_charset=charset,
                 )
             elif method == "GET":
-                resp = client.get(spec.path, query, auth, timeout=spec.timeout_seconds)
+                resp = client.get(
+                    spec.path, query, auth, timeout=spec.timeout_seconds, request_charset=charset,
+                )
             else:
                 resp = client.post(
                     spec.path, body or {}, auth, timeout=spec.timeout_seconds,
-                    content_type=content_type, params=query or None,
+                    content_type=content_type, params=query or None, request_charset=charset,
                 )
             result = compact(spec, resp.data, clean, self.remark_limit)
         except (OfficeApiError, ConnectorError, ToolError) as exc:

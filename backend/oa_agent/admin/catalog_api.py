@@ -87,9 +87,10 @@ class ToolIn(ReasonIn):
     result: ToolResultIn
     invoke_service: str = Field("", max_length=128)
     invoke_method: str = Field("", max_length=128)
-    invoke_call: str = Field("one_by_params", max_length=32)
+    invoke_call: str = Field("named_args", max_length=32)
     invoke_target: str = Field("", max_length=255)
     content_type: str = Field("", max_length=64)
+    request_charset: str = Field("", max_length=16)
 
 
 class ApipostIn(BaseModel):
@@ -108,9 +109,11 @@ class ExportWizardDescribeIn(ExportWizardServiceIn):
 class ExportWizardProbeIn(ExportWizardDescribeIn):
     oa: str = Field(min_length=1, max_length=64)
     args: dict[str, Any] = Field(default_factory=dict)
-    call: str = Field(default="one_by_params", max_length=32)
+    call: str = Field(default="named_args", max_length=32)
     op: str = Field(default="read", max_length=16)
     idempotency_key: str = Field(default="", max_length=128)
+    # 强制身份：写入参数名 → 值（如 userId / oa），不写死键名
+    identity_args: dict[str, str] = Field(default_factory=dict)
 
 
 class HttpProbeIn(BaseModel):
@@ -130,6 +133,7 @@ class HttpProbeIn(BaseModel):
     model_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
     invoke_target: str = Field("", max_length=255)
     content_type: str = Field("", max_length=64)
+    request_charset: str = Field("", max_length=16)
 
 
 class EnrichSchemaIn(BaseModel):
@@ -148,7 +152,7 @@ class ExportWizardSaveIn(ReasonIn):
     method: str = Field(min_length=1, max_length=128)
     oa: str = Field(min_length=1, max_length=64)
     args: dict[str, Any] = Field(default_factory=dict)
-    call: str = Field(default="one_by_params", max_length=32)
+    call: str = Field(default="named_args", max_length=32)
     op: str = Field(default="read", max_length=16)
     risk: str = Field(default="low", max_length=16)
     name: str = Field(min_length=1, max_length=64)
@@ -156,6 +160,8 @@ class ExportWizardSaveIn(ReasonIn):
     model_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
     result: ToolResultIn = Field(default_factory=ToolResultIn)
     idempotency_key: str = Field(default="", max_length=128)
+    identity_args: dict[str, str] = Field(default_factory=dict)
+    identity_params: dict[str, str] = Field(default_factory=dict)
 
 
 class SkillIn(ReasonIn):
@@ -365,8 +371,8 @@ def _tool_view(ctx: AdminCtx, tool: Tool, *, skill_bound: bool | None = None) ->
         "unregistered_reasons": blockers,
         "skill_bound": bool(skill_bound),
         "current_version_no": _version_no(ctx, tool.current_version_id),
-        "pending_version_no": pending.version_no if pending else None,
-        "pending_compat": pending.compat_level if pending else None,
+        "pending_version_no": None,
+        "pending_compat": None,
         "last_sync_at": tool.last_sync_at, "last_sync_result": tool.last_sync_result,
         "last_sync_error": tool.last_sync_error, "updated_by": tool.updated_by, "updated_at": tool.updated_at,
     }
@@ -434,8 +440,8 @@ def tool_detail(name: str, ctx: AdminCtx = Depends(admin_read(TOOL))):
     versions = ctx.db.scalars(sa.select(ToolVersion).where(ToolVersion.tool_id == tool.id)
                               .order_by(ToolVersion.version_no.desc())).all()
     out["versions"] = [{"version_no": v.version_no, "spec_version": v.spec_version, "schema_hash": v.schema_hash[:16],
-                        "compat_level": v.compat_level, "created_by": v.created_by, "created_at": v.created_at,
-                        "is_current": v.id == tool.current_version_id, "is_pending": v.id == tool.pending_version_id}
+                        "created_by": v.created_by, "created_at": v.created_at,
+                        "is_current": v.id == tool.current_version_id, "is_pending": False}
                        for v in versions]
     current = next((v for v in versions if v.id == tool.current_version_id), None)
     schema = current.schema_json if current else None
@@ -455,7 +461,7 @@ def _tool_version(ctx: AdminCtx, tool: Tool, no: int) -> ToolVersion:
 def tool_version(name: str, version_no: int, ctx: AdminCtx = Depends(admin_read(TOOL))):
     v = _tool_version(ctx, _get_tool(ctx, name), version_no)
     return {"version_no": v.version_no, "spec_version": v.spec_version, "schema": v.schema_json,
-            "schema_hash": v.schema_hash, "compat_level": v.compat_level, "diff": v.diff_json,
+            "schema_hash": v.schema_hash, "diff": v.diff_json,
             "created_by": v.created_by, "created_at": v.created_at}
 
 
@@ -464,7 +470,7 @@ def tool_diff(name: str, from_no: int, to_no: int, ctx: AdminCtx = Depends(admin
     tool = _get_tool(ctx, name)
     a, b = _tool_version(ctx, tool, from_no), _tool_version(ctx, tool, to_no)
     level, diff = compare(a.schema_json, b.schema_json)
-    return {"from": from_no, "to": to_no, "compat_level": level, "changes": diff}
+    return {"from": from_no, "to": to_no, "result": level, "changes": diff}
 
 
 def _upstream_configured(ctx: AdminCtx, upstream: str) -> bool:
@@ -700,9 +706,14 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
     """向导：指定测试员工试调。"""
     client, secret = _open_oa_wizard_client(ctx)
     ctx.db.rollback()
-    call = body.call.strip() or "one_by_params"
+    call = body.call.strip() or "named_args"
     # 整包 call 摊平 params|data，避免业务方法多套一层
     args = unwrap_bag_args(call, dict(body.args or {}))
+    identity_args = {
+        str(k).strip(): str(v)
+        for k, v in (body.identity_args or {}).items()
+        if str(k).strip()
+    }
     try:
         data = client.probe_export(
             service=body.service.strip(),
@@ -713,6 +724,7 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
             op=body.op.strip() or "read",
             gateway_secret=secret,
             idempotency_key=body.idempotency_key.strip(),
+            identity_args=identity_args,
         )
     except OpenOaError as exc:
         raise _wizard_upstream_error(exc) from exc
@@ -722,17 +734,27 @@ def export_wizard_probe(body: ExportWizardProbeIn, ctx: AdminCtx = Depends(admin
 def _http_probe_spec(body: HttpProbeIn):
     """从表单契约片段构造临时 ToolSpec，供 build_request 与运行时一致。"""
     from oa_agent.executor.catalog import synthesize_identity_bindings, to_tool_spec
-    from oa_agent.integrations.open_oa import OA_WEB_INVOKE_PATH
+    from oa_agent.integrations.open_oa import (
+        OA_WEB_UPSTREAM_KEY,
+        is_oa_web_upstream,
+        resolve_oa_web_target,
+    )
 
+    upstream = (body.upstream or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM
     inv_target = (body.invoke_target or "").strip().replace("\\", "/").lstrip("/")
     path = body.path.strip()
     method = (body.method or "GET").upper()
-    if inv_target:
-        path = OA_WEB_INVOKE_PATH
+    # 上游 oa：path 即旧 php；出站固定 invoke.php
+    if is_oa_web_upstream(upstream) and not inv_target:
+        inv_target = resolve_oa_web_target(path=path)
+    is_oa_web = bool(inv_target) or is_oa_web_upstream(upstream)
+    if is_oa_web:
         if method not in ("GET", "POST"):
             raise AppError(422, "VALIDATION_ERROR", "OA Web invoke 测调仅支持 GET/POST")
-        if ".." in inv_target or "://" in inv_target:
-            raise AppError(422, "VALIDATION_ERROR", "invoke_target 不合法")
+        if not inv_target or ".." in inv_target or "://" in inv_target:
+            raise AppError(422, "VALIDATION_ERROR", "上游 oa 时须填写合法接口路径（旧 php 文件）")
+        path = "/" + inv_target.lstrip("/")
+        upstream = OA_WEB_UPSTREAM_KEY
     else:
         if not path.startswith("/") or path.startswith("//") or " " in path or "://" in path:
             raise AppError(422, "VALIDATION_ERROR", "接口路径必须是以 / 开头的相对路径")
@@ -742,9 +764,9 @@ def _http_probe_spec(body: HttpProbeIn):
     bindings = body.identity_bindings
     if bindings is None and inject:
         bindings = synthesize_identity_bindings(inject)
-    is_write = bool(inv_target) and method == "POST"
+    is_write = is_oa_web and method == "POST"
     ct = (body.content_type or "").strip()
-    if method == "POST" and not inv_target:
+    if method == "POST":
         if ct not in ("", "application/x-www-form-urlencoded", "application/json"):
             raise AppError(422, "VALIDATION_ERROR", "content_type 不支持")
         if not ct:
@@ -757,7 +779,7 @@ def _http_probe_spec(body: HttpProbeIn):
         "description": "",
         "method": method,
         "path": path,
-        "upstream": (body.upstream or DEFAULT_UPSTREAM).strip() or DEFAULT_UPSTREAM,
+        "upstream": upstream,
         "risk_level": "high" if is_write else "low",
         "requires_confirmation": is_write,
         "timeout_seconds": float(body.timeout_seconds or 10),
@@ -771,8 +793,18 @@ def _http_probe_spec(body: HttpProbeIn):
     }
     if ct:
         schema["content_type"] = ct
-    if inv_target:
+    raw_cs = (body.request_charset or "").strip().lower()
+    if raw_cs in ("gb2312",):
+        raw_cs = "gbk"
+    if raw_cs == "utf8":
+        raw_cs = "utf-8"
+    if raw_cs in ("gbk", "utf-8"):
+        schema["request_charset"] = raw_cs
+    else:
+        schema["request_charset"] = "utf-8" if ct == "application/json" else "gbk"
+    if is_oa_web:
         schema["invoke_target"] = inv_target
+        schema["upstream"] = OA_WEB_UPSTREAM_KEY
     return to_tool_spec(schema, "probe", 0, "http-probe", kind="office")
 
 
@@ -784,7 +816,10 @@ def http_probe(body: HttpProbeIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
     from oa_agent.integrations.open_oa import (
         GATEWAY_SECRET_HEADER,
         OA_WEB_CONFIRM_HEADER,
+        OA_WEB_INVOKE_PATH,
         OA_WEB_TARGET_HEADER,
+        is_oa_web_upstream,
+        resolve_oa_web_target,
         sign_confirm_assertion,
     )
 
@@ -809,14 +844,24 @@ def http_probe(body: HttpProbeIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
     try:
         from oa_agent.executor.executor import build_wired_request
 
+        from oa_agent.executor.param_wire import normalize_request_charset
+
         clean, _ = validate_args(spec, dict(body.args or {}))
-        inv_target = (spec.invoke_target or "").strip()
+        inv_target = resolve_oa_web_target(
+            invoke_target=spec.invoke_target or "", path=spec.path or "",
+        )
+        use_oa_web = bool(inv_target) or is_oa_web_upstream(spec.upstream)
         method = (spec.method or "GET").upper()
         query, wired_body, content_type = build_wired_request(spec, clean, identity)
-        if inv_target:
-            # OA Web invoke：与运行时同闸（B2；写再加确认断言）
+        if use_oa_web and method == "POST" and not (content_type or "").strip():
+            content_type = "application/x-www-form-urlencoded"
+        charset = normalize_request_charset(spec.request_charset, content_type)
+        if use_oa_web:
+            # OA Web invoke：HTTP 固定 invoke.php，业务文件在 X-Agent-Target
             if not secret:
                 raise AppError(503, "OA_NOT_CONFIGURED", "未配置 AGENT_GATEWAY_SECRET")
+            if not inv_target:
+                raise AppError(422, "VALIDATION_ERROR", "上游 oa 时须填写接口路径（旧 php 文件）")
             extra = {
                 GATEWAY_SECRET_HEADER: secret,
                 OA_WEB_TARGET_HEADER: inv_target,
@@ -832,15 +877,17 @@ def http_probe(body: HttpProbeIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
                 )
                 extra[OA_WEB_CONFIRM_HEADER] = assertion
                 resp = client.post(
-                    spec.path, wired_body or clean, identity.authorization,
+                    OA_WEB_INVOKE_PATH, wired_body or clean, identity.authorization,
                     timeout=spec.timeout_seconds, extra_headers=extra,
-                    content_type=content_type or "application/json",
+                    content_type=content_type or "application/x-www-form-urlencoded",
                     params=query or None,
+                    request_charset=charset,
                 )
             else:
                 resp = client.get(
-                    spec.path, query, identity.authorization,
+                    OA_WEB_INVOKE_PATH, query, identity.authorization,
                     timeout=spec.timeout_seconds, extra_headers=extra,
+                    request_charset=charset,
                 )
         elif method == "POST":
             resp = client.post(
@@ -848,9 +895,13 @@ def http_probe(body: HttpProbeIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
                 timeout=spec.timeout_seconds,
                 content_type=content_type,
                 params=query or None,
+                request_charset=charset,
             )
         else:
-            resp = client.get(spec.path, query, identity.authorization, timeout=spec.timeout_seconds)
+            resp = client.get(
+                spec.path, query, identity.authorization, timeout=spec.timeout_seconds,
+                request_charset=charset,
+            )
     except ToolError as exc:
         raise AppError(422, exc.code, exc.message) from exc
     except OpenOaError as exc:
@@ -908,8 +959,13 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
         raise AppError(422, "VALIDATION_ERROR", "入库前须配置 result.fields")
     client, secret = _open_oa_wizard_client(ctx)
     ctx.db.rollback()
-    call = body.call.strip() or "one_by_params"
+    call = body.call.strip() or "named_args"
     args = unwrap_bag_args(call, dict(body.args or {}))
+    identity_args = {
+        str(k).strip(): str(v)
+        for k, v in (body.identity_args or {}).items()
+        if str(k).strip()
+    }
     try:
         client.probe_export(
             service=body.service.strip(),
@@ -920,6 +976,7 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
             op=body.op.strip() or "read",
             gateway_secret=secret,
             idempotency_key=body.idempotency_key.strip(),
+            identity_args=identity_args,
         )
     except OpenOaError as exc:
         raise AppError(422, "PROBE_FAILED", f"测通失败，未入库：{exc.message}") from exc
@@ -952,6 +1009,11 @@ def export_wizard_save(body: ExportWizardSaveIn, ctx: AdminCtx = Depends(admin_w
             "labels": dict(body.result.labels or {}),
             "list_columns": list(body.result.list_columns or []),
             "schema": body.result.schema,
+        },
+        "identity_params": {
+            str(k).strip(): str(v).strip() or "oa"
+            for k, v in (body.identity_params or {}).items()
+            if str(k).strip()
         },
     }
     spec, errs = normalize_open_oa_catalog_item(item)
@@ -1033,7 +1095,7 @@ def disable_tool(name: str, body: ReasonIn, ctx: AdminCtx = Depends(admin_write(
 
 @tools_router.post("/{name}/activate")
 def activate_tool_version(name: str, body: ActivateIn, ctx: AdminCtx = Depends(admin_write(TOOL))):
-    """激活指定版本：接受待激活的不兼容版本，或回退到历史版本"""
+    """回退到指定历史版本（保存时已立即生效，无待激活闸门）。"""
     engine = ctx.runtime.engine
     with ctx.db.begin():
         tool = _get_tool(ctx, name)
@@ -1051,7 +1113,7 @@ def activate_tool_version(name: str, body: ActivateIn, ctx: AdminCtx = Depends(a
         if not is_activatable(schema):
             raise AppError(
                 400, "CONTRACT_NOT_ACTIVATABLE",
-                "契约检查未通过，不可激活该 Tool 版本（GET 只读，或 POST 且须含 invoke_service/method）",
+                "契约检查未通过，不可激活该 Tool 版本（须为 GET，或 POST：Export invoke / OA Web invoke / HTTP content_type）",
             )
         before = _version_no(ctx, tool.current_version_id)
         try:

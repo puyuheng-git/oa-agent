@@ -44,12 +44,14 @@ class ToolSpec:
     # open_oa_invoke：固定转发到 /agent/invoke 的 ANew 目标（模型不可改）
     invoke_service: str = ""
     invoke_method: str = ""
-    invoke_call: str = "one_by_params"  # page_list | one_by_params | named_args
+    invoke_call: str = "named_args"  # page_list | one_by_params | named_args
     invoke_op: str = "read"  # read | write
     # OA Web invoke：旧脚本相对路径（仅服务端配置；模型不可填）
     invoke_target: str = ""
     # HTTP POST body Content-Type；GET / invoke 忽略
     content_type: str = ""
+    # 请求参数字符集：gbk（OA PHP）| utf-8；空则按 content_type 推导
+    request_charset: str = ""
 
     def label(self, key: str) -> str:
         return self.result_labels.get(key) or key

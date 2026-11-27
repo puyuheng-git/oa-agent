@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { errorMessage, http } from '@/shared/http'
 import { formatTime } from '@/shared/format'
-import { COMPAT_LEVEL, syncTag, type DiffChange, type ToolDetail, type ToolItem, type ToolKind } from '../ops'
+import { syncTag, type DiffChange, type ToolDetail, type ToolItem, type ToolKind } from '../ops'
 import { resolveToolGuide } from '../toolGuides'
 
 function paramEntries(params: Record<string, { type?: string; label?: string; description?: string; required?: boolean; enum?: string[] }> | undefined) {
@@ -50,7 +50,7 @@ const detail = ref<ToolDetail | null>(null)
 const guide = computed(() => resolveToolGuide(detail.value))
 const guideParams = computed(() => paramEntries(guide.value?.model_params))
 const diffRange = ref<{ from: number | null; to: number | null }>({ from: null, to: null })
-const diff = ref<{ compat_level: string; changes: DiffChange[] } | null>(null)
+const diff = ref<{ result?: string; changes: DiffChange[] } | null>(null)
 
 async function load() {
   loading.value = true
@@ -103,7 +103,7 @@ async function open(name: string) {
     const versions = detail.value.versions
     diffRange.value = {
       from: versions.find((v) => v.is_current)?.version_no ?? null,
-      to: versions.find((v) => v.is_pending)?.version_no ?? versions[0]?.version_no ?? null,
+      to: versions[0]?.version_no ?? null,
     }
   } catch (e) {
     ElMessage.error(errorMessage(e))
@@ -199,6 +199,8 @@ const reason = ref('')
 /** 调用形参槽位（新建/编辑） */
 const callSlots = ref<CallSlot[]>(slotsFromPresetId('bag_only'))
 const editorContractRef = ref<InstanceType<typeof ToolContractForm> | null>(null)
+/** 新建/编辑默认极简；专家模式可改布线细节 */
+const editorContractMode = ref<'simple' | 'expert'>('simple')
 
 const formPreviewMethod = computed(() =>
   (form.value.invoke_method || form.value.name || 'method').trim() || 'method',
@@ -230,6 +232,7 @@ function onCallSlotsUpdate(slots: CallSlot[]) {
 function create() {
   editing.value = false
   form.value = emptyToolForm(defaultUpstreamKey.value)
+  editorContractMode.value = 'simple'
   syncCallSlotsFromForm()
   editorProbeOk.value = false
   editorProbeError.value = ''
@@ -329,8 +332,8 @@ const RISK_OPTIONS = [
   { value: 'medium', label: '中' },
   { value: 'high', label: '高' },
 ]
-// 返回字段名：单段或一层点号（与后端 RESULT_FIELD_RE 对齐），如 id、user.name
-const RESULT_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/
+// 返回字段名：多级点路径（与后端 RESULT_FIELD_RE 对齐），如 id、user.name、get.params1
+const RESULT_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}(\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,7}$/
 
 const wizardOpen = ref(false)
 const wizardBusy = ref(false)
@@ -351,6 +354,7 @@ const wizard = ref({
 const wizardForm = ref<ToolForm>(emptyToolForm())
 const wizardSlots = ref<CallSlot[]>(slotsFromPresetId('bag_only'))
 const wizardContractRef = ref<InstanceType<typeof ToolContractForm> | null>(null)
+const wizardContractMode = ref<'simple' | 'expert'>('simple')
 
 const wizardFilteredMethods = computed(() => {
   const q = wizard.value.methodFilter.trim().toLowerCase()
@@ -370,6 +374,7 @@ function openExportWizard() {
   wizardLastProbe.value = null
   wizardSkillDraft.value = null
   wizardWithSkill.value = true
+  wizardContractMode.value = 'simple'
   wizardStep.value = 'pick'
   wizard.value.methods = []
   wizard.value.method = ''
@@ -416,9 +421,21 @@ function wizardNodeFromDescribe(p: {
     description: p.description || '',
   }
   const def = p.default
-  // PHP 关联数组常被反射成 array：无 items 结构时按自由 object 处理
+  // PHP 关联数组常被反射成 array：列表默认值保留 array；无结构 assoc 按自由 object
   if (raw.type === 'array' && !(p as { items?: unknown }).items) {
-    raw.type = 'object'
+    if (Array.isArray(def)) {
+      const first = def[0]
+      const itemType =
+        typeof first === 'number'
+          ? (Number.isInteger(first) ? 'integer' : 'number')
+          : typeof first === 'boolean'
+            ? 'boolean'
+            : 'string'
+      raw.items = { type: itemType }
+      raw.default = def
+    } else {
+      raw.type = 'object'
+    }
   }
   if (raw.type === 'object' && def && typeof def === 'object' && !Array.isArray(def)) {
     // 未声明 properties 的对象无法填值：按默认值的键推断子属性（类型按值推断，默认回落为文本）
@@ -524,6 +541,7 @@ async function runHttpProbe(payload: {
     path,
     method: (contract.method as string) || f.method || 'GET',
     content_type: (contract.content_type as string) || f.content_type || '',
+    request_charset: (contract.request_charset as string) || f.request_charset || 'gbk',
     timeout_seconds: f.timeout_seconds,
     inject_identity_fields: contract.inject_identity_fields || [],
     identity_bindings: contract.identity_bindings || [],
@@ -541,6 +559,7 @@ async function runProbe(payload: {
   call: string
   op: string
   mode: 'export' | 'http'
+  identity_args?: Record<string, string>
 }, target: 'wizard' | 'editor') {
   if (!payload.oa.trim()) {
     ElMessage.warning('请填写测试员工 OA 账号')
@@ -577,6 +596,7 @@ async function runProbe(payload: {
         args: payload.args,
         call: payload.call,
         op: payload.op,
+        identity_args: payload.identity_args || {},
       })
       data = r.data
     } else {
@@ -698,7 +718,7 @@ async function wizardSave() {
   }
   const badField = resultRows.find((r) => !RESULT_FIELD_RE.test(r.field))
   if (badField) {
-    ElMessage.warning(`返回字段名无效（仅支持 a 或 a.b 一层）：${badField.field}`)
+    ElMessage.warning(`返回字段名无效（须为 a 或 a.b.c 点路径）：${badField.field}`)
     return
   }
   const oa = wizardContractRef.value?.getProbeOa() || ''
@@ -715,6 +735,9 @@ async function wizardSave() {
   wizardError.value = ''
   try {
     const toolName = wizardForm.value.name.trim()
+    const identityArgs = wizardContractRef.value?.buildIdentityArgs?.(oa) || {}
+    const idKey = (wizardForm.value.identityParamName || 'oa').trim() || 'oa'
+    const identityParams = wizardForm.value.injectOa ? { [idKey]: 'oa' } : {}
     await http.post('/v1/admin/tools/export-wizard/save', {
       reason: reasonText,
       service: wizardForm.value.invoke_service.trim(),
@@ -727,6 +750,8 @@ async function wizardSave() {
       name: toolName,
       summary: wizardForm.value.summary.trim(),
       model_params: wizardForm.value.modelParams,
+      identity_args: identityArgs,
+      identity_params: identityParams,
       result: {
         kind: wizardForm.value.result_kind,
         fields,
@@ -788,6 +813,7 @@ async function edit(name: string) {
     }
     editing.value = true
     form.value = toolFormFromSchema(d.current_schema)
+    editorContractMode.value = 'simple'
     syncCallSlotsFromForm()
     editorProbeOk.value = false
     editorProbeError.value = ''
@@ -849,6 +875,32 @@ async function saveMeta() {
   }
 }
 
+/** 切换 GET/POST：POST 时参数默认进 body（$_POST），避免仍落在 query。 */
+function onMethodChange() {
+  if (form.value.method === 'GET') {
+    form.value.content_type = ''
+    if (!form.value.request_charset) form.value.request_charset = 'gbk'
+    for (const node of Object.values(form.value.modelParams)) {
+      if (node.placement === 'body') node.placement = 'query'
+    }
+    return
+  }
+  if (!form.value.content_type) form.value.content_type = 'application/x-www-form-urlencoded'
+  if (!form.value.request_charset) {
+    form.value.request_charset = form.value.content_type === 'application/json' ? 'utf-8' : 'gbk'
+  }
+  for (const node of Object.values(form.value.modelParams)) {
+    if (!node.placement || node.placement === 'query' || node.placement === 'scalar') {
+      node.placement = 'body'
+    }
+  }
+}
+
+function onContentTypeChange() {
+  if (form.value.content_type === 'application/json') form.value.request_charset = 'utf-8'
+  else if (form.value.content_type === 'application/x-www-form-urlencoded') form.value.request_charset = 'gbk'
+}
+
 async function removeTool(row: ToolItem) {
   const reasonText = await askReason(`删除 Tool：${row.name}`)
   if (!reasonText) return
@@ -887,8 +939,7 @@ async function save() {
       ? await http.put<{ result: string; version_no?: number }>(`/v1/admin/tools/${form.value.name}`, body)
       : await http.post<{ result: string; version_no?: number }>('/v1/admin/tools', body)
     const tag = syncTag(r.result)
-    if (r.result === 'breaking_pending') ElMessage.warning(`已保存为待激活版本 v${r.version_no}（不兼容变更，需在详情中激活）`)
-    else ElMessage.success(`${tag.label}${r.version_no ? ` · v${r.version_no}` : ''}`)
+    ElMessage.success(`${tag.label}${r.version_no ? ` · v${r.version_no}` : ''}`)
     editor.value = false
     if (!editing.value && skillDraft.value && withSkill.value) await createSkill(skillDraft.value, form.value.name.trim())
     skillDraft.value = null
@@ -967,7 +1018,6 @@ onMounted(load)
       <el-table-column label="版本" width="160">
         <template #default="{ row }">
           v{{ row.current_version_no ?? '—' }}
-          <el-tag v-if="row.pending_version_no" type="warning" size="small">待激活 v{{ row.pending_version_no }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="最近变更" min-width="200">
@@ -1051,16 +1101,13 @@ onMounted(load)
             <el-option v-if="!upstreams.some((u) => u.key === form.upstream)" :value="form.upstream"
               :label="`${form.upstream}（未配置）`" />
           </el-select>
-          <span class="hint">上游在「连接配置 → 业务上游 / 连接器」的「业务上游地址」中维护；改上游属于不兼容变更。</span>
+          <span class="hint">上游在「连接配置 → 业务上游 / 连接器」的「业务上游地址」中维护。</span>
         </el-form-item>
         <el-form-item label="HTTP 方法" required>
           <el-radio-group
             v-model="form.method"
             :disabled="!!(form.invoke_service.trim() && form.invoke_method.trim())"
-            @change="() => {
-              if (form.method === 'GET') form.content_type = ''
-              else if (!form.content_type) form.content_type = 'application/x-www-form-urlencoded'
-            }"
+            @change="onMethodChange"
           >
             <el-radio value="GET">GET</el-radio>
             <el-radio value="POST">POST</el-radio>
@@ -1071,10 +1118,20 @@ onMounted(load)
           v-if="form.method === 'POST' && !(form.invoke_service.trim() && form.invoke_method.trim())"
           label="Content-Type"
         >
-          <el-select v-model="form.content_type" style="width: 360px">
+          <el-select v-model="form.content_type" style="width: 360px" @change="onContentTypeChange">
             <el-option label="application/x-www-form-urlencoded（$_POST）" value="application/x-www-form-urlencoded" />
             <el-option label="application/json" value="application/json" />
           </el-select>
+        </el-form-item>
+        <el-form-item
+          v-if="!(form.invoke_service.trim() && form.invoke_method.trim())"
+          label="参数字符集"
+        >
+          <el-radio-group v-model="form.request_charset">
+            <el-radio value="gbk">GBK（OA PHP）</el-radio>
+            <el-radio value="utf-8">UTF-8</el-radio>
+          </el-radio-group>
+          <span class="hint">OA 端接口请选 GBK，否则中文会乱码</span>
         </el-form-item>
         <el-form-item label="接口路径" required>
           <el-input v-model="form.path" placeholder="所选地址下的相对路径，如 /hr/leave/index">
@@ -1094,6 +1151,7 @@ onMounted(load)
           ref="editorContractRef"
           :form="form"
           :slots="callSlots"
+          v-model:contract-mode="editorContractMode"
           :method-name="formPreviewMethod"
           :show-probe="editorShowProbe"
           :probe-busy="editorProbeBusy"
@@ -1274,6 +1332,7 @@ onMounted(load)
             ref="wizardContractRef"
             :form="wizardForm"
             :slots="wizardSlots"
+            v-model:contract-mode="wizardContractMode"
             :method-name="wizardForm.invoke_method || wizard.method"
             :show-probe="true"
             :probe-busy="wizardBusy"
@@ -1435,11 +1494,6 @@ onMounted(load)
               <template #default="{ row }">v{{ row.version_no }}</template>
             </el-table-column>
             <el-table-column label="规范版本" prop="spec_version" width="90" />
-            <el-table-column label="兼容性" width="90">
-              <template #default="{ row }">
-                <el-tag size="small" :type="COMPAT_LEVEL[row.compat_level]?.type">{{ COMPAT_LEVEL[row.compat_level]?.label || row.compat_level }}</el-tag>
-              </template>
-            </el-table-column>
             <el-table-column label="哈希" prop="schema_hash" width="150" />
             <el-table-column label="同步时间" width="160">
               <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
@@ -1447,8 +1501,7 @@ onMounted(load)
             <el-table-column label="" min-width="120">
               <template #default="{ row }">
                 <el-tag v-if="row.is_current" type="success" size="small">当前</el-tag>
-                <el-tag v-if="row.is_pending" type="warning" size="small">待激活</el-tag>
-                <el-button v-if="!row.is_current" link type="primary" size="small" @click="activate(row.version_no)">激活</el-button>
+                <el-button v-if="!row.is_current" link type="primary" size="small" @click="activate(row.version_no)">回退到此版本</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -1466,7 +1519,7 @@ onMounted(load)
           </div>
           <template v-if="diff">
             <p>
-              结论：<el-tag :type="COMPAT_LEVEL[diff.compat_level]?.type || 'info'">{{ COMPAT_LEVEL[diff.compat_level]?.label || '无变化' }}</el-tag>
+              结论：<el-tag :type="diff.changes?.length ? 'warning' : 'info'">{{ diff.changes?.length ? '有差异' : '无变化' }}</el-tag>
             </p>
             <el-table :data="diff.changes" size="small" empty-text="无差异">
               <el-table-column label="字段" prop="field" width="200" />
@@ -1476,9 +1529,6 @@ onMounted(load)
               </el-table-column>
               <el-table-column label="新" min-width="140">
                 <template #default="{ row }"><code>{{ fmt(row.new) }}</code></template>
-              </el-table-column>
-              <el-table-column label="" width="80">
-                <template #default="{ row }"><el-tag v-if="row.breaking" type="danger" size="small">不兼容</el-tag></template>
               </el-table-column>
             </el-table>
           </template>

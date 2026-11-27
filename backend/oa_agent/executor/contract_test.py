@@ -39,11 +39,18 @@ def contract_check(schema: dict[str, Any] | None) -> ContractCheckResult:
 
 
 def is_activatable(schema: dict[str, Any] | None) -> bool:
-    """可激活：GET 只读；或带 invoke_service/method 的 open-oa POST。"""
+    """可激活：GET；office POST（含 content_type）；或 open-oa invoke POST。"""
     schema = schema or {}
     method = str(schema.get("method") or "GET").upper()
     if method == "GET":
         return True
-    if method == "POST" and str(schema.get("invoke_service") or "").strip() and str(schema.get("invoke_method") or "").strip():
+    if method != "POST":
+        return False
+    # open-oa ANew Export
+    if str(schema.get("invoke_service") or "").strip() and str(schema.get("invoke_method") or "").strip():
         return True
-    return False
+    # OA Web invoke 或普通 HTTP POST（OA PHP）
+    if str(schema.get("invoke_target") or "").strip():
+        return True
+    ct = str(schema.get("content_type") or "").strip()
+    return ct in ("", "application/x-www-form-urlencoded", "application/json")

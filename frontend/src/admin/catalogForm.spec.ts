@@ -90,7 +90,8 @@ describe('catalogForm', () => {
         filter: { type: 'object', properties: { a: { type: 'string', required: true } } },
       },
       result: {
-        kind: 'object', fields: ['id', 'user.name'], labels: { 'user.name': '名' }, list_columns: [],
+        kind: 'object', fields: ['id', 'user.name', 'get.params1'],
+        labels: { 'user.name': '名', 'get.params1': '参数1' }, list_columns: [],
       },
     }
     const form = toolFormFromSchema(schema)
@@ -101,7 +102,9 @@ describe('catalogForm', () => {
     expect(payload.model_params.f.accept).toEqual(['.pdf'])
     expect(payload.model_params.filter.properties.a).toEqual({ type: 'string', required: true })
     expect(payload.result.fields).toContain('user.name')
+    expect(payload.result.fields).toContain('get.params1')
     expect(payload.result.labels['user.name']).toBe('名')
+    expect(payload.result.labels['get.params1']).toBe('参数1')
     expect('schema' in payload.result).toBe(false)
     expect(toolPayload(toolFormFromSchema(payload))).toEqual(payload)
   })

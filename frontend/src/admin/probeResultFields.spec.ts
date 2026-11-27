@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { fieldsFromRow, mergeProbeResultFields } from './probeResultFields'
 
 describe('probeResultFields', () => {
-  it('takes top-level and one-dot paths', () => {
+  it('takes top-level and multi-level dot paths', () => {
     expect(fieldsFromRow({ id: 1, user: { name: 'a', dept: { t: 1 } }, items: [] }).map((r) => r.field))
-      .toEqual(['id', 'user', 'user.name', 'user.dept', 'items'])
+      .toEqual(['id', 'user', 'user.name', 'user.dept', 'user.dept.t', 'items'])
   })
 
   it('merges without overwriting labels', () => {

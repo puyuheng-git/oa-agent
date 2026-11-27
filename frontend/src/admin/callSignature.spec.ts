@@ -62,6 +62,21 @@ describe('callSignature', () => {
     expect(inferInvokeCall(slots)).toBe('named_args')
   })
 
+  it('treats userId as identity write-param, not bag', () => {
+    const slots = slotsFromDescribe(
+      [
+        { name: 'userId', type: 'string' },
+        { name: 'field', type: 'array', kind: 'array' },
+      ],
+      'named_args',
+    )
+    expect(slots).toEqual([
+      { role: 'identity', name: 'userId' },
+      { role: 'scalar', name: 'field' },
+    ])
+    expect(inferInvokeCall(slots)).toBe('named_args')
+  })
+
   it('syncs slots with ToolForm', () => {
     const form = emptyToolForm()
     applySlotsToToolForm(form, slotsFromPresetId('identity_bag'))

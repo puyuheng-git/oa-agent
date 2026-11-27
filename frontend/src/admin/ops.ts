@@ -84,7 +84,6 @@ export interface ToolVersion {
   version_no: number
   spec_version: string
   schema_hash: string
-  compat_level: string
   created_by: string
   created_at: string
   is_current: boolean
@@ -139,7 +138,6 @@ export interface DiffChange {
   change: 'added' | 'removed' | 'changed'
   old: unknown
   new: unknown
-  breaking: boolean
 }
 
 export interface SkillItem {
@@ -165,16 +163,12 @@ export interface SkillItem {
 export const SYNC_RESULT: Record<string, { label: string; type: TagType }> = {
   initial: { label: '首次导入', type: 'success' },
   unchanged: { label: '无变化', type: 'info' },
-  compatible: { label: '兼容变更·已生效', type: 'success' },
-  breaking_pending: { label: '不兼容·待激活', type: 'warning' },  updated: { label: '已更新', type: 'success' },
+  updated: { label: '已更新', type: 'success' },
+  // 历史结果文案（旧数据可能仍出现）
+  compatible: { label: '已更新', type: 'success' },
+  breaking_pending: { label: '已更新', type: 'success' },
   removed: { label: '已从规范移除', type: 'danger' },
   error: { label: '同步失败·保留旧版本', type: 'danger' },
-}
-
-export const COMPAT_LEVEL: Record<string, { label: string; type: TagType }> = {
-  initial: { label: '初始', type: 'info' },
-  compatible: { label: '兼容', type: 'success' },
-  breaking: { label: '不兼容', type: 'danger' },
 }
 
 export function syncTag(result: string | null): { label: string; type: TagType } {

@@ -135,17 +135,17 @@ export function slotsFromDescribe(
     return slotsFromPresetId('bag_only')
   }
   const slots: CallSlot[] = []
+  // 仅「袋名 / kind=bag」才当袋；普通 array 形参（如 field=["*"]）仍是独立标量位
+  const bagNames = new Set(['params', 'data', 'payload', 'opt', 'args', 'options', 'extra'])
   for (const p of list) {
     const name = String(p.name || '').trim()
     if (!name) continue
     const kind = String(p.kind || '').toLowerCase()
-    const type = String(p.type || '').toLowerCase()
-    if (name === 'oa' || name === 'user_id' || kind === 'identity') {
+    const lower = name.toLowerCase()
+    // 身份形参名以 Export 签名为准（如 oa / userId），写入参数名随之对齐，注入侧不写死
+    if (kind === 'identity' || lower === 'oa' || lower === 'user_id' || lower === 'userid') {
       slots.push({ role: 'identity', name })
-    } else if (
-      kind === 'bag' || type === 'array' || type === 'object'
-      || name === 'params' || name === 'data'
-    ) {
+    } else if (kind === 'bag' || bagNames.has(lower)) {
       slots.push({ role: 'bag', name })
     } else {
       slots.push({ role: 'scalar', name })

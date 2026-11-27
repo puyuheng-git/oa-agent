@@ -3,7 +3,7 @@
  * 参数表（主编辑器）：名 / 类型 / 必填 / 放置 / 编码 / 说明。
  * Export 仅 scalar|bag；HTTP 为 query|body|bag。嵌套走高级 Schema 树。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import {
   applyParamRows, emptyParamRow, paramRowsFromForm, type ParamRow, type ToolForm,
 } from '../catalogForm'
@@ -12,21 +12,31 @@ import {
 } from '../paramWire'
 import { SCHEMA_TYPES, type SchemaType } from '../schemaTree'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   form: ToolForm
   isExport: boolean
-}>()
+  /** 极简：隐藏放置/编码列 */
+  simple?: boolean
+}>(), {
+  simple: false,
+})
 
 const emit = defineEmits<{ (e: 'change'): void }>()
 
 const rows = ref<ParamRow[]>([])
+/** 写回 form 期间抑制 watch，避免空名草稿行被立刻 reload 清掉 */
 let syncing = false
+
+function draftRows(list: ParamRow[]): ParamRow[] {
+  return list.filter((r) => !r.name.trim())
+}
 
 function reload() {
   syncing = true
-  rows.value = paramRowsFromForm(props.form)
-  if (!rows.value.length) rows.value = []
-  syncing = false
+  // 外部回灌时保留未命名草稿，避免点「添加」后行闪没
+  const drafts = draftRows(rows.value)
+  rows.value = [...paramRowsFromForm(props.form), ...drafts]
+  nextTick(() => { syncing = false })
 }
 
 watch(
@@ -48,12 +58,17 @@ const encodingLabel: Record<ParamEncoding, string> = {
   auto: '自动',
   flat: '扁平',
   repeat: '数组 name[]',
-  json: 'JSON 字符串',
+  json: '多维数组 name[key]',
 }
 
 function flush() {
+  // applyParamRows 会跳过空名；先留住草稿，写回后再拼回去
+  syncing = true
+  const drafts = draftRows(rows.value)
   applyParamRows(props.form, rows.value)
+  rows.value = [...paramRowsFromForm(props.form), ...drafts]
   emit('change')
+  nextTick(() => { syncing = false })
 }
 
 function onRowEdit() {
@@ -62,13 +77,16 @@ function onRowEdit() {
 
 function addRow() {
   const row = emptyParamRow()
-  row.placement = props.isExport ? 'bag' : ((props.form.method || 'GET').toUpperCase() === 'POST' ? 'body' : 'query')
-  rows.value.push(row)
+  // 极简/HTTP：按方法默认 query|body；Export 独立形参（袋留给专家模式）
+  if (props.isExport) row.placement = 'scalar'
+  else row.placement = (props.form.method || 'GET').toUpperCase() === 'POST' ? 'body' : 'query'
+  // 先入表，再 flush；空名不会进 modelParams，靠草稿保留
+  rows.value = [...rows.value, row]
   flush()
 }
 
 function removeRow(i: number) {
-  rows.value.splice(i, 1)
+  rows.value = rows.value.filter((_, idx) => idx !== i)
   flush()
 }
 
@@ -104,12 +122,12 @@ defineExpose({ reload, flush })
           </el-select>
         </template>
       </el-table-column>
-      <el-table-column label="必填" width="64" align="center">
+      <el-table-column :label="simple ? '模型必填' : '必填'" width="88" align="center">
         <template #default="{ row }">
           <el-checkbox v-model="row.required" @change="onRowEdit" />
         </template>
       </el-table-column>
-      <el-table-column label="放置位置" width="130">
+      <el-table-column v-if="!simple" label="放置位置" width="130">
         <template #default="{ row }">
           <el-select v-model="row.placement" size="small" @change="onRowEdit">
             <el-option
@@ -121,7 +139,7 @@ defineExpose({ reload, flush })
           </el-select>
         </template>
       </el-table-column>
-      <el-table-column v-if="!isExport" label="编码" width="150">
+      <el-table-column v-if="!simple && !isExport" label="编码" width="150">
         <template #default="{ row }">
           <el-select v-model="row.encoding" size="small" @change="onRowEdit">
             <el-option
@@ -152,7 +170,8 @@ defineExpose({ reload, flush })
     </el-table>
     <el-button size="small" style="margin-top: 8px" @click="addRow">添加参数</el-button>
     <div class="hint">
-      对象/数组的嵌套字段请用下方「高级 Schema」编辑；表格管顶层名、类型、放置与编码。
+      <template v-if="simple">核对参数名、类型与说明即可；放置与编码由系统自动处理。需要细调请开「专家模式」。</template>
+      <template v-else>对象/数组的嵌套字段请用下方「高级 Schema」编辑；表格管顶层名、类型、放置与编码。</template>
     </div>
   </div>
 </template>

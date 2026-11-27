@@ -503,44 +503,6 @@ GROUPS: dict[str, GroupDef] = {
             ),
             description="出站 MCP 连接的全局安全边界。MCP 连接本身在「MCP 连接」页配置，密钥只写不读。",
         ),
-        GroupDef(
-            "idp",
-            "身份提供者",
-            "热生效",
-            (
-                FieldDef(
-                    "demo_idp_enabled",
-                    "启用 Demo IdP",
-                    "bool",
-                    False,
-                    "开启后允许用共享口令建立本地 demo 会话（无 OA/office）。"
-                    "仅供本地开发与自动化测试；生产环境务必保持关闭。",
-                ),
-                FieldDef(
-                    "demo_shared_secret",
-                    "Demo 共享口令",
-                    "str",
-                    "",
-                    "Demo IdP 校验用的本地共享口令（明文存配置，仅限本机）。"
-                    "与入站 payload.secret 一致才签发主体；生产勿开启 Demo。",
-                    max=256,
-                ),
-                FieldDef(
-                    "channel_idp_map_json",
-                    "渠道到 IdP 映射",
-                    "text",
-                    '{"oa_web":"oa_assertion","wecom":"wecom","demo":"demo"}',
-                    "JSON 对象，键为渠道 ID、值为 IdP ID；非法 JSON 或非对象会回落默认映射，"
-                    "缺少的默认渠道也会逐项回落。"
-                    "预留：运行时入口尚未统一走 verify_channel；改映射暂不影响现网 OA/企微 launch。",
-                    max=4000,
-                ),
-            ),
-            description="身份提供者（IdP）与本地 Demo 入口。"
-                        "生产环境通常使用 OA 宿主页 assertion 或企微；本地开发可启用 Demo IdP（无 office 上游）。"
-                        "Demo 默认关闭；开启后仍须正确共享口令才能建会话。"
-                        "channel_idp_map_json 当前为预留配置，待运行时入口统一接入 verify_channel 后生效。",
-        ),
     )
 }
 
